@@ -1,0 +1,21 @@
+vector_id=ID-JOURNAL-REFERENCE-DERIVATION-001
+format_name=JournalReference
+format_version=v1
+frozen_sections=IDENTITY-FORMAT-v0.3.md §§51–53
+semantic_input.registry_id_hex=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+semantic_input.entry_index=100
+semantic_input.entry_hash_hex=202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+semantic_input.event_type_id=100
+semantic_input.event_record_id_hex=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+expected_cbor_hex=855820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f18645820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f18645820404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+expected_validation_status=ACCEPT_STRUCTURAL_ONLY
+independent_reproduction=manual fixed-byte construction: 85 + 58 20 + registry_id + 18 64 + 58 20 + entry_hash + 18 64 + 58 20 + event_record_id
+negative.1.vector_id=ID-JOURNAL-REFERENCE-INDEX-OUT-OF-RANGE-FAIL-001
+negative.1.input.entry_index=9007199254740992
+negative.1.expected_result=REJECT_BEFORE_AUTHORITATIVE_ENCODING
+negative.2.vector_id=ID-JOURNAL-REFERENCE-UNREGISTERED-EVENT-FAIL-001
+negative.2.input.event_type_id=2
+negative.2.expected_result=REJECT_BEFORE_AUTHORITATIVE_ENCODING
+negative.3.vector_id=ID-JOURNAL-REFERENCE-BSTR-LENGTH-FAIL-001
+negative.3.input.entry_hash_length=31;event_record_id_length=33
+negative.3.expected_result=REJECT_BEFORE_AUTHORITATIVE_ENCODING

@@ -1,0 +1,16 @@
+vector_id=ID-IDENTITY-DEPENDENCY-DERIVATION-001
+format_name=IdentityDependencyCollection
+format_version=v1
+frozen_sections=IDENTITY-FORMAT-v0.3.md §§59–63
+semantic_input.unordered_elements=JOURNAL_ANCHOR_ID:a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf;RECORD_ID:808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f
+expected_canonical_elements=RECORD_ID:808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f;JOURNAL_ANCHOR_ID:a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+expected_cbor_hex=8282015820808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f82025820a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+expected_validation_status=ACCEPT
+independent_reproduction=manual fixed-byte construction: 82 + 82 01 58 20 + record_id + 82 02 58 20 + journal_anchor_id
+negative.1.vector_id=ID-IDENTITY-DEPENDENCY-ORDER-CHANGED-FAIL-001
+negative.1.expected_result=REJECT_WITHOUT_NORMALIZATION
+negative.2.vector_id=ID-IDENTITY-DEPENDENCY-DUPLICATE-FAIL-001
+negative.2.expected_result=REJECT
+negative.3.vector_id=ID-IDENTITY-DEPENDENCY-RESERVED-RAW-SHA256-KIND-FAIL-001
+negative.3.input.identity_dependency_kind_id=3
+negative.3.expected_result=REJECT
