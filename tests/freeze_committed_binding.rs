@@ -227,6 +227,29 @@ fn binding_result_for_receipt_bytes(
     })
 }
 
+fn binding_result_for_fixed_receipt_and_committed_entry(
+    receipt_bytes: &[u8],
+    committed_entry_bytes: &[u8],
+    committed_event_record_id: [u8; 32],
+) -> Result<FreezeCommittedBindingOutcome, evidence_registry::FreezeCommittedBindingError> {
+    let (mut journal, registry_id, start_record, _) = fixed_start_fixture();
+    let receipt = FreezeReceiptRecord::decode_authoritative(receipt_bytes).unwrap();
+    journal.append_strict_entry(committed_entry_bytes).unwrap();
+    let committed_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(2_u64).unwrap(),
+        JournalEntryHash::try_from(sha256(committed_entry_bytes).as_slice()).unwrap(),
+        EventTypeId::try_from(101_u64).unwrap(),
+        EventRecordId::try_from(committed_event_record_id.as_slice()).unwrap(),
+    );
+    validate_freeze_committed_binding(FreezeCommittedBindingInput {
+        retained_journal: &journal,
+        committed_event_reference: committed_reference,
+        freeze_attempt_start_record: &start_record,
+        freeze_receipt_record: &receipt,
+    })
+}
+
 fn id(first: u8) -> [u8; 32] {
     core::array::from_fn(|index| first.wrapping_add(index as u8))
 }
@@ -528,6 +551,16 @@ fn freeze_receipt_decoder_rejects_one_mutation_per_strict_field_or_canonical_bou
     noncanonical_type.insert(type_offset, 0x18);
     assert!(StrictRecordFrame::decode_authoritative(&noncanonical_type).is_err());
     assert!(FreezeReceiptRecord::decode_authoritative(&noncanonical_type).is_err());
+
+    let mut wrong_outer_array = baseline.clone();
+    replace_unique(&mut wrong_outer_array, &[0x84, 0x78, 0x1a, b'E'], 0, 0x85);
+    assert!(StrictRecordFrame::decode_authoritative(&wrong_outer_array).is_err());
+    assert!(FreezeReceiptRecord::decode_authoritative(&wrong_outer_array).is_err());
+
+    let mut wrong_outer_domain = baseline;
+    replace_unique(&mut wrong_outer_domain, &[0x78, 0x1a, b'E', b'v'], 2, b'X');
+    assert!(StrictRecordFrame::decode_authoritative(&wrong_outer_domain).is_err());
+    assert!(FreezeReceiptRecord::decode_authoritative(&wrong_outer_domain).is_err());
 }
 
 #[test]
@@ -591,6 +624,18 @@ fn freeze_committed_binding_rejects_each_mutated_receipt_reference_relation() {
         Err(evidence_registry::FreezeCommittedBindingError::RetainedReference(_))
     ));
 
+    let mut wrong_event_record_id = baseline.clone();
+    replace_unique(
+        &mut wrong_event_record_id,
+        &[0x18, 0x64, 0x58, 0x20, 0x94, 0x9f, 0x6d],
+        4,
+        0x95,
+    );
+    assert!(matches!(
+        binding_result_for_receipt_bytes(&wrong_event_record_id),
+        Err(evidence_registry::FreezeCommittedBindingError::RetainedReference(_))
+    ));
+
     let mut non_prior = baseline;
     replace_unique(
         &mut non_prior,
@@ -605,6 +650,28 @@ fn freeze_committed_binding_rejects_each_mutated_receipt_reference_relation() {
 }
 
 #[test]
+fn freeze_committed_binding_rejects_an_independently_mutated_terminal_receipt_identity() {
+    let receipt_bytes = hex_bytes(RECEIPT_HEX);
+    let mut committed_entry_bytes = hex_bytes(COMMITTED_ENTRY_HEX);
+    replace_unique(
+        &mut committed_entry_bytes,
+        &[0x05, 0x58, 0x20, 0xc2, 0xf7, 0x6c],
+        3,
+        0xc3,
+    );
+    let mut terminal_event_record_id = hex_id(RECEIPT_ID_HEX);
+    terminal_event_record_id[0] = 0xc3;
+    assert_eq!(
+        binding_result_for_fixed_receipt_and_committed_entry(
+            &receipt_bytes,
+            &committed_entry_bytes,
+            terminal_event_record_id,
+        ),
+        Err(evidence_registry::FreezeCommittedBindingError::ReceiptRecordMismatch)
+    );
+}
+
+#[test]
 fn freeze_committed_binding_rejects_each_mutated_record_identity_relation() {
     let baseline = hex_bytes(RECEIPT_HEX);
 
@@ -612,7 +679,7 @@ fn freeze_committed_binding_rejects_each_mutated_record_identity_relation() {
     replace_unique(&mut wrong_attempt, &[0x10, 0x58, 0x20, 0xa0], 3, 0xa1);
     assert_eq!(
         binding_result_for_receipt_bytes(&wrong_attempt),
-        Err(evidence_registry::FreezeCommittedBindingError::CommittedEventMismatch)
+        Err(evidence_registry::FreezeCommittedBindingError::FreezeAttemptMismatch)
     );
 
     let mut wrong_subject = baseline.clone();

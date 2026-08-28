@@ -2846,6 +2846,11 @@ pub enum FreezeCommittedBindingOutcome {
 pub fn validate_freeze_committed_binding(
     input: FreezeCommittedBindingInput<'_>,
 ) -> Result<FreezeCommittedBindingOutcome, FreezeCommittedBindingError> {
+    if input.freeze_attempt_start_record.input.freeze_attempt_id
+        != input.freeze_receipt_record.freeze_attempt_id
+    {
+        return Err(FreezeCommittedBindingError::FreezeAttemptMismatch);
+    }
     let committed = input
         .retained_journal
         .resolve_reference(&input.committed_event_reference)
@@ -2885,11 +2890,6 @@ pub fn validate_freeze_committed_binding(
         != input.freeze_attempt_start_record.record_id().as_bytes()
     {
         return Err(FreezeCommittedBindingError::AttemptStartRecordMismatch);
-    }
-    if input.freeze_attempt_start_record.input.freeze_attempt_id
-        != input.freeze_receipt_record.freeze_attempt_id
-    {
-        return Err(FreezeCommittedBindingError::FreezeAttemptMismatch);
     }
     if input.freeze_attempt_start_record.input.subject_id != input.freeze_receipt_record.subject_id
     {
