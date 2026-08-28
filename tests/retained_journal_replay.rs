@@ -684,6 +684,45 @@ fn retained_journal_rejects_a_freeze_commit_rejection_with_a_nonterminal_conflic
 }
 
 #[test]
+fn retained_journal_rejects_a_freeze_commit_rejection_with_a_broken_chain_link() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+    let terminal_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    let mut malformed = freeze_commit_rejected_bytes(
+        terminal_hash,
+        freeze_start_hash,
+        terminal_hash,
+        2,
+        true,
+        101,
+    );
+    let previous_hash = malformed
+        .windows(3)
+        .position(|window| window == [0x03, 0x58, 0x20])
+        .unwrap()
+        + 3;
+    malformed[previous_hash] ^= 0x01;
+
+    assert_eq!(
+        journal.append_strict_entry(&malformed),
+        Err(RetainedJournalError::PreviousHashMismatch)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
+}
+
+#[test]
 fn retained_journal_rejects_an_ordinary_verification_with_wrong_lifecycle_binding() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();

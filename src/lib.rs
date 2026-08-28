@@ -1255,6 +1255,7 @@ impl RetainedJournal {
                     return Err(RetainedJournalError::DecodeError);
                 }
             }
+            self.preflight_unsupported_common(&common)?;
             return Err(RetainedJournalError::UnsupportedEntry);
         }
         if event_type_id.value() == 200 {
@@ -1266,6 +1267,7 @@ impl RetainedJournal {
                     {
                         return Err(RetainedJournalError::DecodeError);
                     }
+                    self.preflight_unsupported_common(&common)?;
                     Err(RetainedJournalError::UnsupportedEntry)
                 }
                 Err(_) => {
@@ -1290,6 +1292,7 @@ impl RetainedJournal {
                     }
                     self.resolve_reference(closeout_reference)
                         .map_err(|_| RetainedJournalError::DecodeError)?;
+                    self.preflight_unsupported_common(&common)?;
                     Err(RetainedJournalError::UnsupportedEntry)
                 }
             };
@@ -1488,6 +1491,7 @@ impl RetainedJournal {
         {
             return Err(RetainedJournalError::DecodeError);
         }
+        self.preflight_unsupported_common(&common)?;
         Ok(())
     }
 
@@ -1531,7 +1535,47 @@ impl RetainedJournal {
         }
         self.resolve_reference(freeze_authority_reference)
             .map_err(|_| RetainedJournalError::DecodeError)?;
+        self.preflight_unsupported_common(&common)?;
         Ok(())
+    }
+
+    /// Preflights the retained-history conditions shared by an event form this
+    /// runtime recognizes structurally but deliberately does not retain.
+    ///
+    /// It does not decide authority, admission, or Record-payload semantics.
+    fn preflight_unsupported_common(
+        &self,
+        common: &DecodedCommonJournalEntry,
+    ) -> Result<(), RetainedJournalError> {
+        if common.registry_id != self.registry_id {
+            return Err(RetainedJournalError::RegistryMismatch);
+        }
+        let expected_index = u64::try_from(self.entries.len())
+            .ok()
+            .and_then(|value| JournalEntryIndex::try_from(value).ok())
+            .ok_or(RetainedJournalError::UnexpectedEntryIndex)?;
+        if common.entry_index != expected_index {
+            return Err(RetainedJournalError::UnexpectedEntryIndex);
+        }
+        let expected_previous = self.entries.last().map(RetainedJournalEntry::entry_hash);
+        if common.previous_entry_hash != expected_previous {
+            return Err(RetainedJournalError::PreviousHashMismatch);
+        }
+        for reference in &common.authority_dependencies.elements {
+            self.resolve_reference(reference)?;
+        }
+        let reconstructed = self
+            .reconstruct_state()
+            .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+        let before = reconstructed
+            .state_for(common.lifecycle_object_kind, &common.lifecycle_object_id)
+            .unwrap_or_else(|| absent_state_for_kind(common.lifecycle_object_kind));
+        let after = common
+            .event_type_id
+            .resulting_state(before)
+            .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+        validate_state_only_legal_transition(common.event_type_id, before, after)
+            .map_err(|_| RetainedJournalError::LifecycleTransition)
     }
 
     /// Resolves every field of a JournalReference against retained Entry bytes.
