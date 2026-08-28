@@ -1,7 +1,7 @@
 use evidence_registry::{
-    ArtifactEvictionState, CloseoutAttemptState, EventTypeId, FreezeAttemptState,
-    LifecycleObjectState, LifecycleTransitionError, OneShotRecordedState, RegistryLifecycleState,
-    ReviewAdmissionState,
+    ArtifactEvictionState, CloseoutAttemptState, EventShape, EventTypeId, FreezeAttemptState,
+    LifecycleObjectKind, LifecycleObjectState, LifecycleTransitionError, OneShotRecordedState,
+    RegistryLifecycleState, ReviewAdmissionState,
 };
 
 #[test]
@@ -76,40 +76,194 @@ fn every_registered_event_accepts_only_its_exact_matching_kind_predecessors() {
     let eviction_block = [(ArtifactEviction(EvictionOpen), ArtifactEviction(Blocked))];
 
     let cases = [
-        (1, &genesis[..]),
-        (100, &freeze_open[..]),
-        (101, &freeze_commit[..]),
-        (102, &freeze_abort_recovery[..]),
-        (103, &freeze_abort_operator[..]),
-        (104, &freeze_observe[..]),
-        (200, &one_shot[..]),
-        (300, &one_shot[..]),
-        (301, &one_shot[..]),
-        (302, &admission_accept[..]),
-        (303, &admission_reject[..]),
-        (400, &one_shot[..]),
-        (500, &closeout_commit[..]),
-        (501, &closeout_reject[..]),
-        (600, &registry_observe[..]),
-        (700, &eviction_open[..]),
-        (701, &eviction_commit[..]),
-        (702, &eviction_interrupt[..]),
-        (703, &eviction_block[..]),
-        (800, &one_shot[..]),
-        (801, &one_shot[..]),
-        (802, &one_shot[..]),
-        (803, &one_shot[..]),
-        (804, &one_shot[..]),
-        (805, &one_shot[..]),
-        (806, &one_shot[..]),
-        (807, &one_shot[..]),
-        (808, &one_shot[..]),
+        (
+            1,
+            LifecycleObjectKind::Registry,
+            EventShape::BootstrapCreate,
+            &genesis[..],
+        ),
+        (
+            100,
+            LifecycleObjectKind::FreezeAttempt,
+            EventShape::CreateOpen,
+            &freeze_open[..],
+        ),
+        (
+            101,
+            LifecycleObjectKind::FreezeAttempt,
+            EventShape::TransitionTerminal,
+            &freeze_commit[..],
+        ),
+        (
+            102,
+            LifecycleObjectKind::FreezeAttempt,
+            EventShape::TransitionTerminal,
+            &freeze_abort_recovery[..],
+        ),
+        (
+            103,
+            LifecycleObjectKind::FreezeAttempt,
+            EventShape::TransitionTerminal,
+            &freeze_abort_operator[..],
+        ),
+        (
+            104,
+            LifecycleObjectKind::FreezeAttempt,
+            EventShape::ObserveNoStateChange,
+            &freeze_observe[..],
+        ),
+        (
+            200,
+            LifecycleObjectKind::Verification,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            300,
+            LifecycleObjectKind::ReviewRequest,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            301,
+            LifecycleObjectKind::ReviewResult,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            302,
+            LifecycleObjectKind::ReviewAdmissionAttempt,
+            EventShape::CreateTerminal,
+            &admission_accept[..],
+        ),
+        (
+            303,
+            LifecycleObjectKind::ReviewAdmissionAttempt,
+            EventShape::CreateTerminal,
+            &admission_reject[..],
+        ),
+        (
+            400,
+            LifecycleObjectKind::Policy,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            500,
+            LifecycleObjectKind::CloseoutAttempt,
+            EventShape::CreateTerminal,
+            &closeout_commit[..],
+        ),
+        (
+            501,
+            LifecycleObjectKind::CloseoutAttempt,
+            EventShape::CreateTerminal,
+            &closeout_reject[..],
+        ),
+        (
+            600,
+            LifecycleObjectKind::Registry,
+            EventShape::ObserveNoStateChange,
+            &registry_observe[..],
+        ),
+        (
+            700,
+            LifecycleObjectKind::ArtifactEvictionAttempt,
+            EventShape::CreateOpen,
+            &eviction_open[..],
+        ),
+        (
+            701,
+            LifecycleObjectKind::ArtifactEvictionAttempt,
+            EventShape::TransitionTerminal,
+            &eviction_commit[..],
+        ),
+        (
+            702,
+            LifecycleObjectKind::ArtifactEvictionAttempt,
+            EventShape::TransitionTerminal,
+            &eviction_interrupt[..],
+        ),
+        (
+            703,
+            LifecycleObjectKind::ArtifactEvictionAttempt,
+            EventShape::TransitionTerminal,
+            &eviction_block[..],
+        ),
+        (
+            800,
+            LifecycleObjectKind::AssumptionDefinition,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            801,
+            LifecycleObjectKind::AssumptionEstablishment,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            802,
+            LifecycleObjectKind::AssumptionInvalidation,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            803,
+            LifecycleObjectKind::FormalVerification,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            804,
+            LifecycleObjectKind::AssumptionVersionCompatibility,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            805,
+            LifecycleObjectKind::AssumptionVersionCompatibilityInvalidation,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            806,
+            LifecycleObjectKind::BootstrapTrustDeclaration,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            807,
+            LifecycleObjectKind::BootstrapTrustInvalidation,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
+        (
+            808,
+            LifecycleObjectKind::FormalFindingClassification,
+            EventShape::CreateTerminal,
+            &one_shot[..],
+        ),
     ];
 
-    for (event_id, legal_transitions) in cases {
+    for (event_id, expected_kind, expected_shape, legal_transitions) in cases {
         let event = EventTypeId::try_from(event_id).unwrap();
-        let kind = event.lifecycle_object_kind();
-        for before in matching_states(kind) {
+        assert_eq!(
+            event.value(),
+            event_id as u16,
+            "event {event_id} numeric round trip"
+        );
+        assert_eq!(
+            event.lifecycle_object_kind(),
+            expected_kind,
+            "event {event_id} object kind"
+        );
+        assert_eq!(
+            event.event_shape(),
+            expected_shape,
+            "event {event_id} shape"
+        );
+        for before in matching_states(expected_kind) {
             let expected = legal_transitions
                 .iter()
                 .find(|(legal_before, _)| *legal_before == before)
@@ -126,8 +280,8 @@ fn every_registered_event_accepts_only_its_exact_matching_kind_predecessors() {
             );
         }
 
-        let mismatched = match kind {
-            evidence_registry::LifecycleObjectKind::Registry => OneShot(OneShotAbsent),
+        let mismatched = match expected_kind {
+            LifecycleObjectKind::Registry => OneShot(OneShotAbsent),
             _ => Registry(RegistryAbsent),
         };
         assert_eq!(
@@ -138,30 +292,51 @@ fn every_registered_event_accepts_only_its_exact_matching_kind_predecessors() {
     }
 }
 
-fn matching_states(kind: evidence_registry::LifecycleObjectKind) -> Vec<LifecycleObjectState> {
+#[test]
+fn event_type_id_rejects_every_unregistered_value_through_the_registry_boundary() {
+    let registered = [
+        1_u64, 100, 101, 102, 103, 104, 200, 300, 301, 302, 303, 400, 500, 501, 600, 700, 701, 702,
+        703, 800, 801, 802, 803, 804, 805, 806, 807, 808,
+    ];
+
+    for value in 0_u64..=809 {
+        if registered.contains(&value) {
+            continue;
+        }
+        let error = EventTypeId::try_from(value).unwrap_err();
+        assert_eq!(error.value(), value, "unregistered event {value}");
+    }
+
+    for value in [810, u64::MAX] {
+        let error = EventTypeId::try_from(value).unwrap_err();
+        assert_eq!(error.value(), value, "unregistered event {value}");
+    }
+}
+
+fn matching_states(kind: LifecycleObjectKind) -> Vec<LifecycleObjectState> {
     match kind {
-        evidence_registry::LifecycleObjectKind::Registry => vec![
+        LifecycleObjectKind::Registry => vec![
             LifecycleObjectState::Registry(RegistryLifecycleState::Absent),
             LifecycleObjectState::Registry(RegistryLifecycleState::InitializedAuthoritative),
         ],
-        evidence_registry::LifecycleObjectKind::FreezeAttempt => vec![
+        LifecycleObjectKind::FreezeAttempt => vec![
             LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Absent),
             LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Open),
             LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Committed),
             LifecycleObjectState::FreezeAttempt(FreezeAttemptState::AbortedRecovery),
             LifecycleObjectState::FreezeAttempt(FreezeAttemptState::AbortedByOperatorAssertion),
         ],
-        evidence_registry::LifecycleObjectKind::ReviewAdmissionAttempt => vec![
+        LifecycleObjectKind::ReviewAdmissionAttempt => vec![
             LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Absent),
             LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Accepted),
             LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Rejected),
         ],
-        evidence_registry::LifecycleObjectKind::CloseoutAttempt => vec![
+        LifecycleObjectKind::CloseoutAttempt => vec![
             LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Absent),
             LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Committed),
             LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Rejected),
         ],
-        evidence_registry::LifecycleObjectKind::ArtifactEvictionAttempt => vec![
+        LifecycleObjectKind::ArtifactEvictionAttempt => vec![
             LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Absent),
             LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Open),
             LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Committed),
