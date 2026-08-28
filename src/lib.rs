@@ -710,6 +710,12 @@ impl JournalReference {
         self.entry_hash
     }
 
+    /// The referenced registered event type. This is structural metadata only;
+    /// resolving the referenced Entry and its authority requires retained context.
+    pub fn event_type_id(&self) -> EventTypeId {
+        self.event_type_id
+    }
+
     /// Emits the exact deterministic CBOR array required by §51.
     pub fn authoritative_cbor(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(107);
@@ -788,6 +794,174 @@ impl GenesisJournalEntry {
             .try_into()
             .expect("SHA-256 always returns exactly 32 bytes");
         JournalEntryHash(digest)
+    }
+
+    /// Strictly decodes the complete fixed GENESIS Journal Entry grammar.
+    ///
+    /// This verifies canonical CBOR and the GENESIS-only structural relations;
+    /// it deliberately does not load or validate the referenced GENESIS Record.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, JournalEntryDecodeError> {
+        let common = decode_common_journal_entry(input)?;
+        if common.entry_index.value() != 0
+            || common.previous_entry_hash.is_some()
+            || common.event_type_id.value() != 1
+            || common.lifecycle_object_kind != LifecycleObjectKind::Registry
+            || common.lifecycle_object_id != *common.registry_id.as_bytes()
+            || !common.identity_dependencies.elements.is_empty()
+            || !common.authority_dependencies.elements.is_empty()
+        {
+            return Err(JournalEntryDecodeError);
+        }
+
+        let decoded = Self::new(
+            common.registry_id,
+            common.event_record_id,
+            common.storage_capability_class_id,
+            common.environment_observation_id,
+        );
+        if decoded.authoritative_cbor() != input {
+            return Err(JournalEntryDecodeError);
+        }
+        Ok(decoded)
+    }
+}
+
+/// A structurally framed, non-POST `VERIFICATION_RECORDED` Journal Entry.
+///
+/// This type verifies exact Entry bytes, IDs, dependency collection structure,
+/// and the event's explicit prior Freeze-reference shape. It does not establish
+/// that the referenced Entry exists, has a matching hash, is authoritative, or
+/// that the unavailable Verification Record payload is semantically valid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrdinaryVerificationJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    identity_dependencies: IdentityDependencyCollection,
+    authority_dependencies: AuthorityDependencyCollection,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+/// A rejected ordinary-Verification construction or strict-decode input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrdinaryVerificationJournalEntryError;
+
+/// A rejected Journal Entry byte sequence under the implemented strict grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalEntryDecodeError;
+
+/// Typed fields for constructing the ordinary (non-POST) Verification form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrdinaryVerificationJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub event_record_id: EventRecordId,
+    pub identity_dependencies: IdentityDependencyCollection,
+    pub authority_dependencies: AuthorityDependencyCollection,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+impl OrdinaryVerificationJournalEntry {
+    /// Constructs the ordinary (non-POST) Verification Entry structural form.
+    pub fn new(
+        input: OrdinaryVerificationJournalEntryInput,
+    ) -> Result<Self, OrdinaryVerificationJournalEntryError> {
+        if input.entry_index.value() == 0
+            || input
+                .authority_dependencies
+                .validate_for_context(AuthorityDependencyContext::new(
+                    input.registry_id,
+                    input.entry_index,
+                ))
+                .is_err()
+            || !input.authority_dependencies.contains_event_type(101)
+        {
+            return Err(OrdinaryVerificationJournalEntryError);
+        }
+
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id: input.event_record_id,
+            identity_dependencies: input.identity_dependencies,
+            authority_dependencies: input.authority_dependencies,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    /// Emits the exact canonical Journal Entry framing and ordinary Verification body.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        debug_assert_eq!(JOURNAL_ENTRY_DOMAIN.len(), 32);
+
+        let mut bytes = Vec::with_capacity(331);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, 200);
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x06);
+        bytes.extend_from_slice(&self.identity_dependencies.authoritative_cbor());
+        bytes.push(0x07);
+        bytes.extend_from_slice(&self.authority_dependencies.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x03, 0x09]);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes
+    }
+
+    /// Returns `SHA256(authoritative_cbor())` as the Journal Entry hash.
+    pub fn entry_hash(&self) -> JournalEntryHash {
+        let digest: [u8; ID_LENGTH] = Sha256::digest(self.authoritative_cbor())
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 always returns exactly 32 bytes");
+        JournalEntryHash(digest)
+    }
+
+    /// Strictly decodes an ordinary Verification Entry without normalizing bytes.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, JournalEntryDecodeError> {
+        let common = decode_common_journal_entry(input)?;
+        let previous_entry_hash = common.previous_entry_hash.ok_or(JournalEntryDecodeError)?;
+        if common.entry_index.value() == 0
+            || common.event_type_id.value() != 200
+            || common.lifecycle_object_kind != LifecycleObjectKind::Verification
+            || common.lifecycle_object_id != *common.event_record_id.as_bytes()
+        {
+            return Err(JournalEntryDecodeError);
+        }
+
+        let decoded = Self::new(OrdinaryVerificationJournalEntryInput {
+            registry_id: common.registry_id,
+            entry_index: common.entry_index,
+            previous_entry_hash,
+            event_record_id: common.event_record_id,
+            identity_dependencies: common.identity_dependencies,
+            authority_dependencies: common.authority_dependencies,
+            storage_capability_class_id: common.storage_capability_class_id,
+            environment_observation_id: common.environment_observation_id,
+        })
+        .map_err(|_| JournalEntryDecodeError)?;
+        if decoded.authoritative_cbor() != input {
+            return Err(JournalEntryDecodeError);
+        }
+        Ok(decoded)
     }
 }
 
@@ -890,6 +1064,269 @@ fn encode_uint(output: &mut Vec<u8>, value: u64) {
             (value >> 8) as u8,
             value as u8,
         ]),
+    }
+}
+
+struct DecodedCommonJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: Option<JournalEntryHash>,
+    event_type_id: EventTypeId,
+    event_record_id: EventRecordId,
+    identity_dependencies: IdentityDependencyCollection,
+    authority_dependencies: AuthorityDependencyCollection,
+    lifecycle_object_kind: LifecycleObjectKind,
+    lifecycle_object_id: [u8; ID_LENGTH],
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+fn decode_common_journal_entry(
+    input: &[u8],
+) -> Result<DecodedCommonJournalEntry, JournalEntryDecodeError> {
+    let mut cursor = CborCursor::new(input);
+    cursor.array_exact(2)?;
+    cursor.text_exact(JOURNAL_ENTRY_DOMAIN)?;
+    cursor.map_exact(12)?;
+    cursor.key(0)?;
+    if cursor.uint()? != 1 {
+        return Err(JournalEntryDecodeError);
+    }
+    cursor.key(1)?;
+    let registry_id =
+        RegistryId::try_from(cursor.bstr_32()?.as_slice()).map_err(|_| JournalEntryDecodeError)?;
+    cursor.key(2)?;
+    let entry_index =
+        JournalEntryIndex::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+    cursor.key(3)?;
+    let previous_entry_hash = cursor
+        .null_or_bstr_32()?
+        .map(|bytes| {
+            JournalEntryHash::try_from(bytes.as_slice()).map_err(|_| JournalEntryDecodeError)
+        })
+        .transpose()?;
+    cursor.key(4)?;
+    let event_type_id =
+        EventTypeId::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+    cursor.key(5)?;
+    let event_record_id = EventRecordId::try_from(cursor.bstr_32()?.as_slice())
+        .map_err(|_| JournalEntryDecodeError)?;
+    cursor.key(6)?;
+    let identity_dependencies = decode_identity_dependencies(&mut cursor)?;
+    cursor.key(7)?;
+    let authority_dependencies =
+        decode_authority_dependencies(&mut cursor, registry_id, entry_index)?;
+    cursor.key(8)?;
+    let lifecycle_object_kind =
+        LifecycleObjectKind::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+    cursor.key(9)?;
+    let lifecycle_object_id = cursor.bstr_32()?;
+    cursor.key(10)?;
+    let storage_capability_class_id =
+        RecordId::try_from(cursor.bstr_32()?.as_slice()).map_err(|_| JournalEntryDecodeError)?;
+    cursor.key(11)?;
+    let environment_observation_id =
+        RecordId::try_from(cursor.bstr_32()?.as_slice()).map_err(|_| JournalEntryDecodeError)?;
+    if !cursor.finished() {
+        return Err(JournalEntryDecodeError);
+    }
+    Ok(DecodedCommonJournalEntry {
+        registry_id,
+        entry_index,
+        previous_entry_hash,
+        event_type_id,
+        event_record_id,
+        identity_dependencies,
+        authority_dependencies,
+        lifecycle_object_kind,
+        lifecycle_object_id,
+        storage_capability_class_id,
+        environment_observation_id,
+    })
+}
+
+fn decode_identity_dependencies(
+    cursor: &mut CborCursor<'_>,
+) -> Result<IdentityDependencyCollection, JournalEntryDecodeError> {
+    let length = cursor.array()?;
+    if length > cursor.remaining() / 36 {
+        return Err(JournalEntryDecodeError);
+    }
+    let mut elements = Vec::with_capacity(length);
+    for _ in 0..length {
+        cursor.array_exact(2)?;
+        let kind = IdentityDependencyKind::try_from(cursor.uint()?)
+            .map_err(|_| JournalEntryDecodeError)?;
+        let bytes = cursor.bstr_32()?;
+        elements.push(match kind {
+            IdentityDependencyKind::RecordId => IdentityDependency::record_id(
+                RecordId::try_from(bytes.as_slice()).map_err(|_| JournalEntryDecodeError)?,
+            ),
+            IdentityDependencyKind::JournalAnchorId => IdentityDependency::journal_anchor_id(
+                JournalAnchorId::try_from(bytes.as_slice()).map_err(|_| JournalEntryDecodeError)?,
+            ),
+        });
+    }
+    IdentityDependencyCollection::from_authoritative_ordered_elements(elements)
+        .map_err(|_| JournalEntryDecodeError)
+}
+
+fn decode_authority_dependencies(
+    cursor: &mut CborCursor<'_>,
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+) -> Result<AuthorityDependencyCollection, JournalEntryDecodeError> {
+    let length = cursor.array()?;
+    if length > cursor.remaining() / 107 {
+        return Err(JournalEntryDecodeError);
+    }
+    let mut elements = Vec::with_capacity(length);
+    for _ in 0..length {
+        cursor.array_exact(5)?;
+        let reference_registry = RegistryId::try_from(cursor.bstr_32()?.as_slice())
+            .map_err(|_| JournalEntryDecodeError)?;
+        let reference_index =
+            JournalEntryIndex::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+        let reference_hash = JournalEntryHash::try_from(cursor.bstr_32()?.as_slice())
+            .map_err(|_| JournalEntryDecodeError)?;
+        let reference_event =
+            EventTypeId::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+        let reference_record = EventRecordId::try_from(cursor.bstr_32()?.as_slice())
+            .map_err(|_| JournalEntryDecodeError)?;
+        elements.push(JournalReference::new(
+            reference_registry,
+            reference_index,
+            reference_hash,
+            reference_event,
+            reference_record,
+        ));
+    }
+    AuthorityDependencyCollection::from_authoritative_ordered_elements(
+        AuthorityDependencyContext::new(registry_id, entry_index),
+        elements,
+    )
+    .map_err(|_| JournalEntryDecodeError)
+}
+
+struct CborCursor<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CborCursor<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.input.len().saturating_sub(self.offset)
+    }
+
+    fn finished(&self) -> bool {
+        self.offset == self.input.len()
+    }
+
+    fn byte(&mut self) -> Result<u8, JournalEntryDecodeError> {
+        let result = *self.input.get(self.offset).ok_or(JournalEntryDecodeError)?;
+        self.offset += 1;
+        Ok(result)
+    }
+
+    fn argument(&mut self, additional: u8) -> Result<u64, JournalEntryDecodeError> {
+        let (width, minimum) = match additional {
+            value @ 0..=23 => return Ok(u64::from(value)),
+            24 => (1, 24),
+            25 => (2, 0x100),
+            26 => (4, 0x1_0000),
+            27 => (8, 0x1_0000_0000),
+            _ => return Err(JournalEntryDecodeError),
+        };
+        let mut value = 0_u64;
+        for _ in 0..width {
+            value = (value << 8) | u64::from(self.byte()?);
+        }
+        if value < minimum || value > ER_UINT_MAX {
+            return Err(JournalEntryDecodeError);
+        }
+        Ok(value)
+    }
+
+    fn initial(&mut self, major: u8) -> Result<u64, JournalEntryDecodeError> {
+        let initial = self.byte()?;
+        if initial >> 5 != major {
+            return Err(JournalEntryDecodeError);
+        }
+        self.argument(initial & 0x1f)
+    }
+
+    fn uint(&mut self) -> Result<u64, JournalEntryDecodeError> {
+        self.initial(0)
+    }
+
+    fn array(&mut self) -> Result<usize, JournalEntryDecodeError> {
+        usize::try_from(self.initial(4)?).map_err(|_| JournalEntryDecodeError)
+    }
+
+    fn array_exact(&mut self, expected: usize) -> Result<(), JournalEntryDecodeError> {
+        if self.array()? != expected {
+            return Err(JournalEntryDecodeError);
+        }
+        Ok(())
+    }
+
+    fn map_exact(&mut self, expected: usize) -> Result<(), JournalEntryDecodeError> {
+        let actual = usize::try_from(self.initial(5)?).map_err(|_| JournalEntryDecodeError)?;
+        if actual != expected {
+            return Err(JournalEntryDecodeError);
+        }
+        Ok(())
+    }
+
+    fn text_exact(&mut self, expected: &[u8]) -> Result<(), JournalEntryDecodeError> {
+        let length = usize::try_from(self.initial(3)?).map_err(|_| JournalEntryDecodeError)?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(JournalEntryDecodeError)?;
+        if self.input.get(self.offset..end) != Some(expected) {
+            return Err(JournalEntryDecodeError);
+        }
+        self.offset = end;
+        Ok(())
+    }
+
+    fn bstr_32(&mut self) -> Result<[u8; ID_LENGTH], JournalEntryDecodeError> {
+        if self.initial(2)? != ID_LENGTH as u64 {
+            return Err(JournalEntryDecodeError);
+        }
+        let end = self
+            .offset
+            .checked_add(ID_LENGTH)
+            .ok_or(JournalEntryDecodeError)?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or(JournalEntryDecodeError)?
+            .try_into()
+            .map_err(|_| JournalEntryDecodeError)?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn null_or_bstr_32(&mut self) -> Result<Option<[u8; ID_LENGTH]>, JournalEntryDecodeError> {
+        if self.input.get(self.offset) == Some(&0xf6) {
+            self.offset += 1;
+            Ok(None)
+        } else {
+            self.bstr_32().map(Some)
+        }
+    }
+
+    fn key(&mut self, expected: u64) -> Result<(), JournalEntryDecodeError> {
+        if self.uint()? != expected {
+            return Err(JournalEntryDecodeError);
+        }
+        Ok(())
     }
 }
 
@@ -1136,6 +1573,28 @@ impl AuthorityDependencyCollection {
             }
         }
         Ok(Self { elements })
+    }
+
+    fn validate_for_context(
+        &self,
+        context: AuthorityDependencyContext,
+    ) -> Result<(), AuthorityDependencyCollectionError> {
+        validate_authority_dependency_context(context, &self.elements)?;
+        validate_authority_dependency_indices(&self.elements)?;
+        for pair in self.elements.windows(2) {
+            if (pair[0].entry_index(), pair[0].entry_hash())
+                > (pair[1].entry_index(), pair[1].entry_hash())
+            {
+                return Err(AuthorityDependencyCollectionError::NonCanonicalOrder);
+            }
+        }
+        Ok(())
+    }
+
+    fn contains_event_type(&self, event_type_id: u16) -> bool {
+        self.elements
+            .iter()
+            .any(|reference| reference.event_type_id().value() == event_type_id)
     }
 
     /// Emits the always-present, definite-length canonical dependency array from §58.
