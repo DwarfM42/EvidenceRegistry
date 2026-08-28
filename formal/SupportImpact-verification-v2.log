@@ -1,0 +1,4 @@
+COMMAND=D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe verify --cores:1 --resource-limit:100000 formal/SupportImpact.dfy
+DAFNY_VERSION=4.11.0+fcb2042d6d043a2634f0854338c08feeaaaf4ae2
+Z3_VERSION=4.12.1
+RESULT=Dafny program verifier finished with 11 verified, 0 errors

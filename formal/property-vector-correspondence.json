@@ -36,6 +36,30 @@
       "proof_id": "UnaffectedIsLeftIdentity",
       "corresponding_vector_ids": [],
       "implementation_check_ids": []
+    },
+    {
+      "property_id": "FORMAL-SUPPORT-INVALIDATION-ABSORBING-001",
+      "proof_id": "SupportInvalidationIsAbsorbing",
+      "corresponding_vector_ids": [],
+      "implementation_check_ids": []
+    },
+    {
+      "property_id": "FORMAL-SUPPORT-DEGRADATION-NONREVIVING-001",
+      "proof_id": "SupportDegradationIsNonReviving",
+      "corresponding_vector_ids": [],
+      "implementation_check_ids": []
+    },
+    {
+      "property_id": "FORMAL-CLOSEOUT-SUPPORT-NONREVIVING-001",
+      "proof_id": "CloseoutSupportIsNonReviving",
+      "corresponding_vector_ids": [],
+      "implementation_check_ids": []
+    },
+    {
+      "property_id": "FORMAL-SUPPORT-INDETERMINATE-MAY-RESOLVE-UNAFF-001",
+      "proof_id": "IndeterminateMayResolveUnaffected",
+      "corresponding_vector_ids": [],
+      "implementation_check_ids": []
     }
   ]
 }

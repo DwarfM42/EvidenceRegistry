@@ -1,0 +1,26 @@
+{
+  "provenance_id": "FORMAL-TOOL-PROVENANCE-SUPPORTIMPACT-002",
+  "status": "external implementation provenance; not an EvidenceRegistry Formal Verification Record",
+  "observed_at": "2026-08-28T16:58:56+09:00",
+  "formal_source": "formal/SupportImpact.dfy",
+  "retained_verification_log": "formal/SupportImpact-verification-v2.log",
+  "invocation": "D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe verify --cores:1 --resource-limit:100000 formal/SupportImpact.dfy",
+  "dafny": {
+    "executable": "D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe",
+    "version": "4.11.0+fcb2042d6d043a2634f0854338c08feeaaaf4ae2"
+  },
+  "solver": {
+    "name": "Z3",
+    "executable": "D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/z3/bin/z3-4.12.1.exe",
+    "version": "4.12.1"
+  },
+  "verification_configuration": {
+    "cores": 1,
+    "resource_limit": 100000,
+    "verification_time_limit": "default 30 seconds per assertion batch; no explicit override"
+  },
+  "result": {
+    "verified": 11,
+    "errors": 0
+  }
+}
