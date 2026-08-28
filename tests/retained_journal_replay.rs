@@ -2,7 +2,7 @@ use evidence_registry::{
     derive_freeze_root, validate_state_only_legal_transition, EventRecordId, FreezeAttemptId,
     FreezeAttemptState, GenesisJournalEntry, JournalEntryHash, JournalEntryIndex, JournalReference,
     LifecycleObjectKind, LifecycleObjectState, OneShotRecordedState, RecordId, RegistryId,
-    RegistryLifecycleState, RetainedJournal, RetainedJournalError,
+    RegistryLifecycleState, ResolvedJournalReference, RetainedJournal, RetainedJournalError,
 };
 
 fn id(first: u8) -> [u8; 32] {
@@ -414,7 +414,24 @@ fn retained_genesis_replays_registry_state_and_resolves_its_exact_reference() {
         evidence_registry::EventTypeId::try_from(1_u64).unwrap(),
         EventRecordId::try_from(id(0x20).as_slice()).unwrap(),
     );
-    assert!(journal.resolve_reference(&exact_reference).is_ok());
+    let resolved: ResolvedJournalReference = journal.resolve_reference(&exact_reference).unwrap();
+    assert_eq!(resolved.registry_id(), exact_reference.registry_id());
+    assert_eq!(resolved.entry_index(), exact_reference.entry_index());
+    assert_eq!(resolved.entry_hash(), exact_reference.entry_hash());
+    assert_eq!(resolved.event_type_id(), exact_reference.event_type_id());
+    assert_eq!(
+        resolved.event_record_id(),
+        exact_reference.event_record_id()
+    );
+    assert_eq!(resolved.previous_entry_hash(), None);
+    assert_eq!(
+        resolved.lifecycle_object_kind(),
+        LifecycleObjectKind::Registry
+    );
+    assert_eq!(
+        resolved.lifecycle_object_id(),
+        *exact_reference.registry_id().as_bytes()
+    );
 
     let wrong_hash = JournalReference::new(
         RegistryId::try_from(id(0x00).as_slice()).unwrap(),

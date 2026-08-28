@@ -1101,6 +1101,65 @@ pub enum RetainedJournalError {
     UnsupportedEntry,
 }
 
+/// Exact retained-history facts resolved from one JournalReference.
+///
+/// This is a resolution result, not an authority or admission verdict. It
+/// exposes only retained Entry identity, chain position, and lifecycle facts
+/// required by a caller that must perform further contextual validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedJournalReference {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    entry_hash: JournalEntryHash,
+    previous_entry_hash: Option<JournalEntryHash>,
+    event_type_id: EventTypeId,
+    event_record_id: EventRecordId,
+    lifecycle_object_kind: LifecycleObjectKind,
+    lifecycle_object_id: [u8; ID_LENGTH],
+}
+
+impl ResolvedJournalReference {
+    /// The retained Registry identity of the resolved Entry.
+    pub fn registry_id(&self) -> RegistryId {
+        self.registry_id
+    }
+
+    /// The exact retained Journal index of the resolved Entry.
+    pub fn entry_index(&self) -> JournalEntryIndex {
+        self.entry_index
+    }
+
+    /// The recomputed hash of the exact retained Entry bytes.
+    pub fn entry_hash(&self) -> JournalEntryHash {
+        self.entry_hash
+    }
+
+    /// The predecessor hash retained by this Entry, or `None` for GENESIS.
+    pub fn previous_entry_hash(&self) -> Option<JournalEntryHash> {
+        self.previous_entry_hash
+    }
+
+    /// The retained registered event type.
+    pub fn event_type_id(&self) -> EventTypeId {
+        self.event_type_id
+    }
+
+    /// The event Record identity bound into the retained Entry.
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+
+    /// The retained lifecycle-object kind.
+    pub fn lifecycle_object_kind(&self) -> LifecycleObjectKind {
+        self.lifecycle_object_kind
+    }
+
+    /// The retained lifecycle-object identity.
+    pub fn lifecycle_object_id(&self) -> [u8; ID_LENGTH] {
+        self.lifecycle_object_id
+    }
+}
+
 /// A contiguous, in-memory retained Journal for the currently implemented
 /// strict Entry subset.
 ///
@@ -1593,11 +1652,12 @@ impl RetainedJournal {
     /// Resolves every field of a JournalReference against retained Entry bytes.
     ///
     /// A successful result does not establish that the referenced event carried
-    /// authority; it only establishes retained-history identity agreement.
+    /// authority; it only establishes retained-history identity agreement and
+    /// returns the exact facts available for later contextual validation.
     pub fn resolve_reference(
         &self,
         reference: &JournalReference,
-    ) -> Result<(), RetainedJournalError> {
+    ) -> Result<ResolvedJournalReference, RetainedJournalError> {
         if reference.registry_id() != self.registry_id {
             return Err(RetainedJournalError::ReferenceMismatch);
         }
@@ -1615,7 +1675,16 @@ impl RetainedJournal {
         {
             return Err(RetainedJournalError::ReferenceMismatch);
         }
-        Ok(())
+        Ok(ResolvedJournalReference {
+            registry_id: entry.registry_id(),
+            entry_index: entry.entry_index(),
+            entry_hash: entry.entry_hash(),
+            previous_entry_hash: entry.previous_entry_hash(),
+            event_type_id: entry.event_type_id(),
+            event_record_id: entry.event_record_id(),
+            lifecycle_object_kind: entry.lifecycle_object_kind(),
+            lifecycle_object_id: entry.lifecycle_object_id(),
+        })
     }
 
     /// Replays every supported retained Entry from GENESIS.
