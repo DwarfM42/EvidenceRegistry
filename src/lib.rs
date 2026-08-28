@@ -2396,6 +2396,57 @@ impl<'a> CborCursor<'a> {
         }
         Ok(())
     }
+
+    fn skip_value(&mut self) -> Result<(), JournalEntryDecodeError> {
+        let initial = self.byte()?;
+        let major = initial >> 5;
+        let argument = self.argument(initial & 0x1f)?;
+        match major {
+            0 => Ok(()),
+            2 | 3 => {
+                let length = usize::try_from(argument).map_err(|_| JournalEntryDecodeError)?;
+                let end = self
+                    .offset
+                    .checked_add(length)
+                    .ok_or(JournalEntryDecodeError)?;
+                let bytes = self
+                    .input
+                    .get(self.offset..end)
+                    .ok_or(JournalEntryDecodeError)?;
+                if major == 3 {
+                    std::str::from_utf8(bytes).map_err(|_| JournalEntryDecodeError)?;
+                }
+                self.offset = end;
+                Ok(())
+            }
+            4 => {
+                for _ in 0..argument {
+                    self.skip_value()?;
+                }
+                Ok(())
+            }
+            5 => {
+                let mut previous_key: Option<(usize, usize)> = None;
+                for _ in 0..argument {
+                    let key_start = self.offset;
+                    self.skip_value()?;
+                    let key_end = self.offset;
+                    if let Some((previous_start, previous_end)) = previous_key {
+                        let previous = &self.input[previous_start..previous_end];
+                        let current = &self.input[key_start..key_end];
+                        if (previous.len(), previous) >= (current.len(), current) {
+                            return Err(JournalEntryDecodeError);
+                        }
+                    }
+                    previous_key = Some((key_start, key_end));
+                    self.skip_value()?;
+                }
+                Ok(())
+            }
+            7 if matches!(argument, 20 | 21) => Ok(()),
+            _ => Err(JournalEntryDecodeError),
+        }
+    }
 }
 
 /// A content-addressed EvidenceRegistry Record identity in authoritative 32-byte form.
@@ -2410,6 +2461,95 @@ define_32_byte_identity!(RecordId);
 define_32_byte_identity!(JournalAnchorId);
 
 const RECORD_DOMAIN: &[u8] = b"EvidenceRegistry.Record.v1";
+
+/// Strictly validated Record framing and self-hash identity.
+///
+/// This validates the canonical v0.3 Record envelope, the duplicated type and
+/// schema values, and the exact-byte Record identity. It deliberately does not
+/// validate a type-local body schema, resolve a Record, or establish authority
+/// or admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrictRecordFrame {
+    record_type_id: RecordTypeId,
+    schema_version: u64,
+    record_id: RecordId,
+    authoritative_bytes: Vec<u8>,
+}
+
+impl StrictRecordFrame {
+    /// Strictly decodes canonical Record framing without normalizing its bytes.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        let record_type_id = RecordTypeId::try_from(cursor.uint().map_err(|_| RecordDecodeError)?)
+            .map_err(|_| RecordDecodeError)?;
+        let schema_version = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if schema_version != 1 {
+            return Err(RecordDecodeError);
+        }
+
+        let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if field_count < 2 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != schema_version {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if RecordTypeId::try_from(cursor.uint().map_err(|_| RecordDecodeError)?)
+            .map_err(|_| RecordDecodeError)?
+            != record_type_id
+        {
+            return Err(RecordDecodeError);
+        }
+        let mut previous_key = 1;
+        for _ in 2..field_count {
+            let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+            if key <= previous_key {
+                return Err(RecordDecodeError);
+            }
+            previous_key = key;
+            cursor.skip_value().map_err(|_| RecordDecodeError)?;
+        }
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        let digest: [u8; ID_LENGTH] = Sha256::digest(input)
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 always returns exactly 32 bytes");
+        Ok(Self {
+            record_type_id,
+            schema_version,
+            record_id: RecordId(digest),
+            authoritative_bytes: input.to_vec(),
+        })
+    }
+
+    /// The exact type declared by the validated Record frame.
+    pub fn record_type_id(&self) -> RecordTypeId {
+        self.record_type_id
+    }
+
+    /// The exact schema version declared by the validated Record frame.
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
+    /// The immutable SHA-256 identity of the validated exact Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The original canonical Record bytes; no normalization is performed.
+    pub fn authoritative_cbor(&self) -> &[u8] {
+        &self.authoritative_bytes
+    }
+}
 
 /// Typed, Record-local fields for the frozen GENESIS Record schema.
 ///
