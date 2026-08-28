@@ -277,3 +277,42 @@ fn ordinary_verification_fixture_retains_scope_and_independent_reconstruction_me
         );
     }
 }
+
+#[test]
+fn ordinary_verification_strict_decoder_accepts_compact_canonical_authority_dependencies() {
+    let registry = RegistryId::try_from(id(0x00).as_slice()).unwrap();
+    let entry_index = JournalEntryIndex::try_from(87_u64).unwrap();
+    let authority_dependencies = AuthorityDependencyCollection::from_unordered_semantic_elements(
+        AuthorityDependencyContext::new(registry, entry_index),
+        (1_u64..=86)
+            .map(|reference_index| {
+                JournalReference::new(
+                    registry,
+                    JournalEntryIndex::try_from(reference_index).unwrap(),
+                    JournalEntryHash::try_from([reference_index as u8; 32].as_slice()).unwrap(),
+                    EventTypeId::try_from(if reference_index == 86 { 101 } else { 1 }).unwrap(),
+                    EventRecordId::try_from([reference_index as u8; 32].as_slice()).unwrap(),
+                )
+            })
+            .collect(),
+    )
+    .expect("canonical compact references are structurally valid without resolution");
+    let entry = OrdinaryVerificationJournalEntry::new(OrdinaryVerificationJournalEntryInput {
+        registry_id: registry,
+        entry_index,
+        previous_entry_hash: JournalEntryHash::try_from(id(0x20).as_slice()).unwrap(),
+        event_record_id: EventRecordId::try_from(id(0x40).as_slice()).unwrap(),
+        identity_dependencies: IdentityDependencyCollection::from_unordered_semantic_elements(
+            vec![],
+        )
+        .unwrap(),
+        authority_dependencies,
+        storage_capability_class_id: RecordId::try_from(id(0xa0).as_slice()).unwrap(),
+        environment_observation_id: RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    })
+    .expect("a compact structural dependency array is a valid ordinary Verification entry");
+    let bytes = entry.authoritative_cbor();
+    let decoded = OrdinaryVerificationJournalEntry::decode_authoritative(&bytes)
+        .expect("JRN-REGRESSION-COMPACT-AUTHORITY-DEPS-001");
+    assert_eq!(decoded.authoritative_cbor(), bytes);
+}

@@ -1206,7 +1206,10 @@ fn decode_authority_dependencies(
     entry_index: JournalEntryIndex,
 ) -> Result<AuthorityDependencyCollection, JournalEntryDecodeError> {
     let length = cursor.array()?;
-    if length > cursor.remaining() / 107 {
+    // A canonical JournalReference is at least 105 bytes: array(5), three
+    // bstr(32) fields, and one-byte encodings for index and event type.
+    // This only bounds allocation; the parser still validates every element.
+    if length > cursor.remaining() / 105 {
         return Err(JournalEntryDecodeError);
     }
     let mut elements = Vec::with_capacity(length);
