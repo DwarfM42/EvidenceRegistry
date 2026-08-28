@@ -1535,6 +1535,18 @@ impl RetainedJournal {
         }
         self.resolve_reference(freeze_authority_reference)
             .map_err(|_| RetainedJournalError::DecodeError)?;
+        let freeze_authority = self
+            .entries
+            .get(
+                usize::try_from(freeze_authority_reference.entry_index().value())
+                    .map_err(|_| RetainedJournalError::DecodeError)?,
+            )
+            .ok_or(RetainedJournalError::DecodeError)?;
+        if freeze_authority.event_type_id().value() != 101
+            || freeze_authority.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
         self.preflight_unsupported_common(&common)?;
         Ok(())
     }

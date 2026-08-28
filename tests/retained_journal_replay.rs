@@ -171,6 +171,79 @@ fn eviction_started_bytes_with_mismatched_attempt_id(
     bytes
 }
 
+fn eviction_started_bytes(
+    previous_entry_hash: JournalEntryHash,
+    freeze_authority_entry_index: u8,
+    freeze_authority_entry_hash: JournalEntryHash,
+    freeze_authority_event_type_id: u8,
+    freeze_authority_event_record_id: [u8; 32],
+) -> Vec<u8> {
+    fn append_reference(
+        output: &mut Vec<u8>,
+        entry_index: u8,
+        entry_hash: JournalEntryHash,
+        event_type_id: u8,
+        event_record_id: [u8; 32],
+    ) {
+        output.extend_from_slice(&[0x85, 0x58, 0x20]);
+        output.extend_from_slice(&id(0x00));
+        output.push(entry_index);
+        output.extend_from_slice(&[0x58, 0x20]);
+        output.extend_from_slice(entry_hash.as_bytes());
+        if event_type_id < 24 {
+            output.push(event_type_id);
+        } else {
+            output.extend_from_slice(&[0x18, event_type_id]);
+        }
+        output.extend_from_slice(&[0x58, 0x20]);
+        output.extend_from_slice(&event_record_id);
+    }
+
+    let mut bytes = Vec::with_capacity(560);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xb0);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x03, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x19, 0x02, 0xbc, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x84));
+    bytes.extend_from_slice(&[0x06, 0x82, 0x82, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xc0));
+    bytes.extend_from_slice(&[0x82, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xd0));
+    bytes.extend_from_slice(&[0x07, 0x81]);
+    append_reference(
+        &mut bytes,
+        freeze_authority_entry_index,
+        freeze_authority_entry_hash,
+        freeze_authority_event_type_id,
+        freeze_authority_event_record_id,
+    );
+    bytes.extend_from_slice(&[0x08, 0x09, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xb0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x15, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xb0));
+    bytes.push(0x16);
+    append_reference(
+        &mut bytes,
+        freeze_authority_entry_index,
+        freeze_authority_entry_hash,
+        freeze_authority_event_type_id,
+        freeze_authority_event_record_id,
+    );
+    bytes.extend_from_slice(&[0x17, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xc0));
+    bytes.extend_from_slice(&[0x18, 0x18, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xd0));
+    bytes
+}
+
 fn freeze_committed_bytes(
     previous_entry_hash: JournalEntryHash,
     freeze_start_hash: JournalEntryHash,
@@ -750,6 +823,49 @@ fn retained_journal_rejects_an_eviction_start_with_mismatched_attempt_identity()
         Err(RetainedJournalError::DecodeError)
     );
     assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn retained_journal_classifies_eviction_freeze_authority_by_exact_event_type() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+    let freeze_committed_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+
+    assert_eq!(
+        journal.append_strict_entry(&eviction_started_bytes(
+            freeze_committed_hash,
+            2,
+            freeze_committed_hash,
+            101,
+            id(0x81),
+        )),
+        Err(RetainedJournalError::UnsupportedEntry)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
+
+    assert_eq!(
+        journal.append_strict_entry(&eviction_started_bytes(
+            freeze_committed_hash,
+            0,
+            genesis.entry_hash(),
+            1,
+            id(0x20),
+        )),
+        Err(RetainedJournalError::DecodeError)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
 }
 
 #[test]
