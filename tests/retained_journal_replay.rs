@@ -18,6 +18,48 @@ fn genesis() -> GenesisJournalEntry {
     )
 }
 
+const INDEPENDENT_GENESIS_ENTRY_HASH: [u8; 32] = [
+    0xae, 0x19, 0x19, 0x54, 0x9c, 0x80, 0xa0, 0xc3, 0x70, 0x8c, 0xce, 0x04, 0x85, 0xaf, 0x88, 0x1a,
+    0x52, 0x23, 0xfb, 0xcf, 0x80, 0xc6, 0xb2, 0x7a, 0x2b, 0xbe, 0x60, 0x24, 0x18, 0xda, 0xbd, 0x51,
+];
+const INDEPENDENT_REVIEW_REQUEST_ENTRY_HASH: [u8; 32] = [
+    0xd2, 0x25, 0xef, 0xc3, 0xd9, 0x6d, 0xc4, 0xb2, 0x66, 0x7f, 0xa8, 0x8c, 0xd3, 0xa3, 0xf4, 0xaf,
+    0xe2, 0x0e, 0x23, 0x70, 0x5e, 0x35, 0x15, 0x93, 0x55, 0x34, 0xb0, 0xac, 0x6b, 0x4b, 0x6a, 0xe7,
+];
+
+/// Direct fixed framing for the Common Review Request Entry. Its predecessor
+/// and expected Entry hash are independent constants, rather than values read
+/// back from RetainedJournal reconstruction.
+fn independently_construct_review_request_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(260);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xac);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x01, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(&INDEPENDENT_GENESIS_ENTRY_HASH);
+    bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x2c, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x80));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x04, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x80));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes
+}
+
+fn independent_review_request_reference(entry_index: u64) -> JournalReference {
+    JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(entry_index).unwrap(),
+        JournalEntryHash::try_from(INDEPENDENT_REVIEW_REQUEST_ENTRY_HASH.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
+        EventRecordId::try_from(id(0x80).as_slice()).unwrap(),
+    )
+}
+
 fn review_request_bytes(previous_entry_hash: JournalEntryHash) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(225);
     bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
@@ -447,27 +489,26 @@ fn retained_genesis_replays_registry_state_and_resolves_its_exact_reference() {
 }
 
 #[test]
-fn retained_journal_resolves_a_common_entry_with_its_exact_chain_and_lifecycle_facts() {
+fn retained_journal_resolves_a_common_entry_from_independently_bound_bytes() {
     let genesis = genesis();
-    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    assert_eq!(
+        genesis.entry_hash().as_bytes(),
+        &INDEPENDENT_GENESIS_ENTRY_HASH
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
     journal
-        .append_strict_entry(&review_request_bytes(genesis.entry_hash()))
+        .append_strict_entry(&independently_construct_review_request_bytes())
         .unwrap();
 
-    let head = journal.reconstruct_state().unwrap();
-    let exact_reference = JournalReference::new(
-        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
-        JournalEntryIndex::try_from(1_u64).unwrap(),
-        head.journal_head_hash(),
-        evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
-        EventRecordId::try_from(id(0x80).as_slice()).unwrap(),
-    );
-
+    let exact_reference = independent_review_request_reference(1);
     let resolved = journal.resolve_reference(&exact_reference).unwrap();
     assert_eq!(resolved.registry_id(), exact_reference.registry_id());
     assert_eq!(resolved.entry_index(), exact_reference.entry_index());
     assert_eq!(resolved.entry_hash(), exact_reference.entry_hash());
-    assert_eq!(resolved.previous_entry_hash(), Some(genesis.entry_hash()));
+    assert_eq!(
+        resolved.previous_entry_hash(),
+        Some(JournalEntryHash::try_from(INDEPENDENT_GENESIS_ENTRY_HASH.as_slice()).unwrap())
+    );
     assert_eq!(resolved.event_type_id(), exact_reference.event_type_id());
     assert_eq!(
         resolved.event_record_id(),
@@ -485,6 +526,74 @@ fn retained_journal_resolves_a_common_entry_with_its_exact_chain_and_lifecycle_f
     assert_eq!(
         resolved.environment_observation_id(),
         RecordId::try_from(id(0x60).as_slice()).unwrap()
+    );
+}
+
+#[test]
+fn retained_journal_rejects_absent_or_nonidentical_common_references() {
+    let genesis = genesis();
+    assert_eq!(
+        genesis.entry_hash().as_bytes(),
+        &INDEPENDENT_GENESIS_ENTRY_HASH
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal
+        .append_strict_entry(&independently_construct_review_request_bytes())
+        .unwrap();
+
+    let exact_reference = independent_review_request_reference(1);
+    let wrong_registry = JournalReference::new(
+        RegistryId::try_from(id(0x01).as_slice()).unwrap(),
+        exact_reference.entry_index(),
+        exact_reference.entry_hash(),
+        exact_reference.event_type_id(),
+        exact_reference.event_record_id(),
+    );
+    assert_eq!(
+        journal.resolve_reference(&wrong_registry),
+        Err(RetainedJournalError::ReferenceMismatch)
+    );
+
+    let absent_index = independent_review_request_reference(2);
+    assert_eq!(
+        journal.resolve_reference(&absent_index),
+        Err(RetainedJournalError::MissingReference)
+    );
+
+    let wrong_hash = JournalReference::new(
+        exact_reference.registry_id(),
+        exact_reference.entry_index(),
+        JournalEntryHash::try_from(id(0x81).as_slice()).unwrap(),
+        exact_reference.event_type_id(),
+        exact_reference.event_record_id(),
+    );
+    assert_eq!(
+        journal.resolve_reference(&wrong_hash),
+        Err(RetainedJournalError::ReferenceMismatch)
+    );
+
+    let wrong_event_type = JournalReference::new(
+        exact_reference.registry_id(),
+        exact_reference.entry_index(),
+        exact_reference.entry_hash(),
+        evidence_registry::EventTypeId::try_from(1_u64).unwrap(),
+        exact_reference.event_record_id(),
+    );
+    assert_eq!(
+        journal.resolve_reference(&wrong_event_type),
+        Err(RetainedJournalError::ReferenceMismatch)
+    );
+
+    let wrong_event_record = JournalReference::new(
+        exact_reference.registry_id(),
+        exact_reference.entry_index(),
+        exact_reference.entry_hash(),
+        exact_reference.event_type_id(),
+        EventRecordId::try_from(id(0x81).as_slice()).unwrap(),
+    );
+    assert_eq!(
+        journal.resolve_reference(&wrong_event_record),
+        Err(RetainedJournalError::ReferenceMismatch)
     );
 }
 
