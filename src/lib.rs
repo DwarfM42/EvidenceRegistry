@@ -2551,6 +2551,121 @@ impl StrictRecordFrame {
     }
 }
 
+/// Typed, Record-local fields for the frozen FREEZE_ATTEMPT_START Record schema.
+///
+/// The Registry-relative root derivation and any later Journal authority binding
+/// require external context, so they are intentionally not inferred here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartRecordInput {
+    pub freeze_attempt_id: FreezeAttemptId,
+    pub intended_root_id: IntendedRootId,
+    pub subject_id: [u8; ID_LENGTH],
+    pub policy_record_id: RecordId,
+}
+
+/// The exact-byte, Record-local FREEZE_ATTEMPT_START schema from Record Schema v0.3 §55.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartRecord {
+    input: FreezeAttemptStartRecordInput,
+}
+
+impl FreezeAttemptStartRecord {
+    /// Constructs the locally well-typed Record fields without an authority claim.
+    pub fn new(input: FreezeAttemptStartRecordInput) -> Self {
+        Self { input }
+    }
+
+    /// Returns the exact Record-local fields without inferring external context.
+    pub fn input(&self) -> &FreezeAttemptStartRecordInput {
+        &self.input
+    }
+
+    /// The frozen Record Type ID for FREEZE_ATTEMPT_START.
+    pub fn record_type_id(&self) -> RecordTypeId {
+        RecordTypeId::try_from(3).expect("FREEZE_ATTEMPT_START is assigned in Record Schema v0.3")
+    }
+
+    /// Emits the exact canonical Record framing and all required local fields.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        debug_assert_eq!(RECORD_DOMAIN.len(), 26);
+        let mut bytes = Vec::with_capacity(180);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x03, 0x01, 0xa6, 0x00, 0x01, 0x01, 0x03, 0x10]);
+        encode_bstr_32(&mut bytes, self.input.freeze_attempt_id.as_bytes());
+        bytes.push(0x11);
+        encode_bstr_32(&mut bytes, self.input.intended_root_id.as_bytes());
+        bytes.push(0x12);
+        encode_bstr_32(&mut bytes, &self.input.subject_id);
+        bytes.push(0x13);
+        encode_bstr_32(&mut bytes, self.input.policy_record_id.as_bytes());
+        bytes
+    }
+
+    /// Returns SHA-256 of the exact authoritative Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        let digest: [u8; ID_LENGTH] = Sha256::digest(self.authoritative_cbor())
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 always returns exactly 32 bytes");
+        RecordId(digest)
+    }
+
+    /// Strictly decodes this exact v0.3 Record schema without normalization.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(3).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 3
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(6).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 3 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let freeze_attempt_id =
+            FreezeAttemptId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let intended_root_id =
+            IntendedRootId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let subject_id = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(19).map_err(|_| RecordDecodeError)?;
+        let policy_record_id =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        let decoded = Self::new(FreezeAttemptStartRecordInput {
+            freeze_attempt_id,
+            intended_root_id,
+            subject_id,
+            policy_record_id,
+        });
+        if decoded.authoritative_cbor() != input {
+            return Err(RecordDecodeError);
+        }
+        Ok(decoded)
+    }
+}
+
 /// Typed, Record-local fields for the frozen GENESIS Record schema.
 ///
 /// These fields determine immutable Record identity only. They do not establish
