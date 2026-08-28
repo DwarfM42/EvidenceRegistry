@@ -149,3 +149,11 @@ fn id_authority_dependency_order_changed_fail_001_is_rejected_without_normalizat
         "ID-AUTHORITY-DEPENDENCY-ORDER-CHANGED-FAIL-001"
     );
 }
+
+#[test]
+fn id_authority_dependency_vector_does_not_overclaim_retained_journal_validation() {
+    let vector = include_str!("../vectors/authority-dependency-v1.txt");
+
+    assert!(vector.contains("expected_validation_status=ACCEPT_STRUCTURAL_ONLY\n"));
+    assert!(!vector.contains("expected_validation_status=ACCEPT\n"));
+}
