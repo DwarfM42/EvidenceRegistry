@@ -1208,6 +1208,14 @@ impl RetainedJournal {
         if matches!(event_type_id.value(), 101..=103) {
             return self.append_freeze_terminal(input, event_type_id);
         }
+        if event_type_id.value() == 104 {
+            self.validate_freeze_commit_rejected(input, event_type_id)?;
+            return Err(RetainedJournalError::UnsupportedEntry);
+        }
+        if event_type_id.value() == 700 {
+            self.validate_eviction_started(input, event_type_id)?;
+            return Err(RetainedJournalError::UnsupportedEntry);
+        }
         if let Some(event_specific_keys) = event_specific_keys(event_type_id.value()) {
             let common = decode_journal_entry_with_event_specific_keys(input, event_specific_keys)
                 .map_err(|_| RetainedJournalError::DecodeError)?;
@@ -1231,15 +1239,59 @@ impl RetainedJournal {
                 {
                     return Err(RetainedJournalError::DecodeError);
                 }
+                self.resolve_reference(eviction_start_reference)
+                    .map_err(|_| RetainedJournalError::DecodeError)?;
+                let eviction_start = self
+                    .entries
+                    .get(
+                        usize::try_from(eviction_start_reference.entry_index().value())
+                            .map_err(|_| RetainedJournalError::DecodeError)?,
+                    )
+                    .ok_or(RetainedJournalError::DecodeError)?;
+                if eviction_start.lifecycle_object_kind()
+                    != LifecycleObjectKind::ArtifactEvictionAttempt
+                    || eviction_start.lifecycle_object_id() != *eviction_attempt_id
+                {
+                    return Err(RetainedJournalError::DecodeError);
+                }
             }
             return Err(RetainedJournalError::UnsupportedEntry);
         }
         if event_type_id.value() == 200 {
             return match decode_common_journal_entry(input) {
-                Ok(_) => Err(RetainedJournalError::UnsupportedEntry),
-                Err(_) => decode_event_specific_journal_entry(input, event_type_id, &[20])
-                    .map(|_| Err(RetainedJournalError::UnsupportedEntry))
-                    .map_err(|_| RetainedJournalError::DecodeError)?,
+                Ok(common) => {
+                    if common.event_type_id != event_type_id
+                        || common.lifecycle_object_kind != event_type_id.lifecycle_object_kind()
+                        || common.lifecycle_object_id != *common.event_record_id.as_bytes()
+                    {
+                        return Err(RetainedJournalError::DecodeError);
+                    }
+                    Err(RetainedJournalError::UnsupportedEntry)
+                }
+                Err(_) => {
+                    let common = decode_journal_entry_with_event_specific_keys(input, &[20])
+                        .map_err(|_| RetainedJournalError::DecodeError)?;
+                    let [(20, DecodedEventSpecificField::JournalReference(closeout_reference))] =
+                        common.event_specific_fields.as_slice()
+                    else {
+                        return Err(RetainedJournalError::DecodeError);
+                    };
+                    if common.event_type_id != event_type_id
+                        || common.lifecycle_object_kind != event_type_id.lifecycle_object_kind()
+                        || common.lifecycle_object_id != *common.event_record_id.as_bytes()
+                        || closeout_reference.event_type_id().value() != 500
+                        || !common
+                            .authority_dependencies
+                            .elements
+                            .iter()
+                            .any(|reference| reference == closeout_reference)
+                    {
+                        return Err(RetainedJournalError::DecodeError);
+                    }
+                    self.resolve_reference(closeout_reference)
+                        .map_err(|_| RetainedJournalError::DecodeError)?;
+                    Err(RetainedJournalError::UnsupportedEntry)
+                }
             };
         }
         let common =
@@ -1370,6 +1422,116 @@ impl RetainedJournal {
             authority_dependencies: common.authority_dependencies,
             authoritative_bytes: input.to_vec(),
         }))
+    }
+
+    fn validate_freeze_commit_rejected(
+        &self,
+        input: &[u8],
+        expected_event_type_id: EventTypeId,
+    ) -> Result<(), RetainedJournalError> {
+        let common = decode_journal_entry_with_event_specific_keys(input, &[16, 18, 19])
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        if common.event_type_id != expected_event_type_id
+            || common.lifecycle_object_kind != LifecycleObjectKind::FreezeAttempt
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        let [(16, DecodedEventSpecificField::Bytes(freeze_attempt_id)), (18, DecodedEventSpecificField::JournalReference(freeze_start_reference)), (19, DecodedEventSpecificField::JournalReference(conflicting_terminal_reference))] =
+            common.event_specific_fields.as_slice()
+        else {
+            return Err(RetainedJournalError::DecodeError);
+        };
+        if common.lifecycle_object_id != *freeze_attempt_id
+            || !common
+                .authority_dependencies
+                .elements
+                .iter()
+                .any(|reference| reference == freeze_start_reference)
+            || !common
+                .authority_dependencies
+                .elements
+                .iter()
+                .any(|reference| reference == conflicting_terminal_reference)
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        if freeze_start_reference.event_type_id().value() != 100
+            || !matches!(
+                conflicting_terminal_reference.event_type_id().value(),
+                101..=103
+            )
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        self.resolve_reference(freeze_start_reference)
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        self.resolve_reference(conflicting_terminal_reference)
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        let freeze_start = self
+            .entries
+            .get(
+                usize::try_from(freeze_start_reference.entry_index().value())
+                    .map_err(|_| RetainedJournalError::DecodeError)?,
+            )
+            .ok_or(RetainedJournalError::DecodeError)?;
+        let conflicting_terminal = self
+            .entries
+            .get(
+                usize::try_from(conflicting_terminal_reference.entry_index().value())
+                    .map_err(|_| RetainedJournalError::DecodeError)?,
+            )
+            .ok_or(RetainedJournalError::DecodeError)?;
+        if freeze_start.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+            || freeze_start.lifecycle_object_id() != *freeze_attempt_id
+            || conflicting_terminal.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+            || conflicting_terminal.lifecycle_object_id() != *freeze_attempt_id
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        Ok(())
+    }
+
+    fn validate_eviction_started(
+        &self,
+        input: &[u8],
+        expected_event_type_id: EventTypeId,
+    ) -> Result<(), RetainedJournalError> {
+        let common = decode_journal_entry_with_event_specific_keys(input, &[21, 22, 23, 24])
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        if common.event_type_id != expected_event_type_id
+            || common.lifecycle_object_kind != LifecycleObjectKind::ArtifactEvictionAttempt
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        let [(21, DecodedEventSpecificField::Bytes(eviction_attempt_id)), (22, DecodedEventSpecificField::JournalReference(freeze_authority_reference)), (23, DecodedEventSpecificField::Bytes(pre_eviction_manifest_id)), (24, DecodedEventSpecificField::Bytes(eviction_scope_identity))] =
+            common.event_specific_fields.as_slice()
+        else {
+            return Err(RetainedJournalError::DecodeError);
+        };
+        let pre_eviction_manifest_id = RecordId::try_from(pre_eviction_manifest_id.as_slice())
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        let eviction_scope_identity = RecordId::try_from(eviction_scope_identity.as_slice())
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        if common.lifecycle_object_id != *eviction_attempt_id
+            || !common
+                .authority_dependencies
+                .elements
+                .iter()
+                .any(|reference| reference == freeze_authority_reference)
+            || !common
+                .identity_dependencies
+                .elements
+                .contains(&IdentityDependency::record_id(pre_eviction_manifest_id))
+            || !common
+                .identity_dependencies
+                .elements
+                .contains(&IdentityDependency::record_id(eviction_scope_identity))
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        self.resolve_reference(freeze_authority_reference)
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        Ok(())
     }
 
     /// Resolves every field of a JournalReference against retained Entry bytes.
@@ -1659,19 +1821,6 @@ fn decode_common_journal_entry(
     input: &[u8],
 ) -> Result<DecodedCommonJournalEntry, JournalEntryDecodeError> {
     decode_journal_entry_with_event_specific_keys(input, &[])
-}
-
-fn decode_event_specific_journal_entry(
-    input: &[u8],
-    expected_event_type_id: EventTypeId,
-    event_specific_keys: &[u64],
-) -> Result<(), JournalEntryDecodeError> {
-    if decode_journal_entry_with_event_specific_keys(input, event_specific_keys)?.event_type_id
-        != expected_event_type_id
-    {
-        return Err(JournalEntryDecodeError);
-    }
-    Ok(())
 }
 
 fn decode_journal_entry_event_type_id(

@@ -98,6 +98,79 @@ fn eviction_committed_bytes(previous_entry_hash: JournalEntryHash) -> Vec<u8> {
     bytes
 }
 
+fn eviction_committed_bytes_with_unresolved_start_reference(
+    previous_entry_hash: JournalEntryHash,
+) -> Vec<u8> {
+    fn append_start_reference(output: &mut Vec<u8>, entry_hash: JournalEntryHash) {
+        output.extend_from_slice(&[0x85, 0x58, 0x20]);
+        output.extend_from_slice(&id(0x00));
+        output.push(0x00);
+        output.extend_from_slice(&[0x58, 0x20]);
+        output.extend_from_slice(entry_hash.as_bytes());
+        output.extend_from_slice(&[0x19, 0x02, 0xbc, 0x58, 0x20]);
+        output.extend_from_slice(&id(0x80));
+    }
+
+    let mut bytes = Vec::with_capacity(520);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xae);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x01, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x19, 0x02, 0xbd, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x80));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x81]);
+    append_start_reference(&mut bytes, previous_entry_hash);
+    bytes.extend_from_slice(&[0x08, 0x03, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x15, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x18, 0x19]);
+    append_start_reference(&mut bytes, previous_entry_hash);
+    bytes
+}
+
+fn eviction_started_bytes_with_mismatched_attempt_id(
+    previous_entry_hash: JournalEntryHash,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(512);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xb0);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x01, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x19, 0x02, 0xbc, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x84));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x03, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x15, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xb0));
+    bytes.extend_from_slice(&[0x16, 0x85, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.push(0x00);
+    bytes.extend_from_slice(&[0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x20));
+    bytes.extend_from_slice(&[0x17, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xc0));
+    bytes.extend_from_slice(&[0x18, 0x18, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xd0));
+    bytes
+}
+
 fn freeze_committed_bytes(
     previous_entry_hash: JournalEntryHash,
     freeze_start_hash: JournalEntryHash,
@@ -141,6 +214,108 @@ fn freeze_committed_bytes(
     bytes.extend_from_slice(&id(0xa0));
     bytes.extend_from_slice(&[0x12]);
     append_freeze_start_reference(&mut bytes, freeze_start_hash);
+    bytes
+}
+
+fn freeze_commit_rejected_bytes(
+    previous_entry_hash: JournalEntryHash,
+    freeze_start_hash: JournalEntryHash,
+    conflicting_terminal_hash: JournalEntryHash,
+    lifecycle_object_kind: u8,
+    include_required_authority_dependencies: bool,
+    conflicting_terminal_event_type_id: u8,
+) -> Vec<u8> {
+    fn append_reference(
+        output: &mut Vec<u8>,
+        entry_index: u8,
+        entry_hash: JournalEntryHash,
+        event_type_id: u8,
+        event_record_id: [u8; 32],
+    ) {
+        output.extend_from_slice(&[0x85, 0x58, 0x20]);
+        output.extend_from_slice(&id(0x00));
+        output.push(entry_index);
+        output.extend_from_slice(&[0x58, 0x20]);
+        output.extend_from_slice(entry_hash.as_bytes());
+        output.extend_from_slice(&[0x18, event_type_id, 0x58, 0x20]);
+        output.extend_from_slice(&event_record_id);
+    }
+
+    let mut bytes = Vec::with_capacity(544);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xaf);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x03, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x18, 0x68, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x82));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07]);
+    if include_required_authority_dependencies {
+        bytes.push(0x82);
+        append_reference(&mut bytes, 1, freeze_start_hash, 100, id(0x80));
+        append_reference(
+            &mut bytes,
+            2,
+            conflicting_terminal_hash,
+            conflicting_terminal_event_type_id,
+            id(0x81),
+        );
+    } else {
+        bytes.push(0x80);
+    }
+    bytes.extend_from_slice(&[0x08, lifecycle_object_kind, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x10, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x12]);
+    append_reference(&mut bytes, 1, freeze_start_hash, 100, id(0x80));
+    bytes.extend_from_slice(&[0x13]);
+    append_reference(
+        &mut bytes,
+        2,
+        conflicting_terminal_hash,
+        conflicting_terminal_event_type_id,
+        id(0x81),
+    );
+    bytes
+}
+
+fn verification_recorded_bytes(
+    previous_entry_hash: JournalEntryHash,
+    lifecycle_object_kind: u8,
+    lifecycle_object_id: [u8; 32],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.extend_from_slice(&[0xac, 0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x01, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x18, 0xc8, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x82));
+    bytes.extend_from_slice(&[
+        0x06,
+        0x80,
+        0x07,
+        0x80,
+        0x08,
+        lifecycle_object_kind,
+        0x09,
+        0x58,
+        0x20,
+    ]);
+    bytes.extend_from_slice(&lifecycle_object_id);
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x50));
     bytes
 }
 
@@ -413,12 +588,152 @@ fn retained_journal_rejects_a_freeze_commit_without_its_named_authority_dependen
 }
 
 #[test]
+fn retained_journal_rejects_a_freeze_commit_rejection_with_a_nonfreeze_kind() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+    let terminal_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+
+    assert_eq!(
+        journal.append_strict_entry(&freeze_commit_rejected_bytes(
+            terminal_hash,
+            freeze_start_hash,
+            terminal_hash,
+            4,
+            false,
+            101,
+        )),
+        Err(RetainedJournalError::DecodeError)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
+}
+
+#[test]
+fn retained_journal_rejects_a_freeze_commit_rejection_without_its_required_references() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+    let terminal_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+
+    assert_eq!(
+        journal.append_strict_entry(&freeze_commit_rejected_bytes(
+            terminal_hash,
+            freeze_start_hash,
+            terminal_hash,
+            2,
+            false,
+            101,
+        )),
+        Err(RetainedJournalError::DecodeError)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
+}
+
+#[test]
+fn retained_journal_rejects_a_freeze_commit_rejection_with_a_nonterminal_conflict_reference() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+    let terminal_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+
+    assert_eq!(
+        journal.append_strict_entry(&freeze_commit_rejected_bytes(
+            terminal_hash,
+            freeze_start_hash,
+            terminal_hash,
+            2,
+            true,
+            100,
+        )),
+        Err(RetainedJournalError::DecodeError)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
+}
+
+#[test]
+fn retained_journal_rejects_an_ordinary_verification_with_wrong_lifecycle_binding() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+
+    assert_eq!(
+        journal.append_strict_entry(&verification_recorded_bytes(
+            genesis.entry_hash(),
+            4,
+            id(0x83),
+        )),
+        Err(RetainedJournalError::DecodeError)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn retained_journal_rejects_an_eviction_start_with_mismatched_attempt_identity() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+
+    assert_eq!(
+        journal.append_strict_entry(&eviction_started_bytes_with_mismatched_attempt_id(
+            genesis.entry_hash(),
+        )),
+        Err(RetainedJournalError::DecodeError)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
+}
+
+#[test]
 fn retained_journal_rejects_an_eviction_entry_with_wrong_required_reference_role() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
 
     assert_eq!(
         journal.append_strict_entry(&eviction_committed_bytes(genesis.entry_hash())),
+        Err(RetainedJournalError::DecodeError)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn retained_journal_rejects_an_eviction_terminal_with_an_unresolved_named_start() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+
+    assert_eq!(
+        journal.append_strict_entry(&eviction_committed_bytes_with_unresolved_start_reference(
+            genesis.entry_hash(),
+        )),
         Err(RetainedJournalError::DecodeError)
     );
     assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
