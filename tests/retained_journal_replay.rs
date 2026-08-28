@@ -447,6 +447,48 @@ fn retained_genesis_replays_registry_state_and_resolves_its_exact_reference() {
 }
 
 #[test]
+fn retained_journal_resolves_a_common_entry_with_its_exact_chain_and_lifecycle_facts() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&review_request_bytes(genesis.entry_hash()))
+        .unwrap();
+
+    let head = journal.reconstruct_state().unwrap();
+    let exact_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        head.journal_head_hash(),
+        evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
+        EventRecordId::try_from(id(0x80).as_slice()).unwrap(),
+    );
+
+    let resolved = journal.resolve_reference(&exact_reference).unwrap();
+    assert_eq!(resolved.registry_id(), exact_reference.registry_id());
+    assert_eq!(resolved.entry_index(), exact_reference.entry_index());
+    assert_eq!(resolved.entry_hash(), exact_reference.entry_hash());
+    assert_eq!(resolved.previous_entry_hash(), Some(genesis.entry_hash()));
+    assert_eq!(resolved.event_type_id(), exact_reference.event_type_id());
+    assert_eq!(
+        resolved.event_record_id(),
+        exact_reference.event_record_id()
+    );
+    assert_eq!(
+        resolved.lifecycle_object_kind(),
+        LifecycleObjectKind::ReviewRequest
+    );
+    assert_eq!(resolved.lifecycle_object_id(), id(0x80));
+    assert_eq!(
+        resolved.storage_capability_class_id(),
+        RecordId::try_from(id(0x40).as_slice()).unwrap()
+    );
+    assert_eq!(
+        resolved.environment_observation_id(),
+        RecordId::try_from(id(0x60).as_slice()).unwrap()
+    );
+}
+
+#[test]
 fn retained_journal_rejects_a_second_genesis_instead_of_overwriting_history() {
     let mut journal = RetainedJournal::from_genesis(genesis()).unwrap();
 
