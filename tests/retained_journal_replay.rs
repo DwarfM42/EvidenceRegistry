@@ -739,6 +739,38 @@ fn retained_journal_replays_a_freeze_commit_bound_to_its_retained_start() {
 }
 
 #[test]
+fn journal_only_reconstruction_retains_freeze_root_and_terminal_disposition() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+
+    let replay = journal.reconstruct_state().unwrap();
+    let attempts = replay.freeze_attempts();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].freeze_attempt_id().as_bytes(), &id(0xa0));
+    assert_eq!(
+        attempts[0].intended_root_id().as_bytes(),
+        &[
+            0x7f, 0xa3, 0xd1, 0xbc, 0xfc, 0x31, 0xbc, 0x7b, 0x43, 0x17, 0x6a, 0xec, 0x28, 0xa6,
+            0xd3, 0xd9, 0x44, 0xac, 0xf9, 0x31, 0xd8, 0x77, 0xc8, 0x0c, 0x6b, 0x61, 0xf7, 0x88,
+            0xab, 0xe5, 0x7d, 0xb7,
+        ]
+    );
+    assert_eq!(attempts[0].state(), FreezeAttemptState::Committed);
+}
+
+#[test]
 fn retained_journal_replays_a_freeze_recovery_abort_bound_to_its_retained_start() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();

@@ -1091,6 +1091,7 @@ struct CommonRetainedJournalEntry {
     environment_observation_id: RecordId,
     lifecycle_object_kind: LifecycleObjectKind,
     lifecycle_object_id: [u8; ID_LENGTH],
+    freeze_attempt_intended_root_id: Option<IntendedRootId>,
     authority_dependencies: AuthorityDependencyCollection,
     authoritative_bytes: Vec<u8>,
 }
@@ -1168,6 +1169,13 @@ impl RetainedJournalEntry {
         match self {
             Self::Genesis(entry) => *entry.registry_id.as_bytes(),
             Self::Common(entry) => entry.lifecycle_object_id,
+        }
+    }
+
+    fn freeze_attempt_intended_root_id(&self) -> Option<IntendedRootId> {
+        match self {
+            Self::Genesis(_) => None,
+            Self::Common(entry) => entry.freeze_attempt_intended_root_id,
         }
     }
 
@@ -1295,6 +1303,36 @@ pub struct ReconstructedJournalState {
     journal_head_index: JournalEntryIndex,
     journal_head_hash: JournalEntryHash,
     states: Vec<(LifecycleObjectKind, [u8; ID_LENGTH], LifecycleObjectState)>,
+    freeze_attempts: Vec<ReconstructedFreezeAttempt>,
+}
+
+/// Journal-only lifecycle facts for one retained Freeze Attempt.
+///
+/// These facts are reconstructed from supported Journal Entries only. They do
+/// not establish Receipt validity, Freeze authority, Policy satisfaction,
+/// custody, durability, or admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconstructedFreezeAttempt {
+    freeze_attempt_id: FreezeAttemptId,
+    intended_root_id: IntendedRootId,
+    state: FreezeAttemptState,
+}
+
+impl ReconstructedFreezeAttempt {
+    /// The exact Attempt identity established by its retained START Entry.
+    pub fn freeze_attempt_id(&self) -> FreezeAttemptId {
+        self.freeze_attempt_id
+    }
+
+    /// The exact intended root identity indexed by the retained START Entry.
+    pub fn intended_root_id(&self) -> IntendedRootId {
+        self.intended_root_id
+    }
+
+    /// The Journal-only lifecycle disposition reconstructed for this Attempt.
+    pub fn state(&self) -> FreezeAttemptState {
+        self.state
+    }
 }
 
 impl ReconstructedJournalState {
@@ -1328,6 +1366,12 @@ impl ReconstructedJournalState {
             .iter()
             .find(|(stored_kind, stored_id, _)| *stored_kind == kind && stored_id == object_id)
             .map(|(_, _, state)| *state)
+    }
+
+    /// Every Freeze Attempt retained by the supported Journal replay, ordered
+    /// by its START Entry's Journal position.
+    pub fn freeze_attempts(&self) -> &[ReconstructedFreezeAttempt] {
+        &self.freeze_attempts
     }
 }
 
@@ -1497,6 +1541,7 @@ impl RetainedJournal {
             environment_observation_id: common.environment_observation_id,
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
+            freeze_attempt_intended_root_id: None,
             authority_dependencies: common.authority_dependencies,
             authoritative_bytes: input.to_vec(),
         }))
@@ -1521,11 +1566,13 @@ impl RetainedJournal {
         };
         let freeze_attempt_id = FreezeAttemptId::try_from(freeze_attempt_id.as_slice())
             .map_err(|_| RetainedJournalError::DecodeError)?;
+        let intended_root_id = IntendedRootId::try_from(intended_root_id.as_slice())
+            .map_err(|_| RetainedJournalError::DecodeError)?;
         if common.lifecycle_object_id != *freeze_attempt_id.as_bytes()
             || derive_freeze_root(common.registry_id, freeze_attempt_id)
                 .intended_root_id()
                 .as_bytes()
-                != intended_root_id
+                != intended_root_id.as_bytes()
         {
             return Err(RetainedJournalError::DecodeError);
         }
@@ -1541,6 +1588,7 @@ impl RetainedJournal {
             environment_observation_id: common.environment_observation_id,
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
+            freeze_attempt_intended_root_id: Some(intended_root_id),
             authority_dependencies: common.authority_dependencies,
             authoritative_bytes: input.to_vec(),
         }))
@@ -1598,6 +1646,7 @@ impl RetainedJournal {
             environment_observation_id: common.environment_observation_id,
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
+            freeze_attempt_intended_root_id: None,
             authority_dependencies: common.authority_dependencies,
             authoritative_bytes: input.to_vec(),
         }))
@@ -1810,6 +1859,7 @@ impl RetainedJournal {
     pub fn reconstruct_state(&self) -> Result<ReconstructedJournalState, RetainedJournalError> {
         let mut registry_state = RegistryLifecycleState::Absent;
         let mut states = Vec::new();
+        let mut freeze_attempts = Vec::new();
         for entry in &self.entries {
             let kind = entry.lifecycle_object_kind();
             let object_id = entry.lifecycle_object_id();
@@ -1833,6 +1883,30 @@ impl RetainedJournal {
             if let LifecycleObjectState::Registry(state) = after {
                 registry_state = state;
             }
+            if let LifecycleObjectState::FreezeAttempt(state) = after {
+                let freeze_attempt_id = FreezeAttemptId::try_from(object_id.as_slice())
+                    .map_err(|_| RetainedJournalError::DecodeError)?;
+                match entry.event_type_id().value() {
+                    100 => {
+                        let intended_root_id = entry
+                            .freeze_attempt_intended_root_id()
+                            .ok_or(RetainedJournalError::DecodeError)?;
+                        freeze_attempts.push(ReconstructedFreezeAttempt {
+                            freeze_attempt_id,
+                            intended_root_id,
+                            state,
+                        });
+                    }
+                    101..=103 => {
+                        let attempt = freeze_attempts
+                            .iter_mut()
+                            .find(|attempt| attempt.freeze_attempt_id == freeze_attempt_id)
+                            .ok_or(RetainedJournalError::LifecycleTransition)?;
+                        attempt.state = state;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         let head = self
@@ -1845,6 +1919,7 @@ impl RetainedJournal {
             journal_head_index: head.entry_index(),
             journal_head_hash: head.entry_hash(),
             states,
+            freeze_attempts,
         })
     }
 
