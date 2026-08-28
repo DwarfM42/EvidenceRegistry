@@ -406,13 +406,8 @@ impl IdentityDependencyCollection {
     pub fn from_unordered_semantic_elements(
         mut elements: Vec<IdentityDependency>,
     ) -> Result<Self, DuplicateIdentityDependencyError> {
+        validate_unordered_identity_dependency_uniqueness(&elements)?;
         elements.sort_by_key(|element| element.canonical_key());
-        if elements
-            .windows(2)
-            .any(|pair| pair[0].canonical_key() == pair[1].canonical_key())
-        {
-            return Err(DuplicateIdentityDependencyError);
-        }
         Ok(Self { elements })
     }
 
@@ -517,8 +512,8 @@ impl AuthorityDependencyCollection {
         mut elements: Vec<JournalReference>,
     ) -> Result<Self, AuthorityDependencyCollectionError> {
         validate_authority_dependency_context(context, &elements)?;
+        validate_unordered_authority_dependency_indices(&elements)?;
         elements.sort_by_key(|reference| (reference.entry_index(), reference.entry_hash()));
-        validate_authority_dependency_indices(&elements)?;
         Ok(Self { elements })
     }
 
@@ -565,6 +560,37 @@ fn validate_authority_dependency_context(
     Ok(())
 }
 
+fn validate_unordered_identity_dependency_uniqueness(
+    elements: &[IdentityDependency],
+) -> Result<(), DuplicateIdentityDependencyError> {
+    for (index, element) in elements.iter().enumerate() {
+        if elements[index + 1..]
+            .iter()
+            .any(|other| element.canonical_key() == other.canonical_key())
+        {
+            return Err(DuplicateIdentityDependencyError);
+        }
+    }
+    Ok(())
+}
+
+fn validate_unordered_authority_dependency_indices(
+    elements: &[JournalReference],
+) -> Result<(), AuthorityDependencyCollectionError> {
+    for (index, reference) in elements.iter().enumerate() {
+        for other in &elements[index + 1..] {
+            if reference.entry_index() == other.entry_index() {
+                return if reference.entry_hash() == other.entry_hash() {
+                    Err(AuthorityDependencyCollectionError::Duplicate)
+                } else {
+                    Err(AuthorityDependencyCollectionError::ConflictingSameIndex)
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_authority_dependency_indices(
     elements: &[JournalReference],
 ) -> Result<(), AuthorityDependencyCollectionError> {
@@ -578,4 +604,45 @@ fn validate_authority_dependency_indices(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod construction_order_tests {
+    use super::*;
+
+    #[test]
+    fn unordered_identity_uniqueness_rejects_nonadjacent_duplicate_before_sorting() {
+        let record_a = RecordId::try_from([0x11; ID_LENGTH].as_slice()).unwrap();
+        let record_b = RecordId::try_from([0x22; ID_LENGTH].as_slice()).unwrap();
+        let elements = [
+            IdentityDependency::record_id(record_a),
+            IdentityDependency::record_id(record_b),
+            IdentityDependency::record_id(record_a),
+        ];
+
+        assert_eq!(
+            validate_unordered_identity_dependency_uniqueness(&elements),
+            Err(DuplicateIdentityDependencyError)
+        );
+    }
+
+    #[test]
+    fn unordered_authority_index_validation_rejects_nonadjacent_conflict_before_sorting() {
+        let registry = RegistryId::try_from([0x33; ID_LENGTH].as_slice()).unwrap();
+        let reference = |index, hash| {
+            JournalReference::new(
+                registry,
+                JournalEntryIndex::try_from(index).unwrap(),
+                JournalEntryHash::try_from([hash; ID_LENGTH].as_slice()).unwrap(),
+                EventTypeId::try_from(1).unwrap(),
+                EventRecordId::try_from([0x44; ID_LENGTH].as_slice()).unwrap(),
+            )
+        };
+        let elements = [reference(1, 0x51), reference(2, 0x52), reference(1, 0x53)];
+
+        assert_eq!(
+            validate_unordered_authority_dependency_indices(&elements),
+            Err(AuthorityDependencyCollectionError::ConflictingSameIndex)
+        );
+    }
 }
