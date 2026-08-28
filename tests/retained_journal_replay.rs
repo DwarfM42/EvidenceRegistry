@@ -26,6 +26,18 @@ const INDEPENDENT_REVIEW_REQUEST_ENTRY_HASH: [u8; 32] = [
     0xd2, 0x25, 0xef, 0xc3, 0xd9, 0x6d, 0xc4, 0xb2, 0x66, 0x7f, 0xa8, 0x8c, 0xd3, 0xa3, 0xf4, 0xaf,
     0xe2, 0x0e, 0x23, 0x70, 0x5e, 0x35, 0x15, 0x93, 0x55, 0x34, 0xb0, 0xac, 0x6b, 0x4b, 0x6a, 0xe7,
 ];
+const INDEPENDENT_FREEZE_START_ENTRY_HASH: [u8; 32] = [
+    0x17, 0x32, 0xae, 0x29, 0xe8, 0x50, 0x59, 0x45, 0x28, 0x03, 0xe1, 0xf7, 0x40, 0x77, 0xf5, 0xcc,
+    0x55, 0x35, 0x0a, 0x65, 0xf8, 0x86, 0x79, 0x4d, 0x38, 0x7a, 0xf0, 0x3f, 0x13, 0x54, 0x48, 0xae,
+];
+const INDEPENDENT_FREEZE_COMMITTED_ENTRY_HASH: [u8; 32] = [
+    0xf8, 0x08, 0x78, 0x8a, 0xaf, 0x13, 0x6a, 0x84, 0x6f, 0x9f, 0x05, 0xa9, 0x7b, 0x50, 0x97, 0x6f,
+    0x03, 0xd1, 0xc3, 0x53, 0x3e, 0xe5, 0x94, 0x68, 0x6b, 0xe0, 0x53, 0x71, 0x59, 0xd7, 0xf6, 0xee,
+];
+const INDEPENDENT_POLICY_ENTRY_HASH: [u8; 32] = [
+    0x3e, 0xaa, 0xf1, 0x65, 0xc8, 0xfd, 0x85, 0xae, 0xc6, 0xf4, 0xd2, 0x98, 0x83, 0x86, 0xe0, 0xbd,
+    0x1f, 0x5f, 0x3d, 0xd2, 0x73, 0xf1, 0xac, 0x67, 0xfa, 0xb8, 0xce, 0xaa, 0xd0, 0x5d, 0xce, 0xef,
+];
 
 /// Direct fixed framing for the Common Review Request Entry. Its predecessor
 /// and expected Entry hash are independent constants, rather than values read
@@ -57,6 +69,158 @@ fn independent_review_request_reference(entry_index: u64) -> JournalReference {
         JournalEntryHash::try_from(INDEPENDENT_REVIEW_REQUEST_ENTRY_HASH.as_slice()).unwrap(),
         evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
         EventRecordId::try_from(id(0x80).as_slice()).unwrap(),
+    )
+}
+
+fn append_independent_journal_reference(
+    output: &mut Vec<u8>,
+    entry_index: u8,
+    entry_hash: &[u8; 32],
+    event_type_id: u8,
+    event_record_id: [u8; 32],
+) {
+    output.extend_from_slice(&[0x85, 0x58, 0x20]);
+    output.extend_from_slice(&id(0x00));
+    output.push(entry_index);
+    output.extend_from_slice(&[0x58, 0x20]);
+    output.extend_from_slice(entry_hash);
+    if event_type_id < 24 {
+        output.push(event_type_id);
+    } else {
+        output.extend_from_slice(&[0x18, event_type_id]);
+    }
+    output.extend_from_slice(&[0x58, 0x20]);
+    output.extend_from_slice(&event_record_id);
+}
+
+fn independently_construct_freeze_start_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(329);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xae);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x01, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(&INDEPENDENT_GENESIS_ENTRY_HASH);
+    bytes.extend_from_slice(&[0x04, 0x18, 0x64, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x80));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x02, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x10, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x11, 0x58, 0x20]);
+    bytes.extend_from_slice(&[
+        0x7f, 0xa3, 0xd1, 0xbc, 0xfc, 0x31, 0xbc, 0x7b, 0x43, 0x17, 0x6a, 0xec, 0x28, 0xa6, 0xd3,
+        0xd9, 0x44, 0xac, 0xf9, 0x31, 0xd8, 0x77, 0xc8, 0x0c, 0x6b, 0x61, 0xf7, 0x88, 0xab, 0xe5,
+        0x7d, 0xb7,
+    ]);
+    bytes
+}
+
+fn independently_construct_freeze_committed_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(507);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xae);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x02, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(&INDEPENDENT_FREEZE_START_ENTRY_HASH);
+    bytes.extend_from_slice(&[0x04, 0x18, 0x65, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x81));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x81]);
+    append_independent_journal_reference(
+        &mut bytes,
+        1,
+        &INDEPENDENT_FREEZE_START_ENTRY_HASH,
+        100,
+        id(0x80),
+    );
+    bytes.extend_from_slice(&[0x08, 0x02, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x10, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.push(0x12);
+    append_independent_journal_reference(
+        &mut bytes,
+        1,
+        &INDEPENDENT_FREEZE_START_ENTRY_HASH,
+        100,
+        id(0x80),
+    );
+    bytes
+}
+
+fn independently_construct_policy_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(472);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xac);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x03, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(&INDEPENDENT_FREEZE_COMMITTED_ENTRY_HASH);
+    bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x90, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x82));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x82]);
+    append_independent_journal_reference(
+        &mut bytes,
+        1,
+        &INDEPENDENT_FREEZE_START_ENTRY_HASH,
+        100,
+        id(0x80),
+    );
+    append_independent_journal_reference(
+        &mut bytes,
+        2,
+        &INDEPENDENT_FREEZE_COMMITTED_ENTRY_HASH,
+        101,
+        id(0x81),
+    );
+    bytes.extend_from_slice(&[0x08, 0x07, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x82));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x50));
+    bytes
+}
+
+fn independent_freeze_start_reference() -> JournalReference {
+    JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(INDEPENDENT_FREEZE_START_ENTRY_HASH.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(100_u64).unwrap(),
+        EventRecordId::try_from(id(0x80).as_slice()).unwrap(),
+    )
+}
+
+fn independent_freeze_committed_reference() -> JournalReference {
+    JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(2_u64).unwrap(),
+        JournalEntryHash::try_from(INDEPENDENT_FREEZE_COMMITTED_ENTRY_HASH.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(101_u64).unwrap(),
+        EventRecordId::try_from(id(0x81).as_slice()).unwrap(),
+    )
+}
+
+fn independent_policy_reference() -> JournalReference {
+    JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(3_u64).unwrap(),
+        JournalEntryHash::try_from(INDEPENDENT_POLICY_ENTRY_HASH.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(400_u64).unwrap(),
+        EventRecordId::try_from(id(0x82).as_slice()).unwrap(),
     )
 }
 
@@ -795,34 +959,83 @@ fn journal_only_reconstruction_retains_freeze_root_and_terminal_disposition() {
 }
 
 #[test]
-fn journal_only_reconstruction_retains_the_exact_freeze_authority_dependency_edge() {
+fn journal_only_reconstruction_emits_no_edges_for_genesis_or_dependency_free_entries() {
     let genesis = genesis();
-    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    assert_eq!(
+        genesis.entry_hash().as_bytes(),
+        &INDEPENDENT_GENESIS_ENTRY_HASH
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    assert!(journal
+        .reconstruct_state()
+        .unwrap()
+        .authority_dependency_edges()
+        .is_empty());
     journal
-        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .append_strict_entry(&independently_construct_review_request_bytes())
         .unwrap();
-    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    assert!(journal
+        .reconstruct_state()
+        .unwrap()
+        .authority_dependency_edges()
+        .is_empty());
+}
+
+#[test]
+fn journal_only_reconstruction_preserves_independently_anchored_direct_dependency_references_and_order(
+) {
+    let genesis = genesis();
+    assert_eq!(
+        genesis.entry_hash().as_bytes(),
+        &INDEPENDENT_GENESIS_ENTRY_HASH
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
     journal
-        .append_strict_entry(&freeze_committed_bytes(
-            freeze_start_hash,
-            freeze_start_hash,
-            true,
-            101,
-        ))
+        .append_strict_entry(&independently_construct_freeze_start_bytes())
         .unwrap();
+    assert_eq!(
+        journal
+            .reconstruct_state()
+            .unwrap()
+            .journal_head_hash()
+            .as_bytes(),
+        &INDEPENDENT_FREEZE_START_ENTRY_HASH
+    );
+    journal
+        .append_strict_entry(&independently_construct_freeze_committed_bytes())
+        .unwrap();
+    assert_eq!(
+        journal
+            .reconstruct_state()
+            .unwrap()
+            .journal_head_hash()
+            .as_bytes(),
+        &INDEPENDENT_FREEZE_COMMITTED_ENTRY_HASH
+    );
+    journal
+        .append_strict_entry(&independently_construct_policy_bytes())
+        .unwrap();
+    assert_eq!(
+        journal
+            .reconstruct_state()
+            .unwrap()
+            .journal_head_hash()
+            .as_bytes(),
+        &INDEPENDENT_POLICY_ENTRY_HASH
+    );
 
     let replay = journal.reconstruct_state().unwrap();
     let edges = replay.authority_dependency_edges();
-    assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].dependent_entry().entry_index().value(), 2);
-    assert_eq!(edges[0].dependent_entry().event_type_id().value(), 101);
-    assert_eq!(edges[0].dependency().entry_index().value(), 1);
-    assert_eq!(edges[0].dependency().entry_hash(), freeze_start_hash);
-    assert_eq!(edges[0].dependency().event_type_id().value(), 100);
-    assert_eq!(
-        edges[0].dependency().event_record_id().as_bytes(),
-        &id(0x80)
-    );
+    assert_eq!(edges.len(), 3);
+    let freeze_start = independent_freeze_start_reference();
+    let freeze_committed = independent_freeze_committed_reference();
+    let policy = independent_policy_reference();
+    assert_eq!(edges[0].dependent_entry(), &freeze_committed);
+    assert_eq!(edges[0].dependency(), &freeze_start);
+    assert_eq!(edges[1].dependent_entry(), &policy);
+    assert_eq!(edges[1].dependency(), &freeze_start);
+    assert_eq!(edges[2].dependent_entry(), &policy);
+    assert_eq!(edges[2].dependency(), &freeze_committed);
 }
 
 #[test]
