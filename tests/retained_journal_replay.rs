@@ -375,13 +375,13 @@ fn retained_journal_rejects_a_freeze_commit_without_its_named_authority_dependen
 }
 
 #[test]
-fn retained_journal_marks_a_well_framed_unimplemented_eviction_event_as_unsupported() {
+fn retained_journal_rejects_an_eviction_entry_with_wrong_required_reference_role() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
 
     assert_eq!(
         journal.append_strict_entry(&eviction_committed_bytes(genesis.entry_hash())),
-        Err(RetainedJournalError::UnsupportedEntry)
+        Err(RetainedJournalError::DecodeError)
     );
     assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
 }

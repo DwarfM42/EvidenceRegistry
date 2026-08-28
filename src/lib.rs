@@ -1209,8 +1209,29 @@ impl RetainedJournal {
             return self.append_freeze_terminal(input, event_type_id);
         }
         if let Some(event_specific_keys) = event_specific_keys(event_type_id.value()) {
-            decode_event_specific_journal_entry(input, event_type_id, event_specific_keys)
+            let common = decode_journal_entry_with_event_specific_keys(input, event_specific_keys)
                 .map_err(|_| RetainedJournalError::DecodeError)?;
+            if common.event_type_id != event_type_id {
+                return Err(RetainedJournalError::DecodeError);
+            }
+            if matches!(event_type_id.value(), 701..=703) {
+                let [(21, DecodedEventSpecificField::Bytes(eviction_attempt_id)), (25, DecodedEventSpecificField::JournalReference(eviction_start_reference))] =
+                    common.event_specific_fields.as_slice()
+                else {
+                    return Err(RetainedJournalError::DecodeError);
+                };
+                if common.lifecycle_object_kind != LifecycleObjectKind::ArtifactEvictionAttempt
+                    || common.lifecycle_object_id != *eviction_attempt_id
+                    || eviction_start_reference.event_type_id().value() != 700
+                    || !common
+                        .authority_dependencies
+                        .elements
+                        .iter()
+                        .any(|reference| reference == eviction_start_reference)
+                {
+                    return Err(RetainedJournalError::DecodeError);
+                }
+            }
             return Err(RetainedJournalError::UnsupportedEntry);
         }
         if event_type_id.value() == 200 {
