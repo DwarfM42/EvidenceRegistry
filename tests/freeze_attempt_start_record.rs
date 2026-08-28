@@ -1,6 +1,6 @@
 use evidence_registry::{
     FreezeAttemptId, FreezeAttemptStartRecord, FreezeAttemptStartRecordInput, IntendedRootId,
-    RecordId, RecordTypeId,
+    RecordId, RecordTypeId, StrictRecordFrame,
 };
 
 fn id(first: u8) -> [u8; 32] {
@@ -74,7 +74,10 @@ fn freeze_attempt_start_record_strict_decoder_rejects_noncanonical_or_invalid_ve
     duplicate_member[36] = 0x11;
 
     let mut out_of_order_member = canonical.clone();
-    out_of_order_member[36] = 0x0f;
+    let first_local_member = canonical[36..71].to_vec();
+    let second_local_member = canonical[71..106].to_vec();
+    out_of_order_member[36..71].copy_from_slice(&second_local_member);
+    out_of_order_member[71..106].copy_from_slice(&first_local_member);
 
     let mut wrong_outer_type = canonical.clone();
     wrong_outer_type[29] = 0x04;
@@ -107,7 +110,6 @@ fn freeze_attempt_start_record_strict_decoder_rejects_noncanonical_or_invalid_ve
         missing_member,
         unknown_member,
         duplicate_member,
-        out_of_order_member,
         wrong_outer_type,
         wrong_outer_schema_version,
         wrong_body_schema_version,
@@ -120,4 +122,7 @@ fn freeze_attempt_start_record_strict_decoder_rejects_noncanonical_or_invalid_ve
     ] {
         assert!(FreezeAttemptStartRecord::decode_authoritative(&invalid).is_err());
     }
+
+    assert!(StrictRecordFrame::decode_authoritative(&out_of_order_member).is_err());
+    assert!(FreezeAttemptStartRecord::decode_authoritative(&out_of_order_member).is_err());
 }
