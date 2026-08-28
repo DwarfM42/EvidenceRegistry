@@ -795,6 +795,37 @@ fn journal_only_reconstruction_retains_freeze_root_and_terminal_disposition() {
 }
 
 #[test]
+fn journal_only_reconstruction_retains_the_exact_freeze_authority_dependency_edge() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+
+    let replay = journal.reconstruct_state().unwrap();
+    let edges = replay.authority_dependency_edges();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].dependent_entry().entry_index().value(), 2);
+    assert_eq!(edges[0].dependent_entry().event_type_id().value(), 101);
+    assert_eq!(edges[0].dependency().entry_index().value(), 1);
+    assert_eq!(edges[0].dependency().entry_hash(), freeze_start_hash);
+    assert_eq!(edges[0].dependency().event_type_id().value(), 100);
+    assert_eq!(
+        edges[0].dependency().event_record_id().as_bytes(),
+        &id(0x80)
+    );
+}
+
+#[test]
 fn retained_journal_replays_a_freeze_recovery_abort_bound_to_its_retained_start() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();

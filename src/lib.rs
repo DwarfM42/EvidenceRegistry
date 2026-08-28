@@ -1305,6 +1305,30 @@ pub struct ReconstructedJournalState {
     states: Vec<(LifecycleObjectKind, [u8; ID_LENGTH], LifecycleObjectState)>,
     freeze_attempts: Vec<ReconstructedFreezeAttempt>,
     capability_epochs: Vec<ReconstructedCapabilityEpoch>,
+    authority_dependency_edges: Vec<ReconstructedAuthorityDependency>,
+}
+
+/// One direct authority-dependency edge indexed by retained Journal bytes.
+///
+/// The edge preserves the exact dependent and prerequisite Journal References.
+/// It does not itself establish that either event acquired authority, that its
+/// Record payload is valid, or that an authority/admission gate succeeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconstructedAuthorityDependency {
+    dependent_entry: JournalReference,
+    dependency: JournalReference,
+}
+
+impl ReconstructedAuthorityDependency {
+    /// The retained Entry that declares this direct dependency.
+    pub fn dependent_entry(&self) -> &JournalReference {
+        &self.dependent_entry
+    }
+
+    /// The exact prior Entry Reference named by the dependent Entry.
+    pub fn dependency(&self) -> &JournalReference {
+        &self.dependency
+    }
 }
 
 /// The capability and environment identities indexed by one retained Journal Entry.
@@ -1407,6 +1431,12 @@ impl ReconstructedJournalState {
     /// The capability epoch indexed by every retained Entry, in Journal order.
     pub fn capability_epochs(&self) -> &[ReconstructedCapabilityEpoch] {
         &self.capability_epochs
+    }
+
+    /// Every direct authority-dependency edge indexed by retained Entries, in
+    /// dependent Journal order and then canonical dependency order.
+    pub fn authority_dependency_edges(&self) -> &[ReconstructedAuthorityDependency] {
+        &self.authority_dependency_edges
     }
 }
 
@@ -1896,12 +1926,26 @@ impl RetainedJournal {
         let mut states = Vec::new();
         let mut freeze_attempts = Vec::new();
         let mut capability_epochs = Vec::with_capacity(self.entries.len());
+        let mut authority_dependency_edges = Vec::new();
         for entry in &self.entries {
             capability_epochs.push(ReconstructedCapabilityEpoch {
                 entry_index: entry.entry_index(),
                 storage_capability_class_id: entry.storage_capability_class_id(),
                 environment_observation_id: entry.environment_observation_id(),
             });
+            let dependent_entry = JournalReference::new(
+                entry.registry_id(),
+                entry.entry_index(),
+                entry.entry_hash(),
+                entry.event_type_id(),
+                entry.event_record_id(),
+            );
+            for dependency in entry.authority_dependencies() {
+                authority_dependency_edges.push(ReconstructedAuthorityDependency {
+                    dependent_entry: dependent_entry.clone(),
+                    dependency: dependency.clone(),
+                });
+            }
             let kind = entry.lifecycle_object_kind();
             let object_id = entry.lifecycle_object_id();
             let state_index = states.iter().position(|(stored_kind, stored_id, _)| {
@@ -1962,6 +2006,7 @@ impl RetainedJournal {
             states,
             freeze_attempts,
             capability_epochs,
+            authority_dependency_edges,
         })
     }
 
