@@ -659,6 +659,7 @@ impl JournalReference {
 }
 
 const JOURNAL_ENTRY_DOMAIN: &[u8] = b"EvidenceRegistry.JournalEntry.v1";
+const JOURNAL_ANCHOR_DOMAIN: &[u8] = b"EvidenceRegistry.JournalAnchor.v1";
 
 /// A structurally complete GENESIS Journal Entry from Identity Format v0.3 §§66–73.
 ///
@@ -722,6 +723,76 @@ impl GenesisJournalEntry {
             .try_into()
             .expect("SHA-256 always returns exactly 32 bytes");
         JournalEntryHash(digest)
+    }
+}
+
+/// A portable historical commitment to one Registry Journal head.
+///
+/// This type emits Identity Format v0.3 §§93–96 canonical Anchor bytes. It
+/// does not assert that an external holder is trustworthy or that the Anchor
+/// is itself an authoritative Registry Record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalAnchor {
+    registry_id: RegistryId,
+    journal_head_index: JournalEntryIndex,
+    journal_head_hash: JournalEntryHash,
+    journal_format_version: u64,
+}
+
+/// A Journal Anchor format version outside the general EvidenceRegistry UInt range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalAnchorFormatVersionError {
+    value: u64,
+}
+
+impl JournalAnchor {
+    /// Creates a Journal Anchor when its format version is a representable
+    /// EvidenceRegistry nonnegative counter.
+    pub fn new(
+        registry_id: RegistryId,
+        journal_head_index: JournalEntryIndex,
+        journal_head_hash: JournalEntryHash,
+        journal_format_version: u64,
+    ) -> Result<Self, JournalAnchorFormatVersionError> {
+        if journal_format_version > ER_UINT_MAX {
+            return Err(JournalAnchorFormatVersionError {
+                value: journal_format_version,
+            });
+        }
+
+        Ok(Self {
+            registry_id,
+            journal_head_index,
+            journal_head_hash,
+            journal_format_version,
+        })
+    }
+
+    /// Emits `deterministic_cbor([domain, 1, anchor_body])` with keys 0..3.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        debug_assert_eq!(JOURNAL_ANCHOR_DOMAIN.len(), 33);
+
+        let mut bytes = Vec::with_capacity(113);
+        bytes.extend_from_slice(&[0x83, 0x78, 0x21]);
+        bytes.extend_from_slice(JOURNAL_ANCHOR_DOMAIN);
+        bytes.extend_from_slice(&[0x01, 0xa4, 0x00]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x01);
+        encode_uint(&mut bytes, self.journal_head_index.value());
+        bytes.push(0x02);
+        encode_bstr_32(&mut bytes, self.journal_head_hash.as_bytes());
+        bytes.push(0x03);
+        encode_uint(&mut bytes, self.journal_format_version);
+        bytes
+    }
+
+    /// Returns `SHA256(authoritative_cbor())` as the Anchor ID.
+    pub fn anchor_id(&self) -> JournalAnchorId {
+        let digest: [u8; ID_LENGTH] = Sha256::digest(self.authoritative_cbor())
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 always returns exactly 32 bytes");
+        JournalAnchorId(digest)
     }
 }
 
