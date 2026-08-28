@@ -162,6 +162,233 @@ impl JournalEntryIndex {
     }
 }
 
+/// A v0.x lifecycle object kind from Identity Format v0.3 §29.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleObjectKind {
+    /// Numeric kind 1.
+    Registry,
+    /// Numeric kind 2.
+    FreezeAttempt,
+    /// Numeric kind 3.
+    Verification,
+    /// Numeric kind 4.
+    ReviewRequest,
+    /// Numeric kind 5.
+    ReviewResult,
+    /// Numeric kind 6.
+    ReviewAdmissionAttempt,
+    /// Numeric kind 7.
+    Policy,
+    /// Numeric kind 8.
+    CloseoutAttempt,
+    /// Numeric kind 9.
+    ArtifactEvictionAttempt,
+    /// Numeric kind 10.
+    AssumptionDefinition,
+    /// Numeric kind 11.
+    AssumptionEstablishment,
+    /// Numeric kind 12.
+    AssumptionInvalidation,
+    /// Numeric kind 13.
+    FormalVerification,
+    /// Numeric kind 14.
+    AssumptionVersionCompatibility,
+    /// Numeric kind 15.
+    AssumptionVersionCompatibilityInvalidation,
+    /// Numeric kind 16.
+    BootstrapTrustDeclaration,
+    /// Numeric kind 17.
+    BootstrapTrustInvalidation,
+    /// Numeric kind 18.
+    FormalFindingClassification,
+}
+
+/// The lifecycle state-transition shape assigned to a registered event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventShape {
+    /// Creates the Registry from its absent state.
+    BootstrapCreate,
+    /// Creates a nonterminal attempt from its absent state.
+    CreateOpen,
+    /// Creates a terminal one-shot object from its absent state.
+    CreateTerminal,
+    /// Moves an open attempt into a terminal state.
+    TransitionTerminal,
+    /// Observes an existing state without changing it.
+    ObserveNoStateChange,
+}
+
+/// The only authoritative Registry lifecycle states from Cross-Reference v0.3 §9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryLifecycleState {
+    /// No authoritative GENESIS has occurred for this Registry history.
+    Absent,
+    /// GENESIS established the Registry's authoritative lifecycle state.
+    InitializedAuthoritative,
+}
+
+/// The authoritative lifecycle states for a Freeze Attempt from §11.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeAttemptState {
+    /// The attempt does not exist in authoritative lifecycle history.
+    Absent,
+    /// The attempt was started and has not reached a terminal state.
+    Open,
+    /// The attempt completed successfully.
+    Committed,
+    /// Recovery aborted the attempt.
+    AbortedRecovery,
+    /// An operator assertion aborted the attempt.
+    AbortedByOperatorAssertion,
+}
+
+/// The lifecycle states shared by record-backed one-shot kinds from §12.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OneShotRecordedState {
+    /// The exact lifecycle object has no authoritative event yet.
+    Absent,
+    /// The exact lifecycle object has been recorded and is terminal.
+    Recorded,
+}
+
+/// The authoritative lifecycle states for a Review Admission Attempt from §13.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionState {
+    /// The attempt has no authoritative admission event.
+    Absent,
+    /// The admission was accepted.
+    Accepted,
+    /// The admission was rejected.
+    Rejected,
+}
+
+/// The authoritative lifecycle states for a Closeout Attempt from §14.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseoutAttemptState {
+    /// The attempt has no authoritative closeout event.
+    Absent,
+    /// The closeout was committed.
+    Committed,
+    /// The closeout was rejected.
+    Rejected,
+}
+
+/// The authoritative lifecycle states for an Artifact Eviction Attempt from §15.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactEvictionState {
+    /// The attempt does not exist in authoritative lifecycle history.
+    Absent,
+    /// The attempt was started and has not reached a terminal state.
+    Open,
+    /// The eviction was committed.
+    Committed,
+    /// Recovery interrupted the eviction.
+    InterruptedRecovery,
+    /// Verification blocked the eviction before deliberate destructive removal.
+    Blocked,
+}
+
+/// A kind-tagged lifecycle state. The tag is checked before terminality evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleObjectState {
+    /// A Registry state.
+    Registry(RegistryLifecycleState),
+    /// A Freeze Attempt state.
+    FreezeAttempt(FreezeAttemptState),
+    /// A state for one of the record-backed one-shot kinds.
+    OneShot(OneShotRecordedState),
+    /// A Review Admission Attempt state.
+    ReviewAdmission(ReviewAdmissionState),
+    /// A Closeout Attempt state.
+    CloseoutAttempt(CloseoutAttemptState),
+    /// An Artifact Eviction Attempt state.
+    ArtifactEviction(ArtifactEvictionState),
+}
+
+/// A rejected terminality query outside its frozen applicability domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleStateValidationError {
+    /// Registry has no terminality semantics.
+    NoTerminality,
+    /// The state representation does not belong to the queried lifecycle kind.
+    KindStateMismatch,
+}
+
+impl LifecycleObjectKind {
+    /// Whether the frozen lifecycle state model defines terminality for this kind.
+    pub fn has_terminality(self) -> bool {
+        self != Self::Registry
+    }
+
+    /// Evaluates terminality only for a state representation valid for this kind.
+    pub fn is_terminal(
+        self,
+        state: LifecycleObjectState,
+    ) -> Result<bool, LifecycleStateValidationError> {
+        if !self.has_terminality() {
+            return Err(LifecycleStateValidationError::NoTerminality);
+        }
+        if !state_matches_kind(self, state) {
+            return Err(LifecycleStateValidationError::KindStateMismatch);
+        }
+
+        Ok(match state {
+            LifecycleObjectState::Registry(_) => false,
+            LifecycleObjectState::FreezeAttempt(state) => matches!(
+                state,
+                FreezeAttemptState::Committed
+                    | FreezeAttemptState::AbortedRecovery
+                    | FreezeAttemptState::AbortedByOperatorAssertion
+            ),
+            LifecycleObjectState::OneShot(state) => state == OneShotRecordedState::Recorded,
+            LifecycleObjectState::ReviewAdmission(state) => matches!(
+                state,
+                ReviewAdmissionState::Accepted | ReviewAdmissionState::Rejected
+            ),
+            LifecycleObjectState::CloseoutAttempt(state) => matches!(
+                state,
+                CloseoutAttemptState::Committed | CloseoutAttemptState::Rejected
+            ),
+            LifecycleObjectState::ArtifactEviction(state) => matches!(
+                state,
+                ArtifactEvictionState::Committed
+                    | ArtifactEvictionState::InterruptedRecovery
+                    | ArtifactEvictionState::Blocked
+            ),
+        })
+    }
+}
+
+fn state_matches_kind(kind: LifecycleObjectKind, state: LifecycleObjectState) -> bool {
+    match state {
+        LifecycleObjectState::Registry(_) => kind == LifecycleObjectKind::Registry,
+        LifecycleObjectState::FreezeAttempt(_) => kind == LifecycleObjectKind::FreezeAttempt,
+        LifecycleObjectState::OneShot(_) => matches!(
+            kind,
+            LifecycleObjectKind::Verification
+                | LifecycleObjectKind::ReviewRequest
+                | LifecycleObjectKind::ReviewResult
+                | LifecycleObjectKind::Policy
+                | LifecycleObjectKind::AssumptionDefinition
+                | LifecycleObjectKind::AssumptionEstablishment
+                | LifecycleObjectKind::AssumptionInvalidation
+                | LifecycleObjectKind::FormalVerification
+                | LifecycleObjectKind::AssumptionVersionCompatibility
+                | LifecycleObjectKind::AssumptionVersionCompatibilityInvalidation
+                | LifecycleObjectKind::BootstrapTrustDeclaration
+                | LifecycleObjectKind::BootstrapTrustInvalidation
+                | LifecycleObjectKind::FormalFindingClassification
+        ),
+        LifecycleObjectState::ReviewAdmission(_) => {
+            kind == LifecycleObjectKind::ReviewAdmissionAttempt
+        }
+        LifecycleObjectState::CloseoutAttempt(_) => kind == LifecycleObjectKind::CloseoutAttempt,
+        LifecycleObjectState::ArtifactEviction(_) => {
+            kind == LifecycleObjectKind::ArtifactEvictionAttempt
+        }
+    }
+}
+
 /// A current v0.x registered Journal event type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventTypeId(u16);
@@ -170,6 +397,18 @@ pub struct EventTypeId(u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EventTypeIdError {
     value: u64,
+}
+
+/// A rejected lifecycle-state transition in the state-only transition kernel.
+///
+/// This kernel intentionally excludes Journal-reference, authority-dependency,
+/// Record-payload, and replay validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleTransitionError {
+    /// The supplied state representation does not match the event's object kind.
+    KindStateMismatch,
+    /// The supplied matching state is not the table's legal predecessor.
+    IllegalPredecessor,
 }
 
 impl EventTypeIdError {
@@ -198,6 +437,168 @@ impl EventTypeId {
     /// The registered numeric event type identifier.
     pub fn value(self) -> u16 {
         self.0
+    }
+
+    /// Returns the exact lifecycle object kind assigned by Cross-Reference v0.3 §23.
+    pub fn lifecycle_object_kind(self) -> LifecycleObjectKind {
+        match self.0 {
+            1 | 600 => LifecycleObjectKind::Registry,
+            100..=104 => LifecycleObjectKind::FreezeAttempt,
+            200 => LifecycleObjectKind::Verification,
+            300 => LifecycleObjectKind::ReviewRequest,
+            301 => LifecycleObjectKind::ReviewResult,
+            302 | 303 => LifecycleObjectKind::ReviewAdmissionAttempt,
+            400 => LifecycleObjectKind::Policy,
+            500 | 501 => LifecycleObjectKind::CloseoutAttempt,
+            700..=703 => LifecycleObjectKind::ArtifactEvictionAttempt,
+            800 => LifecycleObjectKind::AssumptionDefinition,
+            801 => LifecycleObjectKind::AssumptionEstablishment,
+            802 => LifecycleObjectKind::AssumptionInvalidation,
+            803 => LifecycleObjectKind::FormalVerification,
+            804 => LifecycleObjectKind::AssumptionVersionCompatibility,
+            805 => LifecycleObjectKind::AssumptionVersionCompatibilityInvalidation,
+            806 => LifecycleObjectKind::BootstrapTrustDeclaration,
+            807 => LifecycleObjectKind::BootstrapTrustInvalidation,
+            808 => LifecycleObjectKind::FormalFindingClassification,
+            _ => unreachable!("EventTypeId only contains registered v0.x event identifiers"),
+        }
+    }
+
+    /// Returns the exact state-transition shape assigned by Cross-Reference v0.3 §66.
+    pub fn event_shape(self) -> EventShape {
+        match self.0 {
+            1 => EventShape::BootstrapCreate,
+            100 | 700 => EventShape::CreateOpen,
+            101..=103 | 701..=703 => EventShape::TransitionTerminal,
+            104 | 600 => EventShape::ObserveNoStateChange,
+            200 | 300..=303 | 400 | 500 | 501 | 800..=808 => EventShape::CreateTerminal,
+            _ => unreachable!("EventTypeId only contains registered v0.x event identifiers"),
+        }
+    }
+
+    /// Returns whether `before` is this event's exact state-only table predecessor.
+    pub fn has_legal_predecessor(self, before: LifecycleObjectState) -> bool {
+        self.resulting_state(before).is_ok()
+    }
+
+    /// Applies this event's state-only transition from the normative table.
+    ///
+    /// A successful result establishes only lifecycle-state continuity. It does
+    /// not establish full Journal admission or authority semantics.
+    pub fn resulting_state(
+        self,
+        before: LifecycleObjectState,
+    ) -> Result<LifecycleObjectState, LifecycleTransitionError> {
+        if !state_matches_kind(self.lifecycle_object_kind(), before) {
+            return Err(LifecycleTransitionError::KindStateMismatch);
+        }
+
+        let result = match self.0 {
+            1 => match before {
+                LifecycleObjectState::Registry(RegistryLifecycleState::Absent) => {
+                    LifecycleObjectState::Registry(RegistryLifecycleState::InitializedAuthoritative)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            100 => match before {
+                LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Absent) => {
+                    LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Open)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            101 => match before {
+                LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Open) => {
+                    LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Committed)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            102 => match before {
+                LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Open) => {
+                    LifecycleObjectState::FreezeAttempt(FreezeAttemptState::AbortedRecovery)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            103 => match before {
+                LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Open) => {
+                    LifecycleObjectState::FreezeAttempt(
+                        FreezeAttemptState::AbortedByOperatorAssertion,
+                    )
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            104 => match before {
+                LifecycleObjectState::FreezeAttempt(
+                    FreezeAttemptState::Committed
+                    | FreezeAttemptState::AbortedRecovery
+                    | FreezeAttemptState::AbortedByOperatorAssertion,
+                ) => before,
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            200 | 300 | 301 | 400 | 800..=808 => match before {
+                LifecycleObjectState::OneShot(OneShotRecordedState::Absent) => {
+                    LifecycleObjectState::OneShot(OneShotRecordedState::Recorded)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            302 => match before {
+                LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Absent) => {
+                    LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Accepted)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            303 => match before {
+                LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Absent) => {
+                    LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Rejected)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            500 => match before {
+                LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Absent) => {
+                    LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Committed)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            501 => match before {
+                LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Absent) => {
+                    LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Rejected)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            600 => match before {
+                LifecycleObjectState::Registry(
+                    RegistryLifecycleState::InitializedAuthoritative,
+                ) => before,
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            700 => match before {
+                LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Absent) => {
+                    LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Open)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            701 => match before {
+                LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Open) => {
+                    LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Committed)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            702 => match before {
+                LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Open) => {
+                    LifecycleObjectState::ArtifactEviction(
+                        ArtifactEvictionState::InterruptedRecovery,
+                    )
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            703 => match before {
+                LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Open) => {
+                    LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Blocked)
+                }
+                _ => return Err(LifecycleTransitionError::IllegalPredecessor),
+            },
+            _ => unreachable!("EventTypeId only contains registered v0.x event identifiers"),
+        };
+        Ok(result)
     }
 }
 
