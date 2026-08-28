@@ -1,0 +1,30 @@
+{
+  "provenance_id": "FORMAL-TOOL-PROVENANCE-LIFECYCLE-001",
+  "status": "external bootstrap provenance; not an EvidenceRegistry Formal Verification Record",
+  "observed_at": "2026-08-28T17:52:02+09:00",
+  "formal_source": "formal/Lifecycle.dfy",
+  "retained_verification_log": "formal/Lifecycle-verification-v1.log",
+  "log_line_endings": "Windows process CRLF output normalized to LF only for Git whitespace hygiene",
+  "invocation": "D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe verify --cores:1 --resource-limit:100000 formal/Lifecycle.dfy",
+  "dafny": {
+    "executable": "D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe",
+    "version": "4.11.0+fcb2042d6d043a2634f0854338c08feeaaaf4ae2",
+    "release_archive": "dafny-4.11.0-x64-windows-2022.zip",
+    "release_archive_sha256": "3653f05a111ca21e234709ea7b25ce96083fd6c6f10484256ba54110dbc0654d"
+  },
+  "solver": {
+    "name": "Z3",
+    "executable": "D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/z3/bin/z3-4.12.1.exe",
+    "version": "4.12.1"
+  },
+  "verification_configuration": {
+    "cores": 1,
+    "resource_limit": 100000,
+    "verification_time_limit": "default 30 seconds per assertion batch; no explicit override"
+  },
+  "result": {
+    "verified": 20,
+    "errors": 0
+  },
+  "claim_scope": "PURE_FORMAL symbolic event/object/state classifications, terminality, lifecycle predecessor relation, resulting-state function, and state-only transition laws. It does not establish runtime implementation correctness, Journal admission, Record payload validity, authority semantics, storage behavior, replay correctness, or qualification."
+}
