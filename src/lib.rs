@@ -1067,6 +1067,35 @@ fn encode_uint(output: &mut Vec<u8>, value: u64) {
     }
 }
 
+fn encode_text(output: &mut Vec<u8>, value: &str) {
+    let length = u64::try_from(value.len()).expect("platform usize fits into u64");
+    debug_assert!(length <= ER_UINT_MAX);
+    match length {
+        0..=23 => output.push(0x60 | length as u8),
+        24..=0xff => output.extend_from_slice(&[0x78, length as u8]),
+        0x100..=0xffff => output.extend_from_slice(&[0x79, (length >> 8) as u8, length as u8]),
+        0x1_0000..=0xffff_ffff => output.extend_from_slice(&[
+            0x7a,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+        _ => output.extend_from_slice(&[
+            0x7b,
+            (length >> 56) as u8,
+            (length >> 48) as u8,
+            (length >> 40) as u8,
+            (length >> 32) as u8,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+    }
+    output.extend_from_slice(value.as_bytes());
+}
+
 struct DecodedCommonJournalEntry {
     registry_id: RegistryId,
     entry_index: JournalEntryIndex,
@@ -1295,6 +1324,23 @@ impl<'a> CborCursor<'a> {
         Ok(())
     }
 
+    fn text(&mut self) -> Result<String, JournalEntryDecodeError> {
+        let length = usize::try_from(self.initial(3)?).map_err(|_| JournalEntryDecodeError)?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(JournalEntryDecodeError)?;
+        let text = std::str::from_utf8(
+            self.input
+                .get(self.offset..end)
+                .ok_or(JournalEntryDecodeError)?,
+        )
+        .map_err(|_| JournalEntryDecodeError)?
+        .to_owned();
+        self.offset = end;
+        Ok(text)
+    }
+
     fn bstr_32(&mut self) -> Result<[u8; ID_LENGTH], JournalEntryDecodeError> {
         if self.initial(2)? != ID_LENGTH as u64 {
             return Err(JournalEntryDecodeError);
@@ -1340,6 +1386,139 @@ pub struct JournalAnchorId([u8; ID_LENGTH]);
 
 define_32_byte_identity!(RecordId);
 define_32_byte_identity!(JournalAnchorId);
+
+const RECORD_DOMAIN: &[u8] = b"EvidenceRegistry.Record.v1";
+
+/// Typed, Record-local fields for the frozen GENESIS Record schema.
+///
+/// These fields determine immutable Record identity only. They do not establish
+/// that a Journal Entry later authorizes this Record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisRecordInput {
+    pub registry_id: RegistryId,
+    pub journal_format_version: u64,
+    pub record_identity_profile_id: u64,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+    pub created_by_tool_version: String,
+}
+
+/// A GENESIS Record field outside its exact structural domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenesisRecordFormatError;
+
+/// A rejected GENESIS Record byte sequence under its strict v0.3 grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordDecodeError;
+
+/// The exact-byte, structural GENESIS Record from Record Schema v0.3 §51.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisRecord {
+    input: GenesisRecordInput,
+}
+
+impl GenesisRecord {
+    /// Constructs a Record-local GENESIS statement without claiming authority.
+    pub fn new(input: GenesisRecordInput) -> Result<Self, GenesisRecordFormatError> {
+        if input.journal_format_version > ER_UINT_MAX
+            || input.record_identity_profile_id > ER_UINT_MAX
+            || u64::try_from(input.created_by_tool_version.len()).is_err()
+        {
+            return Err(GenesisRecordFormatError);
+        }
+        Ok(Self { input })
+    }
+
+    /// Emits the exact canonical Record framing and all required GENESIS fields.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        debug_assert_eq!(RECORD_DOMAIN.len(), 26);
+        let mut bytes = Vec::with_capacity(180);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x01, 0x01, 0xa8, 0x00, 0x01, 0x01, 0x01, 0x10]);
+        encode_bstr_32(&mut bytes, self.input.registry_id.as_bytes());
+        bytes.push(0x11);
+        encode_uint(&mut bytes, self.input.journal_format_version);
+        bytes.push(0x12);
+        encode_uint(&mut bytes, self.input.record_identity_profile_id);
+        bytes.push(0x13);
+        encode_bstr_32(
+            &mut bytes,
+            self.input.storage_capability_class_id.as_bytes(),
+        );
+        bytes.push(0x14);
+        encode_bstr_32(&mut bytes, self.input.environment_observation_id.as_bytes());
+        bytes.push(0x15);
+        encode_text(&mut bytes, &self.input.created_by_tool_version);
+        bytes
+    }
+
+    /// Returns `SHA256(authoritative_cbor())` as the immutable Record identity.
+    pub fn record_id(&self) -> RecordId {
+        let digest: [u8; ID_LENGTH] = Sha256::digest(self.authoritative_cbor())
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 always returns exactly 32 bytes");
+        RecordId(digest)
+    }
+
+    /// Strictly decodes GENESIS Record bytes and rejects normalization.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(8).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let registry_id =
+            RegistryId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let journal_format_version = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let record_identity_profile_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(19).map_err(|_| RecordDecodeError)?;
+        let storage_capability_class_id =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(20).map_err(|_| RecordDecodeError)?;
+        let environment_observation_id =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(21).map_err(|_| RecordDecodeError)?;
+        let created_by_tool_version = cursor.text().map_err(|_| RecordDecodeError)?;
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        let decoded = Self::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version,
+            record_identity_profile_id,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version,
+        })
+        .map_err(|_| RecordDecodeError)?;
+        if decoded.authoritative_cbor() != input {
+            return Err(RecordDecodeError);
+        }
+        Ok(decoded)
+    }
+}
 
 /// An active identity-dependency kind from Identity Format v0.3 §32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
