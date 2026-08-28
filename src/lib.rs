@@ -1460,6 +1460,20 @@ impl RetainedJournal {
         for reference in entry.authority_dependencies() {
             self.resolve_reference(reference)?;
         }
+        if !self.entries.is_empty() {
+            let reconstructed = self
+                .reconstruct_state()
+                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+            let before = reconstructed
+                .state_for(entry.lifecycle_object_kind(), &entry.lifecycle_object_id())
+                .unwrap_or_else(|| absent_state_for_kind(entry.lifecycle_object_kind()));
+            let after = entry
+                .event_type_id()
+                .resulting_state(before)
+                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+            validate_state_only_legal_transition(entry.event_type_id(), before, after)
+                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+        }
         self.entries.push(entry);
         Ok(())
     }

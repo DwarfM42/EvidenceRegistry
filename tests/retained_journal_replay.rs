@@ -325,6 +325,44 @@ fn retained_journal_replays_a_freeze_recovery_abort_bound_to_its_retained_start(
 }
 
 #[test]
+fn retained_journal_rejects_a_second_freeze_terminal_without_mutating_history() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let freeze_start_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            freeze_start_hash,
+            freeze_start_hash,
+            true,
+            101,
+        ))
+        .unwrap();
+    let committed_hash = journal.reconstruct_state().unwrap().journal_head_hash();
+    let mut second_terminal = freeze_committed_bytes(committed_hash, freeze_start_hash, true, 102);
+    let entry_index = second_terminal
+        .windows(5)
+        .position(|window| window == [0x02, 0x02, 0x03, 0x58, 0x20])
+        .unwrap();
+    second_terminal[entry_index + 1] = 0x03;
+
+    assert_eq!(
+        journal.append_strict_entry(&second_terminal),
+        Err(RetainedJournalError::LifecycleTransition)
+    );
+    let replay = journal.reconstruct_state().unwrap();
+    assert_eq!(replay.entry_count(), 3);
+    assert_eq!(
+        replay.state_for(LifecycleObjectKind::FreezeAttempt, &id(0xa0)),
+        Some(LifecycleObjectState::FreezeAttempt(
+            FreezeAttemptState::Committed
+        ))
+    );
+}
+
+#[test]
 fn retained_journal_replays_a_freeze_operator_abort_bound_to_its_retained_start() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
