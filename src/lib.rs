@@ -658,6 +658,73 @@ impl JournalReference {
     }
 }
 
+const JOURNAL_ENTRY_DOMAIN: &[u8] = b"EvidenceRegistry.JournalEntry.v1";
+
+/// A structurally complete GENESIS Journal Entry from Identity Format v0.3 §§66–73.
+///
+/// The constructor fixes the only GENESIS event/index/previous-hash/object-kind
+/// values. It does not claim to validate the referenced GENESIS Record payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisJournalEntry {
+    registry_id: RegistryId,
+    event_record_id: EventRecordId,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl GenesisJournalEntry {
+    /// Creates the fixed structural GENESIS Entry body from its four typed IDs.
+    pub fn new(
+        registry_id: RegistryId,
+        event_record_id: EventRecordId,
+        storage_capability_class_id: RecordId,
+        environment_observation_id: RecordId,
+    ) -> Self {
+        Self {
+            registry_id,
+            event_record_id,
+            storage_capability_class_id,
+            environment_observation_id,
+        }
+    }
+
+    /// Emits the exact canonical CBOR framing and all mandatory common fields.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        debug_assert_eq!(JOURNAL_ENTRY_DOMAIN.len(), 32);
+
+        let mut bytes = Vec::with_capacity(225);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+
+        // A definite-length map with common keys 0 through 11 in canonical
+        // ascending integer-key order. GENESIS has no event-specific keys.
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01]); // schema_version = 1
+        bytes.push(0x01);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.extend_from_slice(&[0x02, 0x00, 0x03, 0xf6, 0x04, 0x01]);
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x01]);
+        bytes.push(0x09);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes
+    }
+
+    /// Returns `SHA256(authoritative_cbor())` as the Entry hash.
+    pub fn entry_hash(&self) -> JournalEntryHash {
+        let digest: [u8; ID_LENGTH] = Sha256::digest(self.authoritative_cbor())
+            .as_slice()
+            .try_into()
+            .expect("SHA-256 always returns exactly 32 bytes");
+        JournalEntryHash(digest)
+    }
+}
+
 fn encode_bstr_32(output: &mut Vec<u8>, bytes: &[u8; ID_LENGTH]) {
     output.extend_from_slice(&[0x58, 0x20]);
     output.extend_from_slice(bytes);
