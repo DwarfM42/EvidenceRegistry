@@ -519,6 +519,33 @@ fn retained_journal_replays_a_structurally_valid_freeze_start() {
 }
 
 #[test]
+fn retained_reference_resolution_preserves_common_capability_and_environment_context() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+    let head = journal.reconstruct_state().unwrap();
+    let freeze_start_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        head.journal_head_hash(),
+        evidence_registry::EventTypeId::try_from(100_u64).unwrap(),
+        EventRecordId::try_from(id(0x80).as_slice()).unwrap(),
+    );
+
+    let resolved = journal.resolve_reference(&freeze_start_reference).unwrap();
+    assert_eq!(
+        resolved.storage_capability_class_id(),
+        RecordId::try_from(id(0x40).as_slice()).unwrap()
+    );
+    assert_eq!(
+        resolved.environment_observation_id(),
+        RecordId::try_from(id(0x60).as_slice()).unwrap()
+    );
+}
+
+#[test]
 fn retained_journal_rejects_a_freeze_start_with_a_nonderived_intended_root() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();

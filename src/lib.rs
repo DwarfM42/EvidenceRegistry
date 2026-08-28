@@ -1087,6 +1087,8 @@ struct CommonRetainedJournalEntry {
     previous_entry_hash: JournalEntryHash,
     event_type_id: EventTypeId,
     event_record_id: EventRecordId,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
     lifecycle_object_kind: LifecycleObjectKind,
     lifecycle_object_id: [u8; ID_LENGTH],
     authority_dependencies: AuthorityDependencyCollection,
@@ -1126,6 +1128,20 @@ impl RetainedJournalEntry {
         match self {
             Self::Genesis(entry) => entry.event_record_id,
             Self::Common(entry) => entry.event_record_id,
+        }
+    }
+
+    fn storage_capability_class_id(&self) -> RecordId {
+        match self {
+            Self::Genesis(entry) => entry.storage_capability_class_id,
+            Self::Common(entry) => entry.storage_capability_class_id,
+        }
+    }
+
+    fn environment_observation_id(&self) -> RecordId {
+        match self {
+            Self::Genesis(entry) => entry.environment_observation_id,
+            Self::Common(entry) => entry.environment_observation_id,
         }
     }
 
@@ -1197,6 +1213,8 @@ pub struct ResolvedJournalReference {
     previous_entry_hash: Option<JournalEntryHash>,
     event_type_id: EventTypeId,
     event_record_id: EventRecordId,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
     lifecycle_object_kind: LifecycleObjectKind,
     lifecycle_object_id: [u8; ID_LENGTH],
 }
@@ -1230,6 +1248,16 @@ impl ResolvedJournalReference {
     /// The event Record identity bound into the retained Entry.
     pub fn event_record_id(&self) -> EventRecordId {
         self.event_record_id
+    }
+
+    /// The exact retained storage-capability class identity for this Entry.
+    pub fn storage_capability_class_id(&self) -> RecordId {
+        self.storage_capability_class_id
+    }
+
+    /// The exact retained environment-observation identity for this Entry.
+    pub fn environment_observation_id(&self) -> RecordId {
+        self.environment_observation_id
     }
 
     /// The retained lifecycle-object kind.
@@ -1465,6 +1493,8 @@ impl RetainedJournal {
                 .ok_or(RetainedJournalError::DecodeError)?,
             event_type_id: common.event_type_id,
             event_record_id: common.event_record_id,
+            storage_capability_class_id: common.storage_capability_class_id,
+            environment_observation_id: common.environment_observation_id,
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
             authority_dependencies: common.authority_dependencies,
@@ -1507,6 +1537,8 @@ impl RetainedJournal {
                 .ok_or(RetainedJournalError::DecodeError)?,
             event_type_id: common.event_type_id,
             event_record_id: common.event_record_id,
+            storage_capability_class_id: common.storage_capability_class_id,
+            environment_observation_id: common.environment_observation_id,
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
             authority_dependencies: common.authority_dependencies,
@@ -1562,6 +1594,8 @@ impl RetainedJournal {
                 .ok_or(RetainedJournalError::DecodeError)?,
             event_type_id: common.event_type_id,
             event_record_id: common.event_record_id,
+            storage_capability_class_id: common.storage_capability_class_id,
+            environment_observation_id: common.environment_observation_id,
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
             authority_dependencies: common.authority_dependencies,
@@ -1765,6 +1799,8 @@ impl RetainedJournal {
             previous_entry_hash: entry.previous_entry_hash(),
             event_type_id: entry.event_type_id(),
             event_record_id: entry.event_record_id(),
+            storage_capability_class_id: entry.storage_capability_class_id(),
+            environment_observation_id: entry.environment_observation_id(),
             lifecycle_object_kind: entry.lifecycle_object_kind(),
             lifecycle_object_id: entry.lifecycle_object_id(),
         })
