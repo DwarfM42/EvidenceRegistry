@@ -203,6 +203,12 @@ pub enum LifecycleObjectKind {
     FormalFindingClassification,
 }
 
+/// A numeric lifecycle object kind outside the frozen v0.x registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleObjectKindError {
+    value: u64,
+}
+
 /// The lifecycle state-transition shape assigned to a registered event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventShape {
@@ -315,6 +321,30 @@ pub enum LifecycleStateValidationError {
 }
 
 impl LifecycleObjectKind {
+    /// The permanent numeric kind assigned by Identity Format v0.3 §29.
+    pub fn value(self) -> u8 {
+        match self {
+            Self::Registry => 1,
+            Self::FreezeAttempt => 2,
+            Self::Verification => 3,
+            Self::ReviewRequest => 4,
+            Self::ReviewResult => 5,
+            Self::ReviewAdmissionAttempt => 6,
+            Self::Policy => 7,
+            Self::CloseoutAttempt => 8,
+            Self::ArtifactEvictionAttempt => 9,
+            Self::AssumptionDefinition => 10,
+            Self::AssumptionEstablishment => 11,
+            Self::AssumptionInvalidation => 12,
+            Self::FormalVerification => 13,
+            Self::AssumptionVersionCompatibility => 14,
+            Self::AssumptionVersionCompatibilityInvalidation => 15,
+            Self::BootstrapTrustDeclaration => 16,
+            Self::BootstrapTrustInvalidation => 17,
+            Self::FormalFindingClassification => 18,
+        }
+    }
+
     /// Whether the frozen lifecycle state model defines terminality for this kind.
     pub fn has_terminality(self) -> bool {
         self != Self::Registry
@@ -356,6 +386,41 @@ impl LifecycleObjectKind {
                     | ArtifactEvictionState::Blocked
             ),
         })
+    }
+}
+
+impl LifecycleObjectKindError {
+    /// The rejected numeric lifecycle object kind.
+    pub fn value(self) -> u64 {
+        self.value
+    }
+}
+
+impl TryFrom<u64> for LifecycleObjectKind {
+    type Error = LifecycleObjectKindError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Registry),
+            2 => Ok(Self::FreezeAttempt),
+            3 => Ok(Self::Verification),
+            4 => Ok(Self::ReviewRequest),
+            5 => Ok(Self::ReviewResult),
+            6 => Ok(Self::ReviewAdmissionAttempt),
+            7 => Ok(Self::Policy),
+            8 => Ok(Self::CloseoutAttempt),
+            9 => Ok(Self::ArtifactEvictionAttempt),
+            10 => Ok(Self::AssumptionDefinition),
+            11 => Ok(Self::AssumptionEstablishment),
+            12 => Ok(Self::AssumptionInvalidation),
+            13 => Ok(Self::FormalVerification),
+            14 => Ok(Self::AssumptionVersionCompatibility),
+            15 => Ok(Self::AssumptionVersionCompatibilityInvalidation),
+            16 => Ok(Self::BootstrapTrustDeclaration),
+            17 => Ok(Self::BootstrapTrustInvalidation),
+            18 => Ok(Self::FormalFindingClassification),
+            _ => Err(LifecycleObjectKindError { value }),
+        }
     }
 }
 
