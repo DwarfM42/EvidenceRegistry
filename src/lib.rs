@@ -2397,7 +2397,17 @@ impl<'a> CborCursor<'a> {
         Ok(())
     }
 
+    /// Maximum container nesting accepted while structurally skipping an opaque CBOR value.
+    ///
+    /// The root opaque value is at depth zero, and each array/map child increments
+    /// depth by one. This bounds the recursive parser independently of input size.
+    const MAX_SKIP_VALUE_CONTAINER_NESTING: usize = 64;
+
     fn skip_value(&mut self) -> Result<(), JournalEntryDecodeError> {
+        self.skip_value_at_depth(0)
+    }
+
+    fn skip_value_at_depth(&mut self, depth: usize) -> Result<(), JournalEntryDecodeError> {
         let initial = self.byte()?;
         let major = initial >> 5;
         let argument = self.argument(initial & 0x1f)?;
@@ -2420,16 +2430,22 @@ impl<'a> CborCursor<'a> {
                 Ok(())
             }
             4 => {
+                if depth >= Self::MAX_SKIP_VALUE_CONTAINER_NESTING {
+                    return Err(JournalEntryDecodeError);
+                }
                 for _ in 0..argument {
-                    self.skip_value()?;
+                    self.skip_value_at_depth(depth + 1)?;
                 }
                 Ok(())
             }
             5 => {
+                if depth >= Self::MAX_SKIP_VALUE_CONTAINER_NESTING {
+                    return Err(JournalEntryDecodeError);
+                }
                 let mut previous_key: Option<(usize, usize)> = None;
                 for _ in 0..argument {
                     let key_start = self.offset;
-                    self.skip_value()?;
+                    self.skip_value_at_depth(depth + 1)?;
                     let key_end = self.offset;
                     if let Some((previous_start, previous_end)) = previous_key {
                         let previous = &self.input[previous_start..previous_end];
@@ -2439,7 +2455,7 @@ impl<'a> CborCursor<'a> {
                         }
                     }
                     previous_key = Some((key_start, key_end));
-                    self.skip_value()?;
+                    self.skip_value_at_depth(depth + 1)?;
                 }
                 Ok(())
             }
