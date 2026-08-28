@@ -1,0 +1,9 @@
+[package]
+name = "evidence-registry"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+sha2 = "0.10.9"
