@@ -2390,6 +2390,14 @@ impl<'a> CborCursor<'a> {
         }
     }
 
+    fn bool(&mut self) -> Result<bool, JournalEntryDecodeError> {
+        match self.byte()? {
+            0xf4 => Ok(false),
+            0xf5 => Ok(true),
+            _ => Err(JournalEntryDecodeError),
+        }
+    }
+
     fn key(&mut self, expected: u64) -> Result<(), JournalEntryDecodeError> {
         if self.uint()? != expected {
             return Err(JournalEntryDecodeError);
@@ -2680,6 +2688,219 @@ impl FreezeAttemptStartRecord {
         }
         Ok(decoded)
     }
+}
+
+/// Typed, Record-local fields decoded from a FREEZE_RECEIPT Record.
+///
+/// These fields establish only the strict local Record grammar and exact Record
+/// identity. They do not establish policy, authority, admission, durability,
+/// custody, or lifecycle truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeReceiptRecord {
+    record_id: RecordId,
+    freeze_attempt_id: FreezeAttemptId,
+    attempt_start_journal_ref: JournalReference,
+    subject_id: [u8; ID_LENGTH],
+    policy_record_id: RecordId,
+}
+
+impl FreezeReceiptRecord {
+    /// Strictly decodes the frozen FREEZE_RECEIPT local Record grammar without normalization.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(4).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 4
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(field_count, 17 | 18) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 4 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let freeze_attempt_id =
+            FreezeAttemptId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let attempt_start_journal_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(19).map_err(|_| RecordDecodeError)?;
+        let subject_id = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(20).map_err(|_| RecordDecodeError)?;
+        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(21).map_err(|_| RecordDecodeError)?;
+        if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1 | 2) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(22).map_err(|_| RecordDecodeError)?;
+        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(23).map_err(|_| RecordDecodeError)?;
+        cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(24).map_err(|_| RecordDecodeError)?;
+        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(25).map_err(|_| RecordDecodeError)?;
+        let policy_record_id =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        for key in 26..=28 {
+            cursor.key(key).map_err(|_| RecordDecodeError)?;
+            if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1..=3) {
+                return Err(RecordDecodeError);
+            }
+        }
+        cursor.key(29).map_err(|_| RecordDecodeError)?;
+        cursor.bool().map_err(|_| RecordDecodeError)?;
+        if field_count == 18 {
+            cursor.key(30).map_err(|_| RecordDecodeError)?;
+            cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        }
+        cursor.key(31).map_err(|_| RecordDecodeError)?;
+        cursor.text().map_err(|_| RecordDecodeError)?;
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            freeze_attempt_id,
+            attempt_start_journal_ref,
+            subject_id,
+            policy_record_id,
+        })
+    }
+
+    /// The exact immutable identity of the strictly decoded FREEZE_RECEIPT Record.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+}
+
+/// The exact structural inputs for one bounded FREEZE_COMMITTED binding check.
+///
+/// This input deliberately contains no Manifest, Policy, storage, custody, or
+/// external-authority evidence. Those absences prohibit a positive authority or
+/// admission outcome.
+#[derive(Clone, Debug)]
+pub struct FreezeCommittedBindingInput<'a> {
+    pub retained_journal: &'a RetainedJournal,
+    pub committed_event_reference: JournalReference,
+    pub freeze_attempt_start_record: &'a FreezeAttemptStartRecord,
+    pub freeze_receipt_record: &'a FreezeReceiptRecord,
+}
+
+/// A failure to establish the bounded FREEZE_COMMITTED structural bindings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeCommittedBindingError {
+    /// The supplied Journal reference does not resolve in retained history.
+    RetainedReference(RetainedJournalError),
+    /// The resolved terminal entry is not FREEZE_COMMITTED for this attempt.
+    CommittedEventMismatch,
+    /// The terminal Journal event does not bind the exact Receipt Record identity.
+    ReceiptRecordMismatch,
+    /// The Receipt's start reference does not resolve to the retained FREEZE_ATTEMPT_STARTED event.
+    AttemptStartReferenceMismatch,
+    /// The retained FREEZE_ATTEMPT_STARTED event does not bind the exact START Record identity.
+    AttemptStartRecordMismatch,
+    /// The START, Receipt, and terminal event do not bind one Freeze Attempt identity.
+    FreezeAttemptMismatch,
+    /// The Receipt and START do not preserve the same exact subject identity.
+    SubjectMismatch,
+    /// The Receipt and START do not preserve the same exact Policy identity.
+    PolicyMismatch,
+    /// The Receipt's retained start entry is not strictly prior to the terminal entry.
+    AttemptStartNotPrior,
+}
+
+/// The only non-error outcome of the bounded FREEZE_COMMITTED binding check.
+///
+/// This is explicitly non-success for authority and admission: all available
+/// structural bindings agree, but required authority evidence is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeCommittedBindingOutcome {
+    /// Structural bindings agree; no authority or admission verdict is available.
+    AuthorityEvidenceUnavailable,
+}
+
+/// Validates only the exact retained Journal / START / Receipt bindings available
+/// to this runtime for FREEZE_COMMITTED.
+///
+/// A successful return never means authority, admission, durability, custody,
+/// policy satisfaction, or lifecycle truth has been established.
+pub fn validate_freeze_committed_binding(
+    input: FreezeCommittedBindingInput<'_>,
+) -> Result<FreezeCommittedBindingOutcome, FreezeCommittedBindingError> {
+    let committed = input
+        .retained_journal
+        .resolve_reference(&input.committed_event_reference)
+        .map_err(FreezeCommittedBindingError::RetainedReference)?;
+    if committed.event_type_id().value() != 101
+        || committed.event_type_id().required_record_type_id().value() != 4
+        || committed.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+        || committed.lifecycle_object_id()
+            != *input.freeze_receipt_record.freeze_attempt_id.as_bytes()
+    {
+        return Err(FreezeCommittedBindingError::CommittedEventMismatch);
+    }
+    if committed.event_record_id().as_bytes() != input.freeze_receipt_record.record_id.as_bytes() {
+        return Err(FreezeCommittedBindingError::ReceiptRecordMismatch);
+    }
+    let start_reference = &input.freeze_receipt_record.attempt_start_journal_ref;
+    if start_reference.entry_index().value() >= committed.entry_index().value() {
+        return Err(FreezeCommittedBindingError::AttemptStartNotPrior);
+    }
+    let start = input
+        .retained_journal
+        .resolve_reference(start_reference)
+        .map_err(FreezeCommittedBindingError::RetainedReference)?;
+    if start.event_type_id().value() != 100
+        || start.event_type_id().required_record_type_id().value() != 3
+        || start.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+        || start.lifecycle_object_id()
+            != *input
+                .freeze_attempt_start_record
+                .input
+                .freeze_attempt_id
+                .as_bytes()
+    {
+        return Err(FreezeCommittedBindingError::AttemptStartReferenceMismatch);
+    }
+    if start.event_record_id().as_bytes()
+        != input.freeze_attempt_start_record.record_id().as_bytes()
+    {
+        return Err(FreezeCommittedBindingError::AttemptStartRecordMismatch);
+    }
+    if input.freeze_attempt_start_record.input.freeze_attempt_id
+        != input.freeze_receipt_record.freeze_attempt_id
+    {
+        return Err(FreezeCommittedBindingError::FreezeAttemptMismatch);
+    }
+    if input.freeze_attempt_start_record.input.subject_id != input.freeze_receipt_record.subject_id
+    {
+        return Err(FreezeCommittedBindingError::SubjectMismatch);
+    }
+    if input.freeze_attempt_start_record.input.policy_record_id
+        != input.freeze_receipt_record.policy_record_id
+    {
+        return Err(FreezeCommittedBindingError::PolicyMismatch);
+    }
+    Ok(FreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
 }
 
 /// Typed, Record-local fields for the frozen GENESIS Record schema.
