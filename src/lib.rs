@@ -1189,8 +1189,8 @@ impl RetainedJournal {
     }
 
     /// Strictly decodes and appends a supported non-GENESIS Entry without
-    /// normalizing its bytes. Event forms with required event-specific fields
-    /// intentionally remain unavailable until their exact decoder is present.
+    /// normalizing its bytes. Event forms without a retained-runtime decoder
+    /// remain unavailable until their exact decoder is present.
     ///
     /// This preserves structural/history evidence only; it is not authority or
     /// admission validation despite the Journal Entry wire-format name.
@@ -1201,6 +1201,12 @@ impl RetainedJournal {
             return GenesisJournalEntry::decode_authoritative(input)
                 .map_err(|_| RetainedJournalError::DecodeError)
                 .and_then(|entry| self.append(RetainedJournalEntry::Genesis(entry)));
+        }
+        if event_type_id.value() == 100 {
+            return self.append_freeze_start(input, event_type_id);
+        }
+        if matches!(event_type_id.value(), 101..=103) {
+            return self.append_freeze_terminal(input, event_type_id);
         }
         if let Some(event_specific_keys) = event_specific_keys(event_type_id.value()) {
             decode_event_specific_journal_entry(input, event_type_id, event_specific_keys)
@@ -1233,6 +1239,103 @@ impl RetainedJournal {
             return Err(RetainedJournalError::DecodeError);
         }
 
+        self.append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id: common.registry_id,
+            entry_index: common.entry_index,
+            previous_entry_hash: common
+                .previous_entry_hash
+                .ok_or(RetainedJournalError::DecodeError)?,
+            event_type_id: common.event_type_id,
+            event_record_id: common.event_record_id,
+            lifecycle_object_kind: common.lifecycle_object_kind,
+            lifecycle_object_id: common.lifecycle_object_id,
+            authority_dependencies: common.authority_dependencies,
+            authoritative_bytes: input.to_vec(),
+        }))
+    }
+
+    fn append_freeze_start(
+        &mut self,
+        input: &[u8],
+        expected_event_type_id: EventTypeId,
+    ) -> Result<(), RetainedJournalError> {
+        let common = decode_journal_entry_with_event_specific_keys(input, &[16, 17])
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        if common.event_type_id != expected_event_type_id
+            || common.lifecycle_object_kind != LifecycleObjectKind::FreezeAttempt
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        let [(16, DecodedEventSpecificField::Bytes(freeze_attempt_id)), (17, DecodedEventSpecificField::Bytes(intended_root_id))] =
+            common.event_specific_fields.as_slice()
+        else {
+            return Err(RetainedJournalError::DecodeError);
+        };
+        let freeze_attempt_id = FreezeAttemptId::try_from(freeze_attempt_id.as_slice())
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        if common.lifecycle_object_id != *freeze_attempt_id.as_bytes()
+            || derive_freeze_root(common.registry_id, freeze_attempt_id)
+                .intended_root_id()
+                .as_bytes()
+                != intended_root_id
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        self.append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id: common.registry_id,
+            entry_index: common.entry_index,
+            previous_entry_hash: common
+                .previous_entry_hash
+                .ok_or(RetainedJournalError::DecodeError)?,
+            event_type_id: common.event_type_id,
+            event_record_id: common.event_record_id,
+            lifecycle_object_kind: common.lifecycle_object_kind,
+            lifecycle_object_id: common.lifecycle_object_id,
+            authority_dependencies: common.authority_dependencies,
+            authoritative_bytes: input.to_vec(),
+        }))
+    }
+
+    fn append_freeze_terminal(
+        &mut self,
+        input: &[u8],
+        expected_event_type_id: EventTypeId,
+    ) -> Result<(), RetainedJournalError> {
+        let common = decode_journal_entry_with_event_specific_keys(input, &[16, 18])
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        if common.event_type_id != expected_event_type_id
+            || common.lifecycle_object_kind != LifecycleObjectKind::FreezeAttempt
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        let [(16, DecodedEventSpecificField::Bytes(freeze_attempt_id)), (18, DecodedEventSpecificField::JournalReference(freeze_start_reference))] =
+            common.event_specific_fields.as_slice()
+        else {
+            return Err(RetainedJournalError::DecodeError);
+        };
+        if common.lifecycle_object_id != *freeze_attempt_id
+            || !common
+                .authority_dependencies
+                .elements
+                .iter()
+                .any(|reference| reference == freeze_start_reference)
+            || freeze_start_reference.event_type_id().value() != 100
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        self.resolve_reference(freeze_start_reference)?;
+        let freeze_start = self
+            .entries
+            .get(
+                usize::try_from(freeze_start_reference.entry_index().value())
+                    .map_err(|_| RetainedJournalError::MissingReference)?,
+            )
+            .ok_or(RetainedJournalError::MissingReference)?;
+        if freeze_start.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+            || freeze_start.lifecycle_object_id() != *freeze_attempt_id
+        {
+            return Err(RetainedJournalError::ReferenceMismatch);
+        }
         self.append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
             registry_id: common.registry_id,
             entry_index: common.entry_index,
@@ -1509,6 +1612,12 @@ struct DecodedCommonJournalEntry {
     lifecycle_object_id: [u8; ID_LENGTH],
     storage_capability_class_id: RecordId,
     environment_observation_id: RecordId,
+    event_specific_fields: Vec<(u64, DecodedEventSpecificField)>,
+}
+
+enum DecodedEventSpecificField {
+    Bytes([u8; ID_LENGTH]),
+    JournalReference(JournalReference),
 }
 
 fn decode_common_journal_entry(
@@ -1598,9 +1707,10 @@ fn decode_journal_entry_with_event_specific_keys(
     cursor.key(11)?;
     let environment_observation_id =
         RecordId::try_from(cursor.bstr_32()?.as_slice()).map_err(|_| JournalEntryDecodeError)?;
+    let mut event_specific_fields = Vec::with_capacity(event_specific_keys.len());
     for key in event_specific_keys {
         cursor.key(*key)?;
-        decode_event_specific_value(&mut cursor, *key)?;
+        event_specific_fields.push((*key, decode_event_specific_value(&mut cursor, *key)?));
     }
     if !cursor.finished() {
         return Err(JournalEntryDecodeError);
@@ -1617,6 +1727,7 @@ fn decode_journal_entry_with_event_specific_keys(
         lifecycle_object_id,
         storage_capability_class_id,
         environment_observation_id,
+        event_specific_fields,
     })
 }
 
@@ -1634,10 +1745,12 @@ fn event_specific_keys(event_type_id: u16) -> Option<&'static [u64]> {
 fn decode_event_specific_value(
     cursor: &mut CborCursor<'_>,
     key: u64,
-) -> Result<(), JournalEntryDecodeError> {
+) -> Result<DecodedEventSpecificField, JournalEntryDecodeError> {
     match key {
-        16 | 17 | 21 | 23 | 24 => cursor.bstr_32().map(|_| ()),
-        18 | 19 | 20 | 22 | 25 => decode_journal_reference(cursor).map(|_| ()),
+        16 | 17 | 21 | 23 | 24 => cursor.bstr_32().map(DecodedEventSpecificField::Bytes),
+        18 | 19 | 20 | 22 | 25 => {
+            decode_journal_reference(cursor).map(DecodedEventSpecificField::JournalReference)
+        }
         _ => Err(JournalEntryDecodeError),
     }
 }
