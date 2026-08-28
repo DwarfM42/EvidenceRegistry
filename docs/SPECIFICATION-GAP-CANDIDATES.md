@@ -27,9 +27,12 @@
 - Record Schema v0.3 §14 defines bounded primitives and `CanonicalPath`, but does
   not define a global recursive-container-depth or resource-profile limit
   (`docs/RECORD-SCHEMA-v0.3.md:700-728`).
-- Record Schema v0.3 §68 declares `CLOSEOUT.formal_support_binding` only as an
-  `embedded map`; its nested grammar is not defined in the frozen baseline
-  (`docs/RECORD-SCHEMA-v0.3.md:2683-2700`).
+- Record Schema v0.3 §68 declares `CLOSEOUT.formal_support_binding` as an
+  `embedded map` (`docs/RECORD-SCHEMA-v0.3.md:2683-2700`), and §74 defines
+  its required top-level and Assumption Binding keys
+  (`docs/RECORD-SCHEMA-v0.3.md:2930-2946`). Neither section defines a global
+  recursive-container-depth or resource-profile limit for generic opaque
+  Record-body structural skipping.
 
 The frozen authorities therefore do not uniquely select an interoperable maximum
 container depth for every possible opaque Record-body value.
@@ -71,7 +74,8 @@ and `freeze_attempt_id`, the Receipt identity, a Manifest, or a Journal event.
 1. **Infer a relationship** from field names or surrounding lifecycle wording. This
    would invent semantics and is prohibited.
 2. **Retain an opaque typed value** and validate only required presence, width, and
-   canonical CBOR framing. This is the current fail-closed decoder boundary.
+   canonical CBOR framing. This is the required fail-closed boundary for any
+   future type-local decoder.
 3. **Define a future explicit relationship** in a frozen successor, then add the
    corresponding contextual equality/derivation validation.
 
@@ -101,7 +105,8 @@ for those fields (`docs/RECORD-SCHEMA-v0.3.md:700-728`).
    prohibited.
 2. **Decode canonical unsigned integers as opaque values** without treating any
    number as `PERFORMED`, `NOT_PERFORMED`, `UNSUPPORTED`, custody-qualified, or
-   Policy-satisfying. This is the current fail-closed decoder boundary.
+   Policy-satisfying. This is the required fail-closed boundary for any future
+   type-local decoder.
 3. **Define a future frozen numeric registry and applicability rules**, then evaluate
    the values only with the required Policy, profile, storage/environment, and
    workflow evidence.
