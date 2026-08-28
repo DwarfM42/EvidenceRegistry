@@ -1,9 +1,11 @@
 {
   "provenance_id": "FORMAL-TOOL-PROVENANCE-LIFECYCLE-001",
   "status": "external bootstrap provenance; not an EvidenceRegistry Formal Verification Record",
-  "observed_at": "2026-08-28T17:52:02+09:00",
+  "observed_at": "2026-08-28T18:26:28+09:00",
   "formal_source": "formal/Lifecycle.dfy",
+  "formal_source_sha256": "ab660efd5b2b944653880e1d6400de0767c88e804e2a8949f40dde9043216624",
   "retained_verification_log": "formal/Lifecycle-verification-v1.log",
+  "retained_verification_log_sha256": "eda707aab4b15e8472f7d1722c5ad2994e3afb7a0b8d69ae37caae535a0af717",
   "log_line_endings": "Windows process CRLF output normalized to LF only for Git whitespace hygiene",
   "invocation": "D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe verify --cores:1 --resource-limit:100000 formal/Lifecycle.dfy",
   "dafny": {
