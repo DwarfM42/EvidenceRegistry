@@ -1,0 +1,14 @@
+provenance_observed_at=2026-08-28T16:14:13+09:00
+dafny_executable=D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe
+dafny_version=4.11.0+fcb2042d6d043a2634f0854338c08feeaaaf4ae2
+solver_executable=D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/z3/bin/z3-4.12.1.exe
+solver_version=Z3 version 4.12.1 - 64 bit
+host_uname=MINGW64_NT-10.0-26200 BASE 3.6.6-1cdd4371.x86_64 2026-01-15 22:20 UTC x86_64 Msys
+dotnet_sdk_version=10.0.300
+invocation=D:/AgentData/evidence-registry-tools/dafny-release-4.11.0/dafny/Dafny.exe verify --cores:1 --resource-limit:100000 formal/SupportImpact.dfy
+verification_time_limit=default:30_seconds_per_assertion_batch
+resource_limit=100000
+cores=1
+release_zip_sha256=3653f05a111ca21e234709ea7b25ce96083fd6c6f10484256ba54110dbc0654d
+
+Dafny program verifier finished with 7 verified, 0 errors
