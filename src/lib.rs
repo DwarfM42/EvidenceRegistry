@@ -667,6 +667,24 @@ impl EventTypeId {
     }
 }
 
+/// Validates the state-continuity portion of a runtime lifecycle transition.
+///
+/// This deliberately checks only the frozen event/kind/predecessor/result
+/// relation. A caller must separately validate retained-Journal references,
+/// Record payloads, authority dependencies, and admission before treating an
+/// event as authoritative.
+pub fn validate_state_only_legal_transition(
+    event: EventTypeId,
+    before: LifecycleObjectState,
+    after: LifecycleObjectState,
+) -> Result<(), LifecycleTransitionError> {
+    if event.resulting_state(before)? == after {
+        Ok(())
+    } else {
+        Err(LifecycleTransitionError::IllegalPredecessor)
+    }
+}
+
 /// The structural JournalReference from Identity Format v0.3 §51.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalReference {
@@ -714,6 +732,11 @@ impl JournalReference {
     /// resolving the referenced Entry and its authority requires retained context.
     pub fn event_type_id(&self) -> EventTypeId {
         self.event_type_id
+    }
+
+    /// The referenced event Record identity.
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
     }
 
     /// Emits the exact deterministic CBOR array required by §51.
@@ -962,6 +985,370 @@ impl OrdinaryVerificationJournalEntry {
             return Err(JournalEntryDecodeError);
         }
         Ok(decoded)
+    }
+}
+
+/// A retained, strictly decoded Journal subset currently supported by this
+/// runtime. Unsupported event forms are intentionally not normalized into this
+/// type: recovery must fail closed rather than skip an unknown entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetainedJournalEntry {
+    Genesis(GenesisJournalEntry),
+    Common(CommonRetainedJournalEntry),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommonRetainedJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_type_id: EventTypeId,
+    event_record_id: EventRecordId,
+    lifecycle_object_kind: LifecycleObjectKind,
+    lifecycle_object_id: [u8; ID_LENGTH],
+    authority_dependencies: AuthorityDependencyCollection,
+    authoritative_bytes: Vec<u8>,
+}
+
+impl RetainedJournalEntry {
+    fn registry_id(&self) -> RegistryId {
+        match self {
+            Self::Genesis(entry) => entry.registry_id,
+            Self::Common(entry) => entry.registry_id,
+        }
+    }
+
+    fn entry_index(&self) -> JournalEntryIndex {
+        match self {
+            Self::Genesis(_) => JournalEntryIndex(0),
+            Self::Common(entry) => entry.entry_index,
+        }
+    }
+
+    fn previous_entry_hash(&self) -> Option<JournalEntryHash> {
+        match self {
+            Self::Genesis(_) => None,
+            Self::Common(entry) => Some(entry.previous_entry_hash),
+        }
+    }
+
+    fn event_type_id(&self) -> EventTypeId {
+        match self {
+            Self::Genesis(_) => EventTypeId(1),
+            Self::Common(entry) => entry.event_type_id,
+        }
+    }
+
+    fn event_record_id(&self) -> EventRecordId {
+        match self {
+            Self::Genesis(entry) => entry.event_record_id,
+            Self::Common(entry) => entry.event_record_id,
+        }
+    }
+
+    fn entry_hash(&self) -> JournalEntryHash {
+        match self {
+            Self::Genesis(entry) => entry.entry_hash(),
+            Self::Common(entry) => JournalEntryHash(
+                Sha256::digest(&entry.authoritative_bytes)
+                    .as_slice()
+                    .try_into()
+                    .expect("SHA-256 always returns exactly 32 bytes"),
+            ),
+        }
+    }
+
+    fn lifecycle_object_kind(&self) -> LifecycleObjectKind {
+        match self {
+            Self::Genesis(_) => LifecycleObjectKind::Registry,
+            Self::Common(entry) => entry.lifecycle_object_kind,
+        }
+    }
+
+    fn lifecycle_object_id(&self) -> [u8; ID_LENGTH] {
+        match self {
+            Self::Genesis(entry) => *entry.registry_id.as_bytes(),
+            Self::Common(entry) => entry.lifecycle_object_id,
+        }
+    }
+
+    fn authority_dependencies(&self) -> &[JournalReference] {
+        match self {
+            Self::Genesis(_) => &[],
+            Self::Common(entry) => &entry.authority_dependencies.elements,
+        }
+    }
+}
+
+/// A fail-closed retained-Journal or state-reconstruction result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedJournalError {
+    /// An Entry belongs to a Registry other than the Journal's GENESIS Registry.
+    RegistryMismatch,
+    /// The next Entry index is not the unique monotonically increasing slot.
+    UnexpectedEntryIndex,
+    /// An Entry does not bind the preceding exact Entry hash.
+    PreviousHashMismatch,
+    /// A JournalReference points at an Entry absent from retained history.
+    MissingReference,
+    /// A retained Entry does not match every field of the supplied reference.
+    ReferenceMismatch,
+    /// The supported retained subset contains an impossible lifecycle transition.
+    LifecycleTransition,
+    /// The bytes fail the currently implemented strict Journal Entry grammar.
+    DecodeError,
+    /// The event needs an event-specific strict decoder not implemented by this runtime.
+    UnsupportedEntry,
+}
+
+/// A contiguous, in-memory retained Journal for the currently implemented
+/// strict Entry subset.
+///
+/// It verifies exact Entry hashes, indexes, predecessor links, and reference
+/// field equality for entries it retains. This is structural/history validation,
+/// not an authority or admission decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedJournal {
+    registry_id: RegistryId,
+    entries: Vec<RetainedJournalEntry>,
+}
+
+/// Lifecycle facts reconstructed from every retained Entry, starting at GENESIS.
+///
+/// The result says only that the retained, supported bytes replay through the
+/// state-only transition kernel. It does not establish an authoritative Record
+/// payload, authority dependency, policy, or admission result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconstructedJournalState {
+    registry_state: RegistryLifecycleState,
+    entry_count: usize,
+    journal_head_index: JournalEntryIndex,
+    journal_head_hash: JournalEntryHash,
+    states: Vec<(LifecycleObjectKind, [u8; ID_LENGTH], LifecycleObjectState)>,
+}
+
+impl ReconstructedJournalState {
+    /// The Registry lifecycle state reconstructed from the retained subset.
+    pub fn registry_state(&self) -> RegistryLifecycleState {
+        self.registry_state
+    }
+
+    /// The number of retained Entries included in this reconstruction.
+    pub fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    /// The final retained Entry index.
+    pub fn journal_head_index(&self) -> JournalEntryIndex {
+        self.journal_head_index
+    }
+
+    /// The recomputed hash of the final retained Entry.
+    pub fn journal_head_hash(&self) -> JournalEntryHash {
+        self.journal_head_hash
+    }
+
+    /// Returns the state of one exact kind-tagged lifecycle object, if retained.
+    pub fn state_for(
+        &self,
+        kind: LifecycleObjectKind,
+        object_id: &[u8; ID_LENGTH],
+    ) -> Option<LifecycleObjectState> {
+        self.states
+            .iter()
+            .find(|(stored_kind, stored_id, _)| *stored_kind == kind && stored_id == object_id)
+            .map(|(_, _, state)| *state)
+    }
+}
+
+impl RetainedJournal {
+    /// Starts a retained Journal from its exact structural GENESIS Entry.
+    pub fn from_genesis(genesis: GenesisJournalEntry) -> Result<Self, RetainedJournalError> {
+        let registry_id = genesis.registry_id;
+        let mut journal = Self {
+            registry_id,
+            entries: Vec::new(),
+        };
+        journal.append_genesis(genesis)?;
+        Ok(journal)
+    }
+
+    /// Strictly decodes exact GENESIS bytes before starting retained replay.
+    pub fn from_authoritative_genesis(input: &[u8]) -> Result<Self, RetainedJournalError> {
+        GenesisJournalEntry::decode_authoritative(input)
+            .map_err(|_| RetainedJournalError::DecodeError)
+            .and_then(Self::from_genesis)
+    }
+
+    /// Appends GENESIS only at the single initial Journal slot.
+    pub fn append_genesis(
+        &mut self,
+        genesis: GenesisJournalEntry,
+    ) -> Result<(), RetainedJournalError> {
+        self.append(RetainedJournalEntry::Genesis(genesis))
+    }
+
+    /// Strictly decodes and appends a supported non-GENESIS Entry without
+    /// normalizing its bytes. Event forms with required event-specific fields
+    /// intentionally remain unavailable until their exact decoder is present.
+    ///
+    /// This preserves structural/history evidence only; it is not authority or
+    /// admission validation despite the Journal Entry wire-format name.
+    pub fn append_strict_entry(&mut self, input: &[u8]) -> Result<(), RetainedJournalError> {
+        let common =
+            decode_common_journal_entry(input).map_err(|_| RetainedJournalError::DecodeError)?;
+        if common.event_type_id.value() == 1 {
+            return GenesisJournalEntry::decode_authoritative(input)
+                .map_err(|_| RetainedJournalError::DecodeError)
+                .and_then(|entry| self.append(RetainedJournalEntry::Genesis(entry)));
+        }
+        if common.event_type_id.value() == 200
+            || matches!(common.event_type_id.value(), 100..=104 | 700..=703)
+        {
+            return Err(RetainedJournalError::UnsupportedEntry);
+        }
+        if common.previous_entry_hash.is_none()
+            || common.lifecycle_object_kind != common.event_type_id.lifecycle_object_kind()
+        {
+            return Err(RetainedJournalError::DecodeError);
+        }
+        let expected_object_id = match common.lifecycle_object_kind {
+            LifecycleObjectKind::Registry => *common.registry_id.as_bytes(),
+            LifecycleObjectKind::FreezeAttempt | LifecycleObjectKind::ArtifactEvictionAttempt => {
+                return Err(RetainedJournalError::UnsupportedEntry)
+            }
+            _ => *common.event_record_id.as_bytes(),
+        };
+        if common.lifecycle_object_id != expected_object_id {
+            return Err(RetainedJournalError::DecodeError);
+        }
+
+        self.append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id: common.registry_id,
+            entry_index: common.entry_index,
+            previous_entry_hash: common
+                .previous_entry_hash
+                .ok_or(RetainedJournalError::DecodeError)?,
+            event_type_id: common.event_type_id,
+            event_record_id: common.event_record_id,
+            lifecycle_object_kind: common.lifecycle_object_kind,
+            lifecycle_object_id: common.lifecycle_object_id,
+            authority_dependencies: common.authority_dependencies,
+            authoritative_bytes: input.to_vec(),
+        }))
+    }
+
+    /// Resolves every field of a JournalReference against retained Entry bytes.
+    ///
+    /// A successful result does not establish that the referenced event carried
+    /// authority; it only establishes retained-history identity agreement.
+    pub fn resolve_reference(
+        &self,
+        reference: &JournalReference,
+    ) -> Result<(), RetainedJournalError> {
+        if reference.registry_id() != self.registry_id {
+            return Err(RetainedJournalError::ReferenceMismatch);
+        }
+        let entry = self
+            .entries
+            .get(
+                usize::try_from(reference.entry_index().value())
+                    .map_err(|_| RetainedJournalError::MissingReference)?,
+            )
+            .ok_or(RetainedJournalError::MissingReference)?;
+        if entry.entry_index() != reference.entry_index()
+            || entry.entry_hash() != reference.entry_hash()
+            || entry.event_type_id() != reference.event_type_id()
+            || entry.event_record_id() != reference.event_record_id()
+        {
+            return Err(RetainedJournalError::ReferenceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Replays every supported retained Entry from GENESIS.
+    pub fn reconstruct_state(&self) -> Result<ReconstructedJournalState, RetainedJournalError> {
+        let mut registry_state = RegistryLifecycleState::Absent;
+        let mut states = Vec::new();
+        for entry in &self.entries {
+            let kind = entry.lifecycle_object_kind();
+            let object_id = entry.lifecycle_object_id();
+            let state_index = states.iter().position(|(stored_kind, stored_id, _)| {
+                *stored_kind == kind && *stored_id == object_id
+            });
+            let before = state_index
+                .map(|index| states[index].2)
+                .unwrap_or_else(|| absent_state_for_kind(kind));
+            let after = entry
+                .event_type_id()
+                .resulting_state(before)
+                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+            validate_state_only_legal_transition(entry.event_type_id(), before, after)
+                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+            if let Some(index) = state_index {
+                states[index].2 = after;
+            } else {
+                states.push((kind, object_id, after));
+            }
+            if let LifecycleObjectState::Registry(state) = after {
+                registry_state = state;
+            }
+        }
+
+        let head = self
+            .entries
+            .last()
+            .ok_or(RetainedJournalError::UnexpectedEntryIndex)?;
+        Ok(ReconstructedJournalState {
+            registry_state,
+            entry_count: self.entries.len(),
+            journal_head_index: head.entry_index(),
+            journal_head_hash: head.entry_hash(),
+            states,
+        })
+    }
+
+    fn append(&mut self, entry: RetainedJournalEntry) -> Result<(), RetainedJournalError> {
+        if entry.registry_id() != self.registry_id {
+            return Err(RetainedJournalError::RegistryMismatch);
+        }
+        let expected_index = u64::try_from(self.entries.len())
+            .ok()
+            .and_then(|value| JournalEntryIndex::try_from(value).ok())
+            .ok_or(RetainedJournalError::UnexpectedEntryIndex)?;
+        if entry.entry_index() != expected_index {
+            return Err(RetainedJournalError::UnexpectedEntryIndex);
+        }
+        let expected_previous = self.entries.last().map(RetainedJournalEntry::entry_hash);
+        if entry.previous_entry_hash() != expected_previous {
+            return Err(RetainedJournalError::PreviousHashMismatch);
+        }
+        for reference in entry.authority_dependencies() {
+            self.resolve_reference(reference)?;
+        }
+        self.entries.push(entry);
+        Ok(())
+    }
+}
+
+fn absent_state_for_kind(kind: LifecycleObjectKind) -> LifecycleObjectState {
+    match kind {
+        LifecycleObjectKind::Registry => {
+            LifecycleObjectState::Registry(RegistryLifecycleState::Absent)
+        }
+        LifecycleObjectKind::FreezeAttempt => {
+            LifecycleObjectState::FreezeAttempt(FreezeAttemptState::Absent)
+        }
+        LifecycleObjectKind::ReviewAdmissionAttempt => {
+            LifecycleObjectState::ReviewAdmission(ReviewAdmissionState::Absent)
+        }
+        LifecycleObjectKind::CloseoutAttempt => {
+            LifecycleObjectState::CloseoutAttempt(CloseoutAttemptState::Absent)
+        }
+        LifecycleObjectKind::ArtifactEvictionAttempt => {
+            LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Absent)
+        }
+        _ => LifecycleObjectState::OneShot(OneShotRecordedState::Absent),
     }
 }
 
