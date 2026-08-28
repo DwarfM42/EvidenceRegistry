@@ -670,6 +670,30 @@ fn retained_journal_replays_a_structurally_valid_freeze_start() {
 }
 
 #[test]
+fn journal_only_reconstruction_retains_the_capability_epoch_of_every_entry() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash()))
+        .unwrap();
+
+    let replay = journal.reconstruct_state().unwrap();
+    let epochs = replay.capability_epochs();
+    assert_eq!(epochs.len(), 2);
+    for (expected_index, epoch) in epochs.iter().enumerate() {
+        assert_eq!(epoch.entry_index().value(), expected_index as u64);
+        assert_eq!(
+            epoch.storage_capability_class_id(),
+            RecordId::try_from(id(0x40).as_slice()).unwrap()
+        );
+        assert_eq!(
+            epoch.environment_observation_id(),
+            RecordId::try_from(id(0x60).as_slice()).unwrap()
+        );
+    }
+}
+
+#[test]
 fn retained_reference_resolution_preserves_common_capability_and_environment_context() {
     let genesis = genesis();
     let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();

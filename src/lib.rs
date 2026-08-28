@@ -1304,6 +1304,36 @@ pub struct ReconstructedJournalState {
     journal_head_hash: JournalEntryHash,
     states: Vec<(LifecycleObjectKind, [u8; ID_LENGTH], LifecycleObjectState)>,
     freeze_attempts: Vec<ReconstructedFreezeAttempt>,
+    capability_epochs: Vec<ReconstructedCapabilityEpoch>,
+}
+
+/// The capability and environment identities indexed by one retained Journal Entry.
+///
+/// This is Journal-only historical context. It does not establish that either
+/// referenced Record payload is available, valid, authoritative, or sufficient
+/// for any Policy or admission decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconstructedCapabilityEpoch {
+    entry_index: JournalEntryIndex,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl ReconstructedCapabilityEpoch {
+    /// The exact Journal Entry position carrying this indexed context.
+    pub fn entry_index(&self) -> JournalEntryIndex {
+        self.entry_index
+    }
+
+    /// The exact storage-capability-class identity indexed by the Entry.
+    pub fn storage_capability_class_id(&self) -> RecordId {
+        self.storage_capability_class_id
+    }
+
+    /// The exact environment-observation identity indexed by the Entry.
+    pub fn environment_observation_id(&self) -> RecordId {
+        self.environment_observation_id
+    }
 }
 
 /// Journal-only lifecycle facts for one retained Freeze Attempt.
@@ -1372,6 +1402,11 @@ impl ReconstructedJournalState {
     /// by its START Entry's Journal position.
     pub fn freeze_attempts(&self) -> &[ReconstructedFreezeAttempt] {
         &self.freeze_attempts
+    }
+
+    /// The capability epoch indexed by every retained Entry, in Journal order.
+    pub fn capability_epochs(&self) -> &[ReconstructedCapabilityEpoch] {
+        &self.capability_epochs
     }
 }
 
@@ -1860,7 +1895,13 @@ impl RetainedJournal {
         let mut registry_state = RegistryLifecycleState::Absent;
         let mut states = Vec::new();
         let mut freeze_attempts = Vec::new();
+        let mut capability_epochs = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
+            capability_epochs.push(ReconstructedCapabilityEpoch {
+                entry_index: entry.entry_index(),
+                storage_capability_class_id: entry.storage_capability_class_id(),
+                environment_observation_id: entry.environment_observation_id(),
+            });
             let kind = entry.lifecycle_object_kind();
             let object_id = entry.lifecycle_object_id();
             let state_index = states.iter().position(|(stored_kind, stored_id, _)| {
@@ -1920,6 +1961,7 @@ impl RetainedJournal {
             journal_head_hash: head.entry_hash(),
             states,
             freeze_attempts,
+            capability_epochs,
         })
     }
 
