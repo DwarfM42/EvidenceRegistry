@@ -1067,9 +1067,13 @@ fn encode_uint(output: &mut Vec<u8>, value: u64) {
     }
 }
 
+fn is_canonical_text_length(length: u64) -> bool {
+    length <= ER_UINT_MAX
+}
+
 fn encode_text(output: &mut Vec<u8>, value: &str) {
     let length = u64::try_from(value.len()).expect("platform usize fits into u64");
-    debug_assert!(length <= ER_UINT_MAX);
+    debug_assert!(is_canonical_text_length(length));
     match length {
         0..=23 => output.push(0x60 | length as u8),
         24..=0xff => output.extend_from_slice(&[0x78, length as u8]),
@@ -1425,7 +1429,8 @@ impl GenesisRecord {
     pub fn new(input: GenesisRecordInput) -> Result<Self, GenesisRecordFormatError> {
         if input.journal_format_version > ER_UINT_MAX
             || input.record_identity_profile_id > ER_UINT_MAX
-            || u64::try_from(input.created_by_tool_version.len()).is_err()
+            || u64::try_from(input.created_by_tool_version.len())
+                .map_or(true, |length| !is_canonical_text_length(length))
         {
             return Err(GenesisRecordFormatError);
         }
@@ -1854,6 +1859,12 @@ fn validate_authority_dependency_indices(
 #[cfg(test)]
 mod construction_order_tests {
     use super::*;
+
+    #[test]
+    fn canonical_text_lengths_end_at_er_uint_max() {
+        assert!(is_canonical_text_length(ER_UINT_MAX));
+        assert!(!is_canonical_text_length(ER_UINT_MAX + 1));
+    }
 
     #[test]
     fn unordered_identity_uniqueness_rejects_nonadjacent_duplicate_before_sorting() {
