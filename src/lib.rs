@@ -454,6 +454,53 @@ fn state_matches_kind(kind: LifecycleObjectKind, state: LifecycleObjectState) ->
     }
 }
 
+/// An assigned Record Type identifier from Record Schema v0.3 §4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RecordTypeId(u16);
+
+/// A Record Type identifier that is unassigned, retired, or outside the v0.3 range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordTypeIdError {
+    value: u64,
+}
+
+impl RecordTypeIdError {
+    /// The rejected Record Type identifier.
+    pub fn value(self) -> u64 {
+        self.value
+    }
+}
+
+impl TryFrom<u64> for RecordTypeId {
+    type Error = RecordTypeIdError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        let assigned = matches!(
+            value,
+            1..=7
+                | 10..=12
+                | 20..=23
+                | 30..=32
+                | 40
+                | 50
+                | 60..=63
+                | 70..=72
+                | 80..=90
+        );
+        if !assigned {
+            return Err(RecordTypeIdError { value });
+        }
+        Ok(Self(value as u16))
+    }
+}
+
+impl RecordTypeId {
+    /// The assigned numeric Record Type identifier.
+    pub fn value(self) -> u16 {
+        self.0
+    }
+}
+
 /// A current v0.x registered Journal event type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventTypeId(u16);
@@ -502,6 +549,42 @@ impl EventTypeId {
     /// The registered numeric event type identifier.
     pub fn value(self) -> u16 {
         self.0
+    }
+
+    /// Returns the exact event-Record type required by Record Schema v0.3 §5.
+    ///
+    /// This mapping checks only the event-to-Record-type binding. It does not
+    /// parse a Record, establish Record identity, resolve retained context, or
+    /// establish authority or admission.
+    pub fn required_record_type_id(self) -> RecordTypeId {
+        let value = match self.0 {
+            1 => 1,
+            100 => 3,
+            101 => 4,
+            102 => 5,
+            103 => 6,
+            104 => 7,
+            200 => 12,
+            300 => 30,
+            301 => 31,
+            302 | 303 => 32,
+            400 => 40,
+            500 | 501 => 50,
+            600 => 62,
+            700 => 71,
+            701..=703 => 72,
+            800 => 80,
+            801 => 81,
+            802 => 82,
+            803 => 83,
+            804 => 84,
+            805 => 85,
+            806 => 86,
+            807 => 87,
+            808 => 88,
+            _ => unreachable!("EventTypeId only contains registered v0.x event identifiers"),
+        };
+        RecordTypeId::try_from(value).expect("every frozen event-record mapping is assigned")
     }
 
     /// Returns the exact lifecycle object kind assigned by Cross-Reference v0.3 §23.
