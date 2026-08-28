@@ -34,14 +34,18 @@
   recursive-container-depth or resource-profile limit for generic opaque
   Record-body structural skipping.
 
-The frozen authorities therefore do not uniquely select an interoperable maximum
-container depth for every possible opaque Record-body value.
+The frozen authorities do not provide a global resource profile for an
+implementation that performs generic structural-only opaque-value skipping. This
+does not establish that any particular known Record schema admits arbitrary
+recursive values: type-local decoding remains subject to its closed field matrix
+and unknown-key rejection.
 
 ### Competing outcomes
 
-1. **Unlimited recursive parsing:** accept every otherwise canonical definite
-   nesting depth. This permits hostile bounded-byte input to consume unbounded call
-   stack and is rejected for the structural-parser safety lane.
+1. **An unbounded recursive generic skip algorithm:** recurse according to encoded
+   container nesting without a parser resource bound. This permits hostile
+   bounded-byte input to consume unbounded call stack and is rejected for the
+   structural-parser safety lane.
 2. **A local fail-closed resource profile:** accept container nesting through 64 and
    return a controlled decode error at 65. This is the current `StrictRecordFrame`
    implementation policy; it is not claimed to be a frozen normative constant.
@@ -65,9 +69,18 @@ validation. A strict type-local decoder may require the field and validate its
 ### Frozen authority and gap
 
 `FREEZE_RECEIPT` requires `freeze_id` as `OpaqueId32`
-(`docs/RECORD-SCHEMA-v0.3.md:2255-2278`). The frozen baseline reviewed for this
-candidate does not define a derivation, equality, or linkage rule between that field
-and `freeze_attempt_id`, the Receipt identity, a Manifest, or a Journal event.
+(`docs/RECORD-SCHEMA-v0.3.md:2253-2278`). The relevant frozen rules define
+other bindings: the Receipt contains an exact START JournalReference
+(`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:2054-2092`), a committed
+Freeze binds the exact Receipt and START (`docs/CROSS-REFERENCE-v0.3.md:1220-1225`),
+and the authoritative root derives from `freeze_attempt_id`
+(`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:2008-2026`). This candidate
+does not deny those bindings. Instead, the frozen baseline does not define an
+exact direct semantic equality or derivation rule tying the distinct `freeze_id`
+field to `freeze_attempt_id`, a Manifest identity, or a Journal-event identity.
+The Receipt identity still commits to its complete canonical bytes, including
+`freeze_id`; that identity commitment is not an equality or derivation rule for
+the field's semantic value.
 
 ### Competing outcomes
 
@@ -84,35 +97,3 @@ and `freeze_attempt_id`, the Receipt identity, a Manifest, or a Journal event.
 A binding or authority-shaped API must treat `freeze_id` as unavailable semantic
 context until outcome 3 exists. It must not return authority/admission success from
 this field.
-
-## SG-003 — `FREEZE_RECEIPT` custody and durability numeric semantics
-
-**Affected lane:** type-local semantic interpretation, Policy/durability evaluation,
-and authority/admission. Raw canonical integer decoding is not semantic evaluation.
-
-### Frozen authority and gap
-
-`FREEZE_RECEIPT` declares `custody_mode_id`, `file_content_flush_state`,
-`atomic_publish_no_replace_state`, and `parent_directory_flush_state` as `UInt`
-(`docs/RECORD-SCHEMA-v0.3.md:2261-2278`). Record Schema v0.3 §14 defines `UInt`
-as an unsigned integer within its applicable range but supplies no numeric registry
-for those fields (`docs/RECORD-SCHEMA-v0.3.md:700-728`).
-
-### Competing outcomes
-
-1. **Assign numeric meanings locally** (for example, mapping a number to a
-   durability state). This would invent authority-relevant semantics and is
-   prohibited.
-2. **Decode canonical unsigned integers as opaque values** without treating any
-   number as `PERFORMED`, `NOT_PERFORMED`, `UNSUPPORTED`, custody-qualified, or
-   Policy-satisfying. This is the required fail-closed boundary for any future
-   type-local decoder.
-3. **Define a future frozen numeric registry and applicability rules**, then evaluate
-   the values only with the required Policy, profile, storage/environment, and
-   workflow evidence.
-
-### Current bounded disposition
-
-Without outcome 3 and the separate required evidence, a contextual API must return
-an explicit non-success such as `AuthorityEvidenceUnavailable`; it must never infer
-Policy satisfaction, durability truth, authority, or admission from these integers.
