@@ -160,16 +160,6 @@ module LifecycleModel {
     kind != Registry
   }
 
-  function StateKindOf(state: LifecycleObjectState): LifecycleObjectKind {
-    match state
-      case RegistryObjectState(_) => Registry
-      case FreezeAttemptObjectState(_) => FreezeAttempt
-      case OneShotObjectState(_) => Verification
-      case ReviewAdmissionObjectState(_) => ReviewAdmissionAttempt
-      case CloseoutAttemptObjectState(_) => CloseoutAttempt
-      case ArtifactEvictionObjectState(_) => ArtifactEvictionAttempt
-  }
-
   // OneShotObjectState represents each listed one-shot kind. The kind argument
   // remains explicit at the API boundary so non-one-shot state/kind confusion is
   // rejected by the StateMatchesKind precondition below.
