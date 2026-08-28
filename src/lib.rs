@@ -1195,18 +1195,28 @@ impl RetainedJournal {
     /// This preserves structural/history evidence only; it is not authority or
     /// admission validation despite the Journal Entry wire-format name.
     pub fn append_strict_entry(&mut self, input: &[u8]) -> Result<(), RetainedJournalError> {
-        let common =
-            decode_common_journal_entry(input).map_err(|_| RetainedJournalError::DecodeError)?;
-        if common.event_type_id.value() == 1 {
+        let event_type_id = decode_journal_entry_event_type_id(input)
+            .map_err(|_| RetainedJournalError::DecodeError)?;
+        if event_type_id.value() == 1 {
             return GenesisJournalEntry::decode_authoritative(input)
                 .map_err(|_| RetainedJournalError::DecodeError)
                 .and_then(|entry| self.append(RetainedJournalEntry::Genesis(entry)));
         }
-        if common.event_type_id.value() == 200
-            || matches!(common.event_type_id.value(), 100..=104 | 700..=703)
-        {
+        if let Some(event_specific_keys) = event_specific_keys(event_type_id.value()) {
+            decode_event_specific_journal_entry(input, event_type_id, event_specific_keys)
+                .map_err(|_| RetainedJournalError::DecodeError)?;
             return Err(RetainedJournalError::UnsupportedEntry);
         }
+        if event_type_id.value() == 200 {
+            return match decode_common_journal_entry(input) {
+                Ok(_) => Err(RetainedJournalError::UnsupportedEntry),
+                Err(_) => decode_event_specific_journal_entry(input, event_type_id, &[20])
+                    .map(|_| Err(RetainedJournalError::UnsupportedEntry))
+                    .map_err(|_| RetainedJournalError::DecodeError)?,
+            };
+        }
+        let common =
+            decode_common_journal_entry(input).map_err(|_| RetainedJournalError::DecodeError)?;
         if common.previous_entry_hash.is_none()
             || common.lifecycle_object_kind != common.event_type_id.lifecycle_object_kind()
         {
@@ -1504,10 +1514,51 @@ struct DecodedCommonJournalEntry {
 fn decode_common_journal_entry(
     input: &[u8],
 ) -> Result<DecodedCommonJournalEntry, JournalEntryDecodeError> {
+    decode_journal_entry_with_event_specific_keys(input, &[])
+}
+
+fn decode_event_specific_journal_entry(
+    input: &[u8],
+    expected_event_type_id: EventTypeId,
+    event_specific_keys: &[u64],
+) -> Result<(), JournalEntryDecodeError> {
+    if decode_journal_entry_with_event_specific_keys(input, event_specific_keys)?.event_type_id
+        != expected_event_type_id
+    {
+        return Err(JournalEntryDecodeError);
+    }
+    Ok(())
+}
+
+fn decode_journal_entry_event_type_id(
+    input: &[u8],
+) -> Result<EventTypeId, JournalEntryDecodeError> {
     let mut cursor = CborCursor::new(input);
     cursor.array_exact(2)?;
     cursor.text_exact(JOURNAL_ENTRY_DOMAIN)?;
-    cursor.map_exact(12)?;
+    cursor.map()?;
+    cursor.key(0)?;
+    if cursor.uint()? != 1 {
+        return Err(JournalEntryDecodeError);
+    }
+    cursor.key(1)?;
+    cursor.bstr_32()?;
+    cursor.key(2)?;
+    JournalEntryIndex::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+    cursor.key(3)?;
+    cursor.null_or_bstr_32()?;
+    cursor.key(4)?;
+    EventTypeId::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)
+}
+
+fn decode_journal_entry_with_event_specific_keys(
+    input: &[u8],
+    event_specific_keys: &[u64],
+) -> Result<DecodedCommonJournalEntry, JournalEntryDecodeError> {
+    let mut cursor = CborCursor::new(input);
+    cursor.array_exact(2)?;
+    cursor.text_exact(JOURNAL_ENTRY_DOMAIN)?;
+    cursor.map_exact(12 + event_specific_keys.len())?;
     cursor.key(0)?;
     if cursor.uint()? != 1 {
         return Err(JournalEntryDecodeError);
@@ -1547,6 +1598,10 @@ fn decode_common_journal_entry(
     cursor.key(11)?;
     let environment_observation_id =
         RecordId::try_from(cursor.bstr_32()?.as_slice()).map_err(|_| JournalEntryDecodeError)?;
+    for key in event_specific_keys {
+        cursor.key(*key)?;
+        decode_event_specific_value(&mut cursor, *key)?;
+    }
     if !cursor.finished() {
         return Err(JournalEntryDecodeError);
     }
@@ -1563,6 +1618,28 @@ fn decode_common_journal_entry(
         storage_capability_class_id,
         environment_observation_id,
     })
+}
+
+fn event_specific_keys(event_type_id: u16) -> Option<&'static [u64]> {
+    match event_type_id {
+        100 => Some(&[16, 17]),
+        101..=103 => Some(&[16, 18]),
+        104 => Some(&[16, 18, 19]),
+        700 => Some(&[21, 22, 23, 24]),
+        701..=703 => Some(&[21, 25]),
+        _ => None,
+    }
+}
+
+fn decode_event_specific_value(
+    cursor: &mut CborCursor<'_>,
+    key: u64,
+) -> Result<(), JournalEntryDecodeError> {
+    match key {
+        16 | 17 | 21 | 23 | 24 => cursor.bstr_32().map(|_| ()),
+        18 | 19 | 20 | 22 | 25 => decode_journal_reference(cursor).map(|_| ()),
+        _ => Err(JournalEntryDecodeError),
+    }
 }
 
 fn decode_identity_dependencies(
@@ -1605,30 +1682,36 @@ fn decode_authority_dependencies(
     }
     let mut elements = Vec::with_capacity(length);
     for _ in 0..length {
-        cursor.array_exact(5)?;
-        let reference_registry = RegistryId::try_from(cursor.bstr_32()?.as_slice())
-            .map_err(|_| JournalEntryDecodeError)?;
-        let reference_index =
-            JournalEntryIndex::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
-        let reference_hash = JournalEntryHash::try_from(cursor.bstr_32()?.as_slice())
-            .map_err(|_| JournalEntryDecodeError)?;
-        let reference_event =
-            EventTypeId::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
-        let reference_record = EventRecordId::try_from(cursor.bstr_32()?.as_slice())
-            .map_err(|_| JournalEntryDecodeError)?;
-        elements.push(JournalReference::new(
-            reference_registry,
-            reference_index,
-            reference_hash,
-            reference_event,
-            reference_record,
-        ));
+        elements.push(decode_journal_reference(cursor)?);
     }
     AuthorityDependencyCollection::from_authoritative_ordered_elements(
         AuthorityDependencyContext::new(registry_id, entry_index),
         elements,
     )
     .map_err(|_| JournalEntryDecodeError)
+}
+
+fn decode_journal_reference(
+    cursor: &mut CborCursor<'_>,
+) -> Result<JournalReference, JournalEntryDecodeError> {
+    cursor.array_exact(5)?;
+    let reference_registry =
+        RegistryId::try_from(cursor.bstr_32()?.as_slice()).map_err(|_| JournalEntryDecodeError)?;
+    let reference_index =
+        JournalEntryIndex::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+    let reference_hash = JournalEntryHash::try_from(cursor.bstr_32()?.as_slice())
+        .map_err(|_| JournalEntryDecodeError)?;
+    let reference_event =
+        EventTypeId::try_from(cursor.uint()?).map_err(|_| JournalEntryDecodeError)?;
+    let reference_record = EventRecordId::try_from(cursor.bstr_32()?.as_slice())
+        .map_err(|_| JournalEntryDecodeError)?;
+    Ok(JournalReference::new(
+        reference_registry,
+        reference_index,
+        reference_hash,
+        reference_event,
+        reference_record,
+    ))
 }
 
 struct CborCursor<'a> {
@@ -1698,11 +1781,15 @@ impl<'a> CborCursor<'a> {
     }
 
     fn map_exact(&mut self, expected: usize) -> Result<(), JournalEntryDecodeError> {
-        let actual = usize::try_from(self.initial(5)?).map_err(|_| JournalEntryDecodeError)?;
+        let actual = self.map()?;
         if actual != expected {
             return Err(JournalEntryDecodeError);
         }
         Ok(())
+    }
+
+    fn map(&mut self) -> Result<usize, JournalEntryDecodeError> {
+        usize::try_from(self.initial(5)?).map_err(|_| JournalEntryDecodeError)
     }
 
     fn text_exact(&mut self, expected: &[u8]) -> Result<(), JournalEntryDecodeError> {

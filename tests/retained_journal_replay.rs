@@ -38,6 +38,59 @@ fn review_request_bytes(previous_entry_hash: JournalEntryHash) -> Vec<u8> {
     bytes
 }
 
+fn freeze_start_bytes(previous_entry_hash: JournalEntryHash) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(299);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xae);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x01, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x18, 0x64, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x80));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x02, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x10, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x11, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xc0));
+    bytes
+}
+
+fn eviction_committed_bytes(previous_entry_hash: JournalEntryHash) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(407);
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.push(0xae);
+    bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.extend_from_slice(&[0x02, 0x01, 0x03, 0x58, 0x20]);
+    bytes.extend_from_slice(previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x19, 0x02, 0xbd, 0x05, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x80));
+    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x03, 0x09, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x0a, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x40));
+    bytes.extend_from_slice(&[0x0b, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x60));
+    bytes.extend_from_slice(&[0x15, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0xa0));
+    bytes.extend_from_slice(&[0x18, 0x19, 0x85, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x00));
+    bytes.push(0x00);
+    bytes.extend_from_slice(&[0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x20));
+    bytes.extend_from_slice(&[0x18, 0x64, 0x58, 0x20]);
+    bytes.extend_from_slice(&id(0x80));
+    bytes
+}
+
 #[test]
 fn retained_genesis_replays_registry_state_and_resolves_its_exact_reference() {
     let genesis = genesis();
@@ -124,6 +177,44 @@ fn retained_journal_rejects_a_broken_hash_link_without_mutating_replay_history()
     assert_eq!(
         journal.append_strict_entry(&malformed_link),
         Err(RetainedJournalError::PreviousHashMismatch)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn retained_journal_marks_a_well_framed_unimplemented_freeze_event_as_unsupported() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+
+    assert_eq!(
+        journal.append_strict_entry(&freeze_start_bytes(genesis.entry_hash())),
+        Err(RetainedJournalError::UnsupportedEntry)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn retained_journal_marks_a_well_framed_unimplemented_eviction_event_as_unsupported() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+
+    assert_eq!(
+        journal.append_strict_entry(&eviction_committed_bytes(genesis.entry_hash())),
+        Err(RetainedJournalError::UnsupportedEntry)
+    );
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn retained_journal_rejects_a_malformed_event_specific_entry_without_mutating_history() {
+    let genesis = genesis();
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    let mut malformed = freeze_start_bytes(genesis.entry_hash());
+    malformed.pop();
+
+    assert_eq!(
+        journal.append_strict_entry(&malformed),
+        Err(RetainedJournalError::DecodeError)
     );
     assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 1);
 }
