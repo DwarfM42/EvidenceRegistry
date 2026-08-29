@@ -123,7 +123,7 @@ retention of opaque Manifest bytes.
 - The frozen baseline also provides no numeric `digest_profile_id` registry or
   rule relating that field to each Artifact Entry's `digest_algorithm_id`. The
   latter has a separately frozen algorithm registry
-  (`docs/IDENTITY-FORMAT-v0.3.md:714-738`).
+  (`docs/IDENTITY-FORMAT-v0.3.md:756-766`).
 
 The frozen authorities therefore do not uniquely determine how a runtime selects
 the path parser/comparator for a numeric Manifest profile or evaluates
