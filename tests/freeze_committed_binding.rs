@@ -486,7 +486,11 @@ fn freeze_committed_binding_accepts_only_the_independently_anchored_structural_f
 
 #[test]
 fn freeze_receipt_decoder_retains_exact_typed_authority_prerequisites() {
-    let receipt = FreezeReceiptRecord::decode_authoritative(&hex_bytes(RECEIPT_HEX)).unwrap();
+    let mut receipt_bytes = hex_bytes(RECEIPT_HEX);
+    replace_unique(&mut receipt_bytes, &[0x17, 0x01, 0x18, 0x18, 0x58], 1, 0x02);
+    replace_unique(&mut receipt_bytes, &[0x18, 0x1b, 0x01, 0x18, 0x1c], 2, 0x02);
+    replace_unique(&mut receipt_bytes, &[0x18, 0x1c, 0x01, 0x18, 0x1d], 2, 0x03);
+    let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes).unwrap();
     let input = receipt.input();
 
     assert_eq!(input.freeze_attempt_id.as_bytes(), &id(0xa0));
@@ -509,12 +513,12 @@ fn freeze_receipt_decoder_retains_exact_typed_authority_prerequisites() {
     assert_eq!(input.manifest_id.as_bytes(), &id(0xc0));
     assert_eq!(input.custody_mode_id, 1);
     assert_eq!(input.creation_profile_ref.as_bytes(), &id(0xd0));
-    assert_eq!(input.path_identity_profile_id, 1);
+    assert_eq!(input.path_identity_profile_id, 2);
     assert_eq!(input.filesystem_profile_ref.as_bytes(), &id(0xf0));
     assert_eq!(input.policy_record_id.as_bytes(), &id(0x40));
     assert_eq!(input.file_content_flush_state, 1);
-    assert_eq!(input.atomic_publish_no_replace_state, 1);
-    assert_eq!(input.parent_directory_flush_state, 1);
+    assert_eq!(input.atomic_publish_no_replace_state, 2);
+    assert_eq!(input.parent_directory_flush_state, 3);
     assert!(input.platform_strongest_available);
     assert_eq!(input.requested_commit_durability_ref, None);
     assert_eq!(input.created_by_tool_version, "test");
