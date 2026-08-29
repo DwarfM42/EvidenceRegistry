@@ -67,7 +67,7 @@ fn verify_journal(input: JournalVerifyInput) -> ExitCode {
         Ok(bytes) => bytes,
         Err(_) => {
             print_unavailable("GENESIS_INPUT_UNAVAILABLE", "INPUT_UNAVAILABLE");
-            return ExitCode::from(2);
+            return ExitCode::from(6);
         }
     };
     let mut journal = match RetainedJournal::from_authoritative_genesis(&genesis_bytes) {
@@ -80,7 +80,7 @@ fn verify_journal(input: JournalVerifyInput) -> ExitCode {
             Ok(bytes) => bytes,
             Err(_) => {
                 print_unavailable("ENTRY_INPUT_UNAVAILABLE", "INPUT_UNAVAILABLE");
-                return ExitCode::from(2);
+                return ExitCode::from(6);
             }
         };
         if let Err(error) = journal.append_strict_entry(&entry_bytes) {

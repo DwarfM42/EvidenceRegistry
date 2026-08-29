@@ -118,3 +118,30 @@ fn journal_verify_keeps_invalid_exact_bytes_distinct_from_unavailable_authority(
         "JRN-CLI-INVALID-001"
     );
 }
+
+#[test]
+fn journal_verify_reports_unavailable_caller_selected_input_as_indeterminate_evidence() {
+    let inputs = TempInputDir::new();
+    let missing_genesis = inputs.path.join("missing-genesis.cbor");
+
+    let output = Command::new(cli_path())
+        .args(["journal", "verify", "--genesis"])
+        .arg(missing_genesis)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        concat!(
+            "{\"output_schema_version\":1,",
+            "\"operation\":\"journal verify\",",
+            "\"outcome\":\"INPUT_UNAVAILABLE\",",
+            "\"structural_status\":\"UNAVAILABLE\",",
+            "\"authority_status\":\"UNAVAILABLE\",",
+            "\"admission_status\":\"UNAVAILABLE\",",
+            "\"error_class\":\"GENESIS_INPUT_UNAVAILABLE\"}\n"
+        ),
+        "JRN-CLI-MISSING-INPUT-001"
+    );
+}
