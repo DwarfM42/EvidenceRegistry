@@ -97,3 +97,59 @@ the field's semantic value.
 A binding or authority-shaped API must treat `freeze_id` as unavailable semantic
 context until outcome 3 exists. It must not return authority/admission success from
 this field.
+
+## SG-003 — MANIFEST path and digest profile resolution
+
+**Affected lane:** type-local semantic validation of `MANIFEST.artifacts[]` and
+the structural-continuity path that depends on a semantically validated Manifest.
+This does not affect strict Record-frame decoding, exact Record identity, or
+retention of opaque Manifest bytes.
+
+### Frozen authority and gap
+
+- `MANIFEST` requires a numeric `path_identity_profile_id`, a numeric
+  `digest_profile_id`, and an `artifacts` array whose entries contain canonical
+  paths and digest algorithm identifiers
+  (`docs/RECORD-SCHEMA-v0.3.md:2168-2176`,
+  `docs/RECORD-SCHEMA-v0.3.md:2180-2210`).
+- The Lifecycle specification names `UTF8_STRICT_V1` and `NATIVE_LOSSLESS_V1`
+  and specifies their representations, but supplies no numeric registry binding
+  either profile to a `path_identity_profile_id`
+  (`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:1656-1710`). The selected
+  profile defines component encoding and the path comparison algorithm
+  (`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:1656-1667`), including the
+  selected-profile malformed-encoding rejection required for a canonical path
+  (`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:1744-1753`).
+- The frozen baseline also provides no numeric `digest_profile_id` registry or
+  rule relating that field to each Artifact Entry's `digest_algorithm_id`. The
+  latter has a separately frozen algorithm registry
+  (`docs/IDENTITY-FORMAT-v0.3.md:714-738`).
+
+The frozen authorities therefore do not uniquely determine how a runtime selects
+the path parser/comparator for a numeric Manifest profile or evaluates
+digest-profile-to-algorithm coherence.
+
+### Competing outcomes
+
+1. **Invent a numeric mapping or profile/algorithm relationship:** infer that a
+   numeric value selects a named path profile, or that a digest profile implies a
+   particular artifact algorithm. This invents frozen semantics and is rejected.
+2. **Treat raw component bytes as a universally validated canonical path:** this
+   would bypass the required selected-profile encoding and comparator semantics,
+   and could accept an out-of-order, duplicate, or malformed path under the
+   actual selected profile. This is rejected for the semantic-MANIFEST lane.
+3. **Fail closed for semantic Manifest validation:** retain only exact Record
+   identity/framing facts and report profile semantics unavailable until a frozen
+   profile registry and digest-profile relation are supplied. This is the current
+   bounded disposition.
+4. **A future frozen profile successor:** assign numeric profile IDs and define
+   digest-profile/algorithm coherence, then permit strict typed Manifest
+   validation and Receipt-to-Manifest semantic continuity checks.
+
+### Current bounded disposition
+
+No current runtime path may return a successful semantic-MANIFEST or
+Receipt-to-Manifest continuity result by selecting an unstated profile mapping or
+by treating bytewise parsing as the selected-profile validation. This does not
+weaken the independent requirement that every successful Freeze continuity check
+uses exact identities where the frozen rules do define them.
