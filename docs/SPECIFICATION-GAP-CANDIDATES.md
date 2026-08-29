@@ -153,3 +153,51 @@ Receipt-to-Manifest continuity result by selecting an unstated profile mapping o
 by treating bytewise parsing as the selected-profile validation. This does not
 weaken the independent requirement that every successful Freeze continuity check
 uses exact identities where the frozen rules do define them.
+
+## SG-004 — Runtime Record-byte resolver contract
+
+**Affected lane:** supplying exact authoritative Record bytes to a bounded
+runtime composition adapter. This candidate does not define a persistent Record
+store, namespace ownership, discovery protocol, cache, retry, retention, or
+authorization behavior.
+
+### Frozen authority and gap
+
+- Event Record Validation requires a runtime to load a Journal Entry's exact
+  `event_record_id` and verify its exact Record identity before later
+  event-specific checks (`docs/RECORD-SCHEMA-v0.3.md:3597-3628`).
+- A Journal Entry may remain structurally valid while its authoritative payload
+  is unavailable; that absence must be reported distinctly and cannot validate
+  Record-contained Journal References (`docs/IDENTITY-FORMAT-v0.3.md:344-370`).
+- The Lifecycle specification sketches a `records/<record-id>.cbor` namespace,
+  but says the authoritative namespace layout must be frozen before stable-format
+  release and labels operational namespaces nonauthoritative
+  (`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:1103-1134`). It does not
+  define a runtime resolver's persistence, discovery, collision, cache, retry,
+  error-transport, lifetime, or authorization contract.
+
+The frozen authorities therefore require exact identity checks for Record bytes
+that a runtime obtains, but do not uniquely determine a general Record-storage or
+Record-resolution mechanism.
+
+### Competing outcomes
+
+1. **Invent a persistent Record store contract:** select namespace ownership,
+   discovery, caching, duplicate/collision handling, or authorization behavior.
+   This would add unresolved runtime semantics and is rejected.
+2. **Use an injected exact-byte supplier:** accept only caller-provided bytes for
+   a requested exact Record ID, recompute that identity independently, and report
+   missing, invalid, and identity-mismatched payloads separately. This is the
+   bounded current composition seam.
+3. **Freeze a resolver/store profile:** define the unresolved persistence and
+   operational behavior in a future frozen successor, then implement that
+   separately specified contract.
+
+### Current bounded disposition
+
+The current runtime may compose existing strict START and Receipt decoders through
+an injected exact-byte supplier only. Missing bytes are unavailable evidence;
+present malformed bytes are invalid evidence; bytes whose recomputed Record ID
+differs from the requested exact ID are identity mismatches. None of those outcomes
+establish authority, admission, Policy satisfaction, semantic-MANIFEST validity,
+custody, durability, lifecycle truth, or external trust.
