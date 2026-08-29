@@ -77,23 +77,30 @@ fn scope_record_decodes_fixed_declared_fields_and_exact_identity() {
 }
 
 #[test]
-fn scope_record_rejects_non_scope_and_noncanonical_local_body_variants() {
+fn scope_record_rejects_non_scope_and_unknown_local_body_key_variants() {
     let canonical = hex_bytes(SCOPE_RECORD_NO_LABEL_HEX);
 
     let mut unknown_body_key = canonical.clone();
     replace_unique(&mut unknown_body_key, &[0x11, 0x02, 0x12], 2, 0x14);
-    let mut null_label = canonical.clone();
-    replace_unique(&mut null_label, &[0x01, 0xa5, 0x00, 0x01], 1, 0xa6);
-    null_label.extend_from_slice(&[0x13, 0xf6]);
     let mut non_scope_type = canonical;
     replace_unique(&mut non_scope_type, &[0x14, 0x01, 0xa5], 0, 0x15);
     replace_unique(&mut non_scope_type, &[0x01, 0x14, 0x10], 1, 0x15);
 
     assert!(StrictRecordFrame::decode_authoritative(&unknown_body_key).is_ok());
     assert!(StrictRecordFrame::decode_authoritative(&non_scope_type).is_ok());
-    for invalid in [unknown_body_key, null_label, non_scope_type] {
+    for invalid in [unknown_body_key, non_scope_type] {
         assert!(ScopeRecord::decode_authoritative(&invalid).is_err());
     }
+}
+
+#[test]
+fn scope_record_rejects_structurally_valid_non_text_label_at_local_label_gate() {
+    let mut non_text_label = hex_bytes(SCOPE_RECORD_NO_LABEL_HEX);
+    replace_unique(&mut non_text_label, &[0x01, 0xa5, 0x00, 0x01], 1, 0xa6);
+    non_text_label.extend_from_slice(&[0x13, 0xf5]);
+
+    assert!(StrictRecordFrame::decode_authoritative(&non_text_label).is_ok());
+    assert!(ScopeRecord::decode_authoritative(&non_text_label).is_err());
 }
 
 #[test]
