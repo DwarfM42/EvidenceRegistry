@@ -2910,13 +2910,20 @@ impl ManifestRecord {
         for _ in 0..actual_artifact_count {
             cursor.array_exact(5).map_err(|_| RecordDecodeError)?;
             let artifact_kind_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+            if !matches!(artifact_kind_id, 1 | 2) {
+                return Err(RecordDecodeError);
+            }
             let component_count = cursor.array().map_err(|_| RecordDecodeError)?;
             if component_count == 0 {
                 return Err(RecordDecodeError);
             }
             let mut path_components = Vec::new();
             for _ in 0..component_count {
-                path_components.push(cursor.bstr().map_err(|_| RecordDecodeError)?);
+                let component = cursor.bstr().map_err(|_| RecordDecodeError)?;
+                if component.is_empty() || matches!(component.as_slice(), b"." | b"..") {
+                    return Err(RecordDecodeError);
+                }
+                path_components.push(component);
             }
             let size_bytes = cursor.uint().map_err(|_| RecordDecodeError)?;
             let digest_algorithm_id = cursor.uint().map_err(|_| RecordDecodeError)?;

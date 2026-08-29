@@ -792,6 +792,55 @@ impl ExactRecordByteResolver for FixtureRecordResolver {
     }
 }
 
+fn resolved_binding_result_for_manifest_bytes(
+    manifest_bytes: Vec<u8>,
+) -> Result<FreezeCommittedBindingOutcome, ResolvedFreezeCommittedBindingError> {
+    let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
+    let start_record = start_record(registry_id);
+    let genesis = evidence_registry::GenesisJournalEntry::new(
+        registry_id,
+        EventRecordId::try_from(id(0x20).as_slice()).unwrap(),
+        RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        RecordId::try_from(id(0x60).as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+    journal
+        .append_strict_entry(&freeze_start_bytes(genesis.entry_hash(), &start_record))
+        .unwrap();
+    let start_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        journal.reconstruct_state().unwrap().journal_head_hash(),
+        EventTypeId::try_from(100_u64).unwrap(),
+        EventRecordId::try_from(start_record.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let manifest_id = RecordId::try_from(sha256(&manifest_bytes).as_slice()).unwrap();
+    let receipt_bytes = receipt_bytes(&start_reference, manifest_id);
+    let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes).unwrap();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            start_reference.entry_hash(),
+            &start_reference,
+            receipt.record_id(),
+        ))
+        .unwrap();
+    let committed_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(2_u64).unwrap(),
+        journal.reconstruct_state().unwrap().journal_head_hash(),
+        EventTypeId::try_from(101_u64).unwrap(),
+        EventRecordId::try_from(receipt.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let records = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), start_record.authoritative_cbor()),
+            (receipt.record_id(), receipt_bytes),
+            (manifest_id, manifest_bytes),
+        ],
+    };
+    validate_resolved_freeze_committed_binding(&journal, committed_reference, &records)
+}
+
 #[test]
 fn resolved_freeze_committed_binding_distinguishes_missing_and_invalid_record_payloads() {
     let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
@@ -870,6 +919,40 @@ fn resolved_freeze_committed_binding_distinguishes_missing_invalid_and_wrong_ide
             &mismatched_manifest
         ),
         Err(ResolvedFreezeCommittedBindingError::ManifestIdentityMismatch)
+    );
+}
+
+#[test]
+fn resolved_freeze_committed_binding_reaches_exact_manifest_subject_continuity_gate() {
+    let mut wrong_subject_manifest = hex_bytes(MANIFEST_RECORD_HEX);
+    replace_unique(
+        &mut wrong_subject_manifest,
+        &[0x10, 0x58, 0x20, 0xe0],
+        3,
+        0xe1,
+    );
+
+    assert!(StrictRecordFrame::decode_authoritative(&wrong_subject_manifest).is_ok());
+    assert_eq!(
+        resolved_binding_result_for_manifest_bytes(wrong_subject_manifest),
+        Err(ResolvedFreezeCommittedBindingError::ManifestSubjectMismatch)
+    );
+}
+
+#[test]
+fn resolved_freeze_committed_binding_reaches_exact_manifest_path_profile_continuity_gate() {
+    let mut wrong_profile_manifest = hex_bytes(MANIFEST_RECORD_HEX);
+    replace_unique(
+        &mut wrong_profile_manifest,
+        &[0x11, 0x01, 0x12, 0x01, 0x13, 0x01, 0x14],
+        3,
+        0x02,
+    );
+
+    assert!(StrictRecordFrame::decode_authoritative(&wrong_profile_manifest).is_ok());
+    assert_eq!(
+        resolved_binding_result_for_manifest_bytes(wrong_profile_manifest),
+        Err(ResolvedFreezeCommittedBindingError::ManifestPathIdentityProfileMismatch)
     );
 }
 

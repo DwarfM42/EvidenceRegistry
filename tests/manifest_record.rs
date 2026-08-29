@@ -30,6 +30,19 @@ fn replace_unique(bytes: &mut [u8], needle: &[u8], replacement_at_offset: usize,
     bytes[matches[0] + replacement_at_offset] = replacement;
 }
 
+fn replace_unique_range(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) {
+    let matches = bytes
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(index, candidate)| (candidate == needle).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "fixture marker must occur exactly once");
+    bytes.splice(
+        matches[0]..matches[0] + needle.len(),
+        replacement.iter().copied(),
+    );
+}
+
 #[test]
 fn manifest_record_decodes_fixed_local_artifact_fields_and_exact_identity() {
     let canonical = hex_bytes(MANIFEST_RECORD_HEX);
@@ -101,4 +114,59 @@ fn manifest_record_strict_decoder_rejects_artifact_count_or_local_artifact_gramm
         assert!(ManifestRecord::decode_authoritative(&invalid).is_err());
     }
     assert!(ManifestRecord::decode_authoritative(&short_digest).is_err());
+}
+
+#[test]
+fn manifest_record_strict_decoder_rejects_unassigned_artifact_kinds_and_invalid_path_components() {
+    let canonical = hex_bytes(MANIFEST_RECORD_HEX);
+
+    let mut invalid_artifact_kind_zero = canonical.clone();
+    replace_unique(
+        &mut invalid_artifact_kind_zero,
+        &[0x85, 0x01, 0x81, 0x41, 0x61],
+        1,
+        0x00,
+    );
+    let mut reserved_artifact_kind = canonical.clone();
+    replace_unique(
+        &mut reserved_artifact_kind,
+        &[0x85, 0x01, 0x81, 0x41, 0x61],
+        1,
+        0x03,
+    );
+    let mut unassigned_artifact_kind = canonical.clone();
+    replace_unique(
+        &mut unassigned_artifact_kind,
+        &[0x85, 0x01, 0x81, 0x41, 0x61],
+        1,
+        0x04,
+    );
+
+    let path_member = &[0x81, 0x41, 0x61, 0x00, 0x01, 0x58, 0x20];
+    let mut empty_component = canonical.clone();
+    replace_unique_range(
+        &mut empty_component,
+        path_member,
+        &[0x81, 0x40, 0x00, 0x01, 0x58, 0x20],
+    );
+    let mut dot_component = canonical.clone();
+    replace_unique(&mut dot_component, path_member, 2, b'.');
+    let mut dot_dot_component = canonical;
+    replace_unique_range(
+        &mut dot_dot_component,
+        path_member,
+        &[0x81, 0x42, b'.', b'.', 0x00, 0x01, 0x58, 0x20],
+    );
+
+    for invalid in [
+        invalid_artifact_kind_zero,
+        reserved_artifact_kind,
+        unassigned_artifact_kind,
+        empty_component,
+        dot_component,
+        dot_dot_component,
+    ] {
+        assert!(StrictRecordFrame::decode_authoritative(&invalid).is_ok());
+        assert!(ManifestRecord::decode_authoritative(&invalid).is_err());
+    }
 }
