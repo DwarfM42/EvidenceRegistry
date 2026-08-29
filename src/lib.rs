@@ -2553,6 +2553,21 @@ impl<'a> CborCursor<'a> {
         Ok(bytes)
     }
 
+    fn bstr(&mut self) -> Result<Vec<u8>, JournalEntryDecodeError> {
+        let length = usize::try_from(self.initial(2)?).map_err(|_| JournalEntryDecodeError)?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(JournalEntryDecodeError)?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or(JournalEntryDecodeError)?
+            .to_vec();
+        self.offset = end;
+        Ok(bytes)
+    }
+
     fn null_or_bstr_32(&mut self) -> Result<Option<[u8; ID_LENGTH]>, JournalEntryDecodeError> {
         if self.input.get(self.offset) == Some(&0xf6) {
             self.offset += 1;
@@ -2814,6 +2829,138 @@ pub fn validate_event_record_structural_binding(
         record_id: frame.record_id(),
         record_type_id: frame.record_type_id(),
     })
+}
+
+/// One structurally framed MANIFEST Artifact Entry.
+///
+/// `path_components` retains exact component bytes but does not interpret their
+/// selected path-identity profile, establish path ordering/deduplication, or
+/// establish any filesystem fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestArtifactEntry {
+    pub artifact_kind_id: u64,
+    pub path_components: Vec<Vec<u8>>,
+    pub size_bytes: u64,
+    pub digest_algorithm_id: u64,
+    pub digest_bytes: [u8; ID_LENGTH],
+}
+
+/// Typed, Record-local fields decoded from a MANIFEST Record.
+///
+/// The selected path and digest profile semantics remain external. These fields
+/// retain only the strict Record-local grammar, including the frozen SHA-256
+/// digest algorithm and width, and make no Manifest semantic, authority,
+/// custody, durability, or filesystem claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestRecordInput {
+    pub subject_id: [u8; ID_LENGTH],
+    pub artifact_count: u64,
+    pub path_identity_profile_id: u64,
+    pub digest_profile_id: u64,
+    pub artifacts: Vec<ManifestArtifactEntry>,
+}
+
+/// The exact-byte, Record-local MANIFEST schema from Record Schema v0.3 §§52–54.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestRecord {
+    record_id: RecordId,
+    input: ManifestRecordInput,
+}
+
+impl ManifestRecord {
+    /// Strictly decodes the frozen MANIFEST local Record grammar without normalization.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(2).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 2
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(7).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 2 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let subject_id = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let artifact_count = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let path_identity_profile_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(19).map_err(|_| RecordDecodeError)?;
+        let digest_profile_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(20).map_err(|_| RecordDecodeError)?;
+        let actual_artifact_count = cursor.array().map_err(|_| RecordDecodeError)?;
+        if artifact_count != actual_artifact_count as u64 {
+            return Err(RecordDecodeError);
+        }
+        let mut artifacts = Vec::new();
+        for _ in 0..actual_artifact_count {
+            cursor.array_exact(5).map_err(|_| RecordDecodeError)?;
+            let artifact_kind_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+            let component_count = cursor.array().map_err(|_| RecordDecodeError)?;
+            if component_count == 0 {
+                return Err(RecordDecodeError);
+            }
+            let mut path_components = Vec::new();
+            for _ in 0..component_count {
+                path_components.push(cursor.bstr().map_err(|_| RecordDecodeError)?);
+            }
+            let size_bytes = cursor.uint().map_err(|_| RecordDecodeError)?;
+            let digest_algorithm_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+            if digest_algorithm_id != 1 {
+                return Err(RecordDecodeError);
+            }
+            let digest_bytes = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            artifacts.push(ManifestArtifactEntry {
+                artifact_kind_id,
+                path_components,
+                size_bytes,
+                digest_algorithm_id,
+                digest_bytes,
+            });
+        }
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            input: ManifestRecordInput {
+                subject_id,
+                artifact_count,
+                path_identity_profile_id,
+                digest_profile_id,
+                artifacts,
+            },
+        })
+    }
+
+    /// The exact immutable identity of the strictly decoded MANIFEST Record.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The frozen Record Type ID for MANIFEST.
+    pub fn record_type_id(&self) -> RecordTypeId {
+        RecordTypeId::try_from(2).expect("MANIFEST is assigned in Record Schema v0.3")
+    }
+
+    /// Returns exact local MANIFEST fields without profile or authority inference.
+    pub fn input(&self) -> &ManifestRecordInput {
+        &self.input
+    }
 }
 
 /// Typed, Record-local fields for the frozen FREEZE_ATTEMPT_START Record schema.
@@ -3240,6 +3387,16 @@ pub enum ResolvedFreezeCommittedBindingError {
     ReceiptDecode,
     /// Strictly decoded Receipt bytes did not hash to the terminal Entry's exact Record ID.
     ReceiptIdentityMismatch,
+    /// The exact MANIFEST Record bytes required by the Receipt were unavailable.
+    ManifestPayloadUnavailable,
+    /// Supplied MANIFEST bytes did not satisfy the strict MANIFEST local grammar.
+    ManifestDecode,
+    /// Strictly decoded MANIFEST bytes did not hash to the Receipt's exact Manifest ID.
+    ManifestIdentityMismatch,
+    /// The exact local MANIFEST subject did not equal the Receipt subject.
+    ManifestSubjectMismatch,
+    /// The exact local MANIFEST path-profile ID did not equal the Receipt path-profile ID.
+    ManifestPathIdentityProfileMismatch,
     /// The Receipt's retained START reference was not the required START event.
     AttemptStartReferenceMismatch,
     /// The exact START Record bytes required by the retained START Entry were unavailable.
@@ -3255,8 +3412,9 @@ pub enum ResolvedFreezeCommittedBindingError {
 /// Resolves exact Record bytes only as required to compose one bounded FREEZE_COMMITTED check.
 ///
 /// A non-error result remains `AuthorityEvidenceUnavailable`: this adapter proves no
-/// authority, admission, Policy satisfaction, semantic-MANIFEST validity, custody,
-/// durability, lifecycle truth, persistence, or external trust.
+/// authority, admission, Policy satisfaction, semantic-MANIFEST profile validity, custody,
+/// durability, lifecycle truth, persistence, or external trust. It establishes only
+/// exact local MANIFEST identity plus Receipt subject/profile continuity.
 pub fn validate_resolved_freeze_committed_binding(
     retained_journal: &RetainedJournal,
     committed_event_reference: JournalReference,
@@ -3280,6 +3438,21 @@ pub fn validate_resolved_freeze_committed_binding(
         .map_err(|_| ResolvedFreezeCommittedBindingError::ReceiptDecode)?;
     if receipt.record_id() != receipt_record_id {
         return Err(ResolvedFreezeCommittedBindingError::ReceiptIdentityMismatch);
+    }
+    let manifest_record_id = receipt.input().manifest_id;
+    let manifest_bytes = resolver
+        .resolve(manifest_record_id)
+        .ok_or(ResolvedFreezeCommittedBindingError::ManifestPayloadUnavailable)?;
+    let manifest = ManifestRecord::decode_authoritative(manifest_bytes)
+        .map_err(|_| ResolvedFreezeCommittedBindingError::ManifestDecode)?;
+    if manifest.record_id() != manifest_record_id {
+        return Err(ResolvedFreezeCommittedBindingError::ManifestIdentityMismatch);
+    }
+    if manifest.input().subject_id != receipt.input().subject_id {
+        return Err(ResolvedFreezeCommittedBindingError::ManifestSubjectMismatch);
+    }
+    if manifest.input().path_identity_profile_id != receipt.input().path_identity_profile_id {
+        return Err(ResolvedFreezeCommittedBindingError::ManifestPathIdentityProfileMismatch);
     }
 
     let start_reference = &receipt.input().attempt_start_journal_ref;

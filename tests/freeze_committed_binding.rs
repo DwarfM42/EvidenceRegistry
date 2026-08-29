@@ -12,8 +12,13 @@ const GENESIS_HASH_HEX: &str = "ae1919549c80a0c3708cce0485af881a5223fbcf80c6b27a
 const START_RECORD_ID_HEX: &str =
     "949f6d7f389641c8c615904f8b1473083b8b029f9866873de4bec17d4e1a685c";
 const START_HASH_HEX: &str = "0d678a8c08b32c670e27eb5e815f8077e9be62f5c8578d19ce72835bd88ba168";
-const RECEIPT_ID_HEX: &str = "c2f76cf4e159664e8875f66ca8b5960d19b4d8b01dc8fe3e3f9eb339c050367b";
-const COMMITTED_HASH_HEX: &str = "54f7f1dff278e66f755b0db279380a4eba0726cba04f7c303e57d6190ad1ad6e";
+const RECEIPT_ID_HEX: &str = "e44f96285b374af8a593d34ad0059f3c0d957eeca2db2b1e5ab20bc84a7a413d";
+const COMMITTED_HASH_HEX: &str = "9681583be58ff6e25b13173d329587dffcbfa79d651106ec3f3877d243e685a0";
+const MANIFEST_RECORD_HEX: &str = concat!(
+    "84781a45766964656e636552656769737472792e5265636f72642e76310201a700010102105820",
+    "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff110112011301148185",
+    "0181416100015820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+);
 
 const START_RECORD_HEX: &str = concat!(
     "84781a45766964656e636552656769737472792e5265636f72642e76310301a600010103105820",
@@ -41,7 +46,7 @@ const RECEIPT_HEX: &str = concat!(
     "0d678a8c08b32c670e27eb5e815f8077e9be62f5c8578d19ce72835bd88ba16818645820",
     "949f6d7f389641c8c615904f8b1473083b8b029f9866873de4bec17d4e1a685c135820",
     "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff145820",
-    "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf1501165820",
+    "b4f57d90cf94e711e7ca69bd8cc79120a0b792ff0bf3d10675f41ff72fb4fcb51501165820",
     "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef170118185820",
     "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f18195820",
     "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f181a01181b01",
@@ -51,7 +56,7 @@ const COMMITTED_ENTRY_HEX: &str = concat!(
     "82782045766964656e636552656769737472792e4a6f75726e616c456e7472792e7631ae0001015820",
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0202035820",
     "0d678a8c08b32c670e27eb5e815f8077e9be62f5c8578d19ce72835bd88ba168041865055820",
-    "c2f76cf4e159664e8875f66ca8b5960d19b4d8b01dc8fe3e3f9eb339c050367b06800781855820",
+    "e44f96285b374af8a593d34ad0059f3c0d957eeca2db2b1e5ab20bc84a7a413d06800781855820",
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f015820",
     "0d678a8c08b32c670e27eb5e815f8077e9be62f5c8578d19ce72835bd88ba16818645820",
     "949f6d7f389641c8c615904f8b1473083b8b029f9866873de4bec17d4e1a685c0802095820",
@@ -309,7 +314,7 @@ fn freeze_start_bytes(
     bytes
 }
 
-fn receipt_bytes(start_reference: &JournalReference) -> Vec<u8> {
+fn receipt_bytes(start_reference: &JournalReference, manifest_id: RecordId) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(620);
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
@@ -323,7 +328,7 @@ fn receipt_bytes(start_reference: &JournalReference) -> Vec<u8> {
     bytes.push(0x13);
     append_bstr_32(&mut bytes, &id(0xe0));
     bytes.push(0x14);
-    append_bstr_32(&mut bytes, &id(0xc0));
+    append_bstr_32(&mut bytes, manifest_id.as_bytes());
     bytes.extend_from_slice(&[0x15, 0x01]);
     bytes.push(0x16);
     append_bstr_32(&mut bytes, &id(0xd0));
@@ -385,13 +390,16 @@ fn freeze_committed_binding_returns_explicit_authority_evidence_unavailable_afte
         .append_strict_entry(&freeze_start_bytes(genesis.entry_hash(), &start_record))
         .unwrap();
     let start_reference = JournalReference::new(
-        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        registry_id,
         JournalEntryIndex::try_from(1_u64).unwrap(),
         journal.reconstruct_state().unwrap().journal_head_hash(),
         EventTypeId::try_from(100_u64).unwrap(),
         EventRecordId::try_from(start_record.record_id().as_bytes().as_slice()).unwrap(),
     );
-    let receipt_bytes = receipt_bytes(&start_reference);
+    let receipt_bytes = receipt_bytes(
+        &start_reference,
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
     assert!(StrictRecordFrame::decode_authoritative(&receipt_bytes).is_ok());
     let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes).unwrap();
     journal
@@ -441,8 +449,11 @@ fn freeze_committed_binding_rejects_a_terminal_event_bound_to_a_different_receip
         EventTypeId::try_from(100_u64).unwrap(),
         EventRecordId::try_from(start_record.record_id().as_bytes().as_slice()).unwrap(),
     );
-    let receipt =
-        FreezeReceiptRecord::decode_authoritative(&receipt_bytes(&start_reference)).unwrap();
+    let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes(
+        &start_reference,
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    ))
+    .unwrap();
     let different_receipt_id = RecordId::try_from(id(0x81).as_slice()).unwrap();
     journal
         .append_strict_entry(&freeze_committed_bytes(
@@ -511,7 +522,10 @@ fn freeze_receipt_decoder_retains_exact_typed_authority_prerequisites() {
         &hex_id(START_RECORD_ID_HEX)
     );
     assert_eq!(input.subject_id, id(0xe0));
-    assert_eq!(input.manifest_id.as_bytes(), &id(0xc0));
+    assert_eq!(
+        input.manifest_id.as_bytes(),
+        &hex_id("b4f57d90cf94e711e7ca69bd8cc79120a0b792ff0bf3d10675f41ff72fb4fcb5")
+    );
     assert_eq!(input.custody_mode_id, 1);
     assert_eq!(input.creation_profile_ref.as_bytes(), &id(0xd0));
     assert_eq!(input.path_identity_profile_id, 2);
@@ -704,12 +718,12 @@ fn freeze_committed_binding_rejects_an_independently_mutated_terminal_receipt_id
     let mut committed_entry_bytes = hex_bytes(COMMITTED_ENTRY_HEX);
     replace_unique(
         &mut committed_entry_bytes,
-        &[0x05, 0x58, 0x20, 0xc2, 0xf7, 0x6c],
+        &[0x05, 0x58, 0x20, 0xe4, 0x4f, 0x96],
         3,
-        0xc3,
+        0xe5,
     );
     let mut terminal_event_record_id = hex_id(RECEIPT_ID_HEX);
-    terminal_event_record_id[0] = 0xc3;
+    terminal_event_record_id[0] = 0xe5;
     assert_eq!(
         binding_result_for_fixed_receipt_and_committed_entry(
             &receipt_bytes,
@@ -806,6 +820,60 @@ fn resolved_freeze_committed_binding_distinguishes_missing_and_invalid_record_pa
 }
 
 #[test]
+fn resolved_freeze_committed_binding_distinguishes_missing_invalid_and_wrong_identity_manifest_payloads(
+) {
+    let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
+    let missing_manifest = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
+            (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+        ],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            &journal,
+            committed_reference.clone(),
+            &missing_manifest,
+        ),
+        Err(ResolvedFreezeCommittedBindingError::ManifestPayloadUnavailable)
+    );
+
+    let invalid_manifest = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
+            (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (receipt.input().manifest_id, vec![0]),
+        ],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            &journal,
+            committed_reference.clone(),
+            &invalid_manifest,
+        ),
+        Err(ResolvedFreezeCommittedBindingError::ManifestDecode)
+    );
+
+    let mut alternate_manifest = hex_bytes(MANIFEST_RECORD_HEX);
+    replace_unique(&mut alternate_manifest, &[0x10, 0x58, 0x20, 0xe0], 3, 0xe1);
+    let mismatched_manifest = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
+            (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (receipt.input().manifest_id, alternate_manifest),
+        ],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            &journal,
+            committed_reference,
+            &mismatched_manifest
+        ),
+        Err(ResolvedFreezeCommittedBindingError::ManifestIdentityMismatch)
+    );
+}
+
+#[test]
 fn resolved_freeze_committed_binding_rejects_a_valid_receipt_with_the_wrong_exact_identity() {
     let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
     let mut alternate_receipt_bytes = hex_bytes(RECEIPT_HEX);
@@ -832,7 +900,10 @@ fn resolved_freeze_committed_binding_rejects_a_valid_receipt_with_the_wrong_exac
 fn resolved_freeze_committed_binding_distinguishes_missing_start_payload() {
     let (journal, committed_reference, _, receipt) = fixed_binding_fixture();
     let missing_start = FixtureRecordResolver {
-        records: vec![(receipt.record_id(), hex_bytes(RECEIPT_HEX))],
+        records: vec![
+            (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (receipt.input().manifest_id, hex_bytes(MANIFEST_RECORD_HEX)),
+        ],
     };
 
     assert_eq!(
@@ -862,6 +933,7 @@ fn resolved_freeze_committed_binding_rejects_wrong_type_and_invalid_or_mismatche
     let invalid_start = FixtureRecordResolver {
         records: vec![
             (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (receipt.input().manifest_id, hex_bytes(MANIFEST_RECORD_HEX)),
             (start_record.record_id(), vec![0]),
         ],
     };
@@ -884,6 +956,7 @@ fn resolved_freeze_committed_binding_rejects_wrong_type_and_invalid_or_mismatche
     let mismatched_start = FixtureRecordResolver {
         records: vec![
             (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (receipt.input().manifest_id, hex_bytes(MANIFEST_RECORD_HEX)),
             (start_record.record_id(), alternate_start_bytes),
         ],
     };
@@ -904,6 +977,7 @@ fn resolved_freeze_committed_binding_returns_authority_evidence_unavailable_for_
         records: vec![
             (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
             (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (receipt.input().manifest_id, hex_bytes(MANIFEST_RECORD_HEX)),
         ],
     };
 
@@ -958,8 +1032,11 @@ fn freeze_committed_binding_rejects_start_record_root_that_disagrees_with_retain
         EventTypeId::try_from(100_u64).unwrap(),
         EventRecordId::try_from(wrong_start.record_id().as_bytes().as_slice()).unwrap(),
     );
-    let receipt =
-        FreezeReceiptRecord::decode_authoritative(&receipt_bytes(&start_reference)).unwrap();
+    let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes(
+        &start_reference,
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    ))
+    .unwrap();
     journal
         .append_strict_entry(&freeze_committed_bytes(
             JournalEntryHash::try_from(sha256(&start_entry).as_slice()).unwrap(),
