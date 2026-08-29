@@ -2737,6 +2737,75 @@ impl StrictRecordFrame {
     }
 }
 
+/// The exact structural facts that bind one strict Record frame to one retained
+/// Journal event. This is not type-local Record validation, authority, admission,
+/// Policy satisfaction, custody, durability, or lifecycle truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventRecordStructuralBinding {
+    event_reference: JournalReference,
+    record_id: RecordId,
+    record_type_id: RecordTypeId,
+}
+
+impl EventRecordStructuralBinding {
+    /// The exact retained Journal reference bound by this structural check.
+    pub fn event_reference(&self) -> &JournalReference {
+        &self.event_reference
+    }
+
+    /// The exact self-hash identity of the supplied strict Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The exact Record type declared by the supplied strict Record frame.
+    pub fn record_type_id(&self) -> RecordTypeId {
+        self.record_type_id
+    }
+}
+
+/// A fail-closed outcome of structurally binding exact Record bytes to a retained event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventRecordStructuralBindingError {
+    /// The referenced event is absent, cross-Registry, or differs in any retained identity field.
+    RetainedReference(RetainedJournalError),
+    /// The supplied Record bytes fail strict canonical framing or exact self-hash derivation.
+    RecordDecode,
+    /// The strict Record type is not the frozen type required for the retained event.
+    RecordTypeMismatch,
+    /// The strict Record self-hash is not the retained event's exact Record identity.
+    RecordIdMismatch,
+}
+
+/// Validates the exact structural Record-to-event binding available from retained history.
+///
+/// This composes retained five-field reference resolution, strict Record framing,
+/// the frozen event-to-required-Record-type mapping, and exact Record identity.
+/// It deliberately does not decode a type-local Record body or establish any
+/// semantic, authority, admission, Policy, custody, durability, or lifecycle result.
+pub fn validate_event_record_structural_binding(
+    retained_journal: &RetainedJournal,
+    event_reference: &JournalReference,
+    record_bytes: &[u8],
+) -> Result<EventRecordStructuralBinding, EventRecordStructuralBindingError> {
+    let resolved = retained_journal
+        .resolve_reference(event_reference)
+        .map_err(EventRecordStructuralBindingError::RetainedReference)?;
+    let frame = StrictRecordFrame::decode_authoritative(record_bytes)
+        .map_err(|_| EventRecordStructuralBindingError::RecordDecode)?;
+    if frame.record_type_id() != resolved.event_type_id().required_record_type_id() {
+        return Err(EventRecordStructuralBindingError::RecordTypeMismatch);
+    }
+    if frame.record_id().as_bytes() != resolved.event_record_id().as_bytes() {
+        return Err(EventRecordStructuralBindingError::RecordIdMismatch);
+    }
+    Ok(EventRecordStructuralBinding {
+        event_reference: event_reference.clone(),
+        record_id: frame.record_id(),
+        record_type_id: frame.record_type_id(),
+    })
+}
+
 /// Typed, Record-local fields for the frozen FREEZE_ATTEMPT_START Record schema.
 ///
 /// The Registry-relative root derivation and any later Journal authority binding
