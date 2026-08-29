@@ -1225,6 +1225,7 @@ pub struct ResolvedJournalReference {
     environment_observation_id: RecordId,
     lifecycle_object_kind: LifecycleObjectKind,
     lifecycle_object_id: [u8; ID_LENGTH],
+    freeze_attempt_intended_root_id: Option<IntendedRootId>,
 }
 
 impl ResolvedJournalReference {
@@ -1276,6 +1277,14 @@ impl ResolvedJournalReference {
     /// The retained lifecycle-object identity.
     pub fn lifecycle_object_id(&self) -> [u8; ID_LENGTH] {
         self.lifecycle_object_id
+    }
+
+    /// The exact intended-root identity retained by a FREEZE_ATTEMPT_STARTED Entry.
+    ///
+    /// `None` means the resolved Entry has no such Journal-native field; it does
+    /// not establish any filesystem, Manifest, Policy, or authority fact.
+    pub fn freeze_attempt_intended_root_id(&self) -> Option<IntendedRootId> {
+        self.freeze_attempt_intended_root_id
     }
 }
 
@@ -1917,6 +1926,7 @@ impl RetainedJournal {
             environment_observation_id: entry.environment_observation_id(),
             lifecycle_object_kind: entry.lifecycle_object_kind(),
             lifecycle_object_id: entry.lifecycle_object_id(),
+            freeze_attempt_intended_root_id: entry.freeze_attempt_intended_root_id(),
         })
     }
 
@@ -3107,6 +3117,8 @@ pub enum FreezeCommittedBindingError {
     AttemptStartReferenceMismatch,
     /// The retained FREEZE_ATTEMPT_STARTED event does not bind the exact START Record identity.
     AttemptStartRecordMismatch,
+    /// The exact START Record root does not match the retained START Journal root.
+    IntendedRootMismatch,
     /// The START, Receipt, and terminal event do not bind one Freeze Attempt identity.
     FreezeAttemptMismatch,
     /// The Receipt and START do not preserve the same exact subject identity.
@@ -3183,6 +3195,11 @@ pub fn validate_freeze_committed_binding(
         != input.freeze_attempt_start_record.record_id().as_bytes()
     {
         return Err(FreezeCommittedBindingError::AttemptStartRecordMismatch);
+    }
+    if start.freeze_attempt_intended_root_id()
+        != Some(input.freeze_attempt_start_record.input.intended_root_id)
+    {
+        return Err(FreezeCommittedBindingError::IntendedRootMismatch);
     }
     if input.freeze_attempt_start_record.input.subject_id
         != input.freeze_receipt_record.input.subject_id

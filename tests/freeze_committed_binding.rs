@@ -3,8 +3,8 @@ use evidence_registry::{
     validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
     FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
-    FreezeReceiptRecord, JournalEntryHash, JournalEntryIndex, JournalReference, RecordId,
-    RegistryId, ResolvedFreezeCommittedBindingError, RetainedJournal, StrictRecordFrame,
+    FreezeReceiptRecord, IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference,
+    RecordId, RegistryId, ResolvedFreezeCommittedBindingError, RetainedJournal, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -910,5 +910,78 @@ fn resolved_freeze_committed_binding_returns_authority_evidence_unavailable_for_
     assert_eq!(
         validate_resolved_freeze_committed_binding(&journal, committed_reference, &records),
         Ok(FreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
+    );
+}
+
+#[test]
+fn freeze_committed_binding_rejects_start_record_root_that_disagrees_with_retained_start() {
+    let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
+    let correct_start =
+        FreezeAttemptStartRecord::decode_authoritative(&hex_bytes(START_RECORD_HEX)).unwrap();
+    let wrong_start = FreezeAttemptStartRecord::new(FreezeAttemptStartRecordInput {
+        freeze_attempt_id: correct_start.input().freeze_attempt_id,
+        intended_root_id: IntendedRootId::try_from(id(0xb0).as_slice()).unwrap(),
+        subject_id: correct_start.input().subject_id,
+        policy_record_id: correct_start.input().policy_record_id,
+    });
+    let mut start_entry = hex_bytes(START_ENTRY_HEX);
+    let old_event_record_id = hex_id(START_RECORD_ID_HEX);
+    let event_record_offset = start_entry
+        .windows(old_event_record_id.len())
+        .position(|candidate| candidate == old_event_record_id)
+        .expect(
+            "JRN-FREEZE-ROOT-BINDING-001: fixture event Record ID must be present exactly once",
+        );
+    assert_eq!(
+        start_entry
+            .windows(old_event_record_id.len())
+            .filter(|candidate| *candidate == old_event_record_id)
+            .count(),
+        1,
+        "JRN-FREEZE-ROOT-BINDING-001"
+    );
+    start_entry[event_record_offset..event_record_offset + old_event_record_id.len()]
+        .copy_from_slice(wrong_start.record_id().as_bytes());
+
+    let genesis = evidence_registry::GenesisJournalEntry::new(
+        registry_id,
+        EventRecordId::try_from(id(0x20).as_slice()).unwrap(),
+        RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        RecordId::try_from(id(0x60).as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&start_entry).unwrap();
+    let start_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(sha256(&start_entry).as_slice()).unwrap(),
+        EventTypeId::try_from(100_u64).unwrap(),
+        EventRecordId::try_from(wrong_start.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let receipt =
+        FreezeReceiptRecord::decode_authoritative(&receipt_bytes(&start_reference)).unwrap();
+    journal
+        .append_strict_entry(&freeze_committed_bytes(
+            JournalEntryHash::try_from(sha256(&start_entry).as_slice()).unwrap(),
+            &start_reference,
+            receipt.record_id(),
+        ))
+        .unwrap();
+    let committed_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(2_u64).unwrap(),
+        journal.reconstruct_state().unwrap().journal_head_hash(),
+        EventTypeId::try_from(101_u64).unwrap(),
+        EventRecordId::try_from(receipt.record_id().as_bytes().as_slice()).unwrap(),
+    );
+
+    assert_eq!(
+        validate_freeze_committed_binding(FreezeCommittedBindingInput {
+            retained_journal: &journal,
+            committed_event_reference: committed_reference,
+            freeze_attempt_start_record: &wrong_start,
+            freeze_receipt_record: &receipt,
+        }),
+        Err(evidence_registry::FreezeCommittedBindingError::IntendedRootMismatch)
     );
 }
