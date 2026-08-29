@@ -485,6 +485,42 @@ fn freeze_committed_binding_accepts_only_the_independently_anchored_structural_f
 }
 
 #[test]
+fn freeze_receipt_decoder_retains_exact_typed_authority_prerequisites() {
+    let receipt = FreezeReceiptRecord::decode_authoritative(&hex_bytes(RECEIPT_HEX)).unwrap();
+    let input = receipt.input();
+
+    assert_eq!(input.freeze_attempt_id.as_bytes(), &id(0xa0));
+    assert_eq!(input.freeze_id, id(0xb0));
+    assert_eq!(
+        input.attempt_start_journal_ref.registry_id().as_bytes(),
+        &id(0x00)
+    );
+    assert_eq!(input.attempt_start_journal_ref.entry_index().value(), 1);
+    assert_eq!(
+        input.attempt_start_journal_ref.entry_hash().as_bytes(),
+        &hex_id(START_HASH_HEX)
+    );
+    assert_eq!(input.attempt_start_journal_ref.event_type_id().value(), 100);
+    assert_eq!(
+        input.attempt_start_journal_ref.event_record_id().as_bytes(),
+        &hex_id(START_RECORD_ID_HEX)
+    );
+    assert_eq!(input.subject_id, id(0xe0));
+    assert_eq!(input.manifest_id.as_bytes(), &id(0xc0));
+    assert_eq!(input.custody_mode_id, 1);
+    assert_eq!(input.creation_profile_ref.as_bytes(), &id(0xd0));
+    assert_eq!(input.path_identity_profile_id, 1);
+    assert_eq!(input.filesystem_profile_ref.as_bytes(), &id(0xf0));
+    assert_eq!(input.policy_record_id.as_bytes(), &id(0x40));
+    assert_eq!(input.file_content_flush_state, 1);
+    assert_eq!(input.atomic_publish_no_replace_state, 1);
+    assert_eq!(input.parent_directory_flush_state, 1);
+    assert!(input.platform_strongest_available);
+    assert_eq!(input.requested_commit_durability_ref, None);
+    assert_eq!(input.created_by_tool_version, "test");
+}
+
+#[test]
 fn freeze_receipt_decoder_rejects_one_mutation_per_strict_field_or_canonical_boundary() {
     let baseline = hex_bytes(RECEIPT_HEX);
     assert!(StrictRecordFrame::decode_authoritative(&baseline).is_ok());
@@ -564,7 +600,7 @@ fn freeze_receipt_decoder_rejects_one_mutation_per_strict_field_or_canonical_bou
 }
 
 #[test]
-fn freeze_receipt_decoder_accepts_only_a_well_formed_optional_filter_hash() {
+fn freeze_receipt_decoder_retains_only_a_well_formed_optional_commit_durability_reference() {
     let mut optional = hex_bytes(RECEIPT_HEX);
     replace_unique(&mut optional, &[0xb1, 0x00, 0x01, 0x01, 0x04], 0, 0xb2);
     let terminal_key = optional
@@ -577,7 +613,15 @@ fn freeze_receipt_decoder_accepts_only_a_well_formed_optional_filter_hash() {
             "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
         )),
     );
-    assert!(FreezeReceiptRecord::decode_authoritative(&optional).is_ok());
+    let decoded_optional = FreezeReceiptRecord::decode_authoritative(&optional).unwrap();
+    assert_eq!(
+        decoded_optional
+            .input()
+            .requested_commit_durability_ref
+            .unwrap()
+            .as_bytes(),
+        &hex_id("101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f")
+    );
 
     let mut malformed_optional = optional;
     replace_unique(&mut malformed_optional, &[0x18, 0x1e, 0x58, 0x20], 2, 0x57);

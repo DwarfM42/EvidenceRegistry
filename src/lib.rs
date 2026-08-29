@@ -2858,12 +2858,30 @@ impl FreezeAttemptStartRecord {
 /// identity. They do not establish policy, authority, admission, durability,
 /// custody, or lifecycle truth.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeReceiptRecordInput {
+    pub freeze_attempt_id: FreezeAttemptId,
+    pub freeze_id: [u8; ID_LENGTH],
+    pub attempt_start_journal_ref: JournalReference,
+    pub subject_id: [u8; ID_LENGTH],
+    pub manifest_id: RecordId,
+    pub custody_mode_id: u64,
+    pub creation_profile_ref: RecordId,
+    pub path_identity_profile_id: u64,
+    pub filesystem_profile_ref: RecordId,
+    pub policy_record_id: RecordId,
+    pub file_content_flush_state: u64,
+    pub atomic_publish_no_replace_state: u64,
+    pub parent_directory_flush_state: u64,
+    pub platform_strongest_available: bool,
+    pub requested_commit_durability_ref: Option<RecordId>,
+    pub created_by_tool_version: String,
+}
+
+/// The exact-byte, Record-local FREEZE_RECEIPT schema from Record Schema v0.3 §56.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FreezeReceiptRecord {
     record_id: RecordId,
-    freeze_attempt_id: FreezeAttemptId,
-    attempt_start_journal_ref: JournalReference,
-    subject_id: [u8; ID_LENGTH],
-    policy_record_id: RecordId,
+    input: FreezeReceiptRecordInput,
 }
 
 impl FreezeReceiptRecord {
@@ -2900,57 +2918,97 @@ impl FreezeReceiptRecord {
             FreezeAttemptId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
                 .map_err(|_| RecordDecodeError)?;
         cursor.key(17).map_err(|_| RecordDecodeError)?;
-        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        let freeze_id = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
         cursor.key(18).map_err(|_| RecordDecodeError)?;
         let attempt_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
         cursor.key(19).map_err(|_| RecordDecodeError)?;
         let subject_id = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
         cursor.key(20).map_err(|_| RecordDecodeError)?;
-        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        let manifest_id =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
         cursor.key(21).map_err(|_| RecordDecodeError)?;
-        if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1 | 2) {
+        let custody_mode_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(custody_mode_id, 1 | 2) {
             return Err(RecordDecodeError);
         }
         cursor.key(22).map_err(|_| RecordDecodeError)?;
-        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        let creation_profile_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
         cursor.key(23).map_err(|_| RecordDecodeError)?;
-        cursor.uint().map_err(|_| RecordDecodeError)?;
+        let path_identity_profile_id = cursor.uint().map_err(|_| RecordDecodeError)?;
         cursor.key(24).map_err(|_| RecordDecodeError)?;
-        cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        let filesystem_profile_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
         cursor.key(25).map_err(|_| RecordDecodeError)?;
         let policy_record_id =
             RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
                 .map_err(|_| RecordDecodeError)?;
-        for key in 26..=28 {
-            cursor.key(key).map_err(|_| RecordDecodeError)?;
-            if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1..=3) {
-                return Err(RecordDecodeError);
-            }
+        cursor.key(26).map_err(|_| RecordDecodeError)?;
+        let file_content_flush_state = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(file_content_flush_state, 1..=3) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(27).map_err(|_| RecordDecodeError)?;
+        let atomic_publish_no_replace_state = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(atomic_publish_no_replace_state, 1..=3) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(28).map_err(|_| RecordDecodeError)?;
+        let parent_directory_flush_state = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(parent_directory_flush_state, 1..=3) {
+            return Err(RecordDecodeError);
         }
         cursor.key(29).map_err(|_| RecordDecodeError)?;
-        cursor.bool().map_err(|_| RecordDecodeError)?;
-        if field_count == 18 {
+        let platform_strongest_available = cursor.bool().map_err(|_| RecordDecodeError)?;
+        let requested_commit_durability_ref = if field_count == 18 {
             cursor.key(30).map_err(|_| RecordDecodeError)?;
-            cursor.bstr_32().map_err(|_| RecordDecodeError)?;
-        }
+            Some(
+                RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                    .map_err(|_| RecordDecodeError)?,
+            )
+        } else {
+            None
+        };
         cursor.key(31).map_err(|_| RecordDecodeError)?;
-        cursor.text().map_err(|_| RecordDecodeError)?;
+        let created_by_tool_version = cursor.text().map_err(|_| RecordDecodeError)?;
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
         Ok(Self {
             record_id: frame.record_id(),
-            freeze_attempt_id,
-            attempt_start_journal_ref,
-            subject_id,
-            policy_record_id,
+            input: FreezeReceiptRecordInput {
+                freeze_attempt_id,
+                freeze_id,
+                attempt_start_journal_ref,
+                subject_id,
+                manifest_id,
+                custody_mode_id,
+                creation_profile_ref,
+                path_identity_profile_id,
+                filesystem_profile_ref,
+                policy_record_id,
+                file_content_flush_state,
+                atomic_publish_no_replace_state,
+                parent_directory_flush_state,
+                platform_strongest_available,
+                requested_commit_durability_ref,
+                created_by_tool_version,
+            },
         })
     }
 
     /// The exact immutable identity of the strictly decoded FREEZE_RECEIPT Record.
     pub fn record_id(&self) -> RecordId {
         self.record_id
+    }
+
+    /// Returns the exact typed Receipt fields without inferring external context.
+    pub fn input(&self) -> &FreezeReceiptRecordInput {
+        &self.input
     }
 }
 
@@ -3009,7 +3067,7 @@ pub fn validate_freeze_committed_binding(
     input: FreezeCommittedBindingInput<'_>,
 ) -> Result<FreezeCommittedBindingOutcome, FreezeCommittedBindingError> {
     if input.freeze_attempt_start_record.input.freeze_attempt_id
-        != input.freeze_receipt_record.freeze_attempt_id
+        != input.freeze_receipt_record.input.freeze_attempt_id
     {
         return Err(FreezeCommittedBindingError::FreezeAttemptMismatch);
     }
@@ -3021,14 +3079,18 @@ pub fn validate_freeze_committed_binding(
         || committed.event_type_id().required_record_type_id().value() != 4
         || committed.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
         || committed.lifecycle_object_id()
-            != *input.freeze_receipt_record.freeze_attempt_id.as_bytes()
+            != *input
+                .freeze_receipt_record
+                .input
+                .freeze_attempt_id
+                .as_bytes()
     {
         return Err(FreezeCommittedBindingError::CommittedEventMismatch);
     }
     if committed.event_record_id().as_bytes() != input.freeze_receipt_record.record_id.as_bytes() {
         return Err(FreezeCommittedBindingError::ReceiptRecordMismatch);
     }
-    let start_reference = &input.freeze_receipt_record.attempt_start_journal_ref;
+    let start_reference = &input.freeze_receipt_record.input.attempt_start_journal_ref;
     if start_reference.entry_index().value() >= committed.entry_index().value() {
         return Err(FreezeCommittedBindingError::AttemptStartNotPrior);
     }
@@ -3053,12 +3115,13 @@ pub fn validate_freeze_committed_binding(
     {
         return Err(FreezeCommittedBindingError::AttemptStartRecordMismatch);
     }
-    if input.freeze_attempt_start_record.input.subject_id != input.freeze_receipt_record.subject_id
+    if input.freeze_attempt_start_record.input.subject_id
+        != input.freeze_receipt_record.input.subject_id
     {
         return Err(FreezeCommittedBindingError::SubjectMismatch);
     }
     if input.freeze_attempt_start_record.input.policy_record_id
-        != input.freeze_receipt_record.policy_record_id
+        != input.freeze_receipt_record.input.policy_record_id
     {
         return Err(FreezeCommittedBindingError::PolicyMismatch);
     }
