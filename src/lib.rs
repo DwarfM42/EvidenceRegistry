@@ -2963,6 +2963,114 @@ impl ManifestRecord {
     }
 }
 
+/// The exact local fields from the frozen POLICY shape with no optional
+/// requirements. This is a declared-context witness only; it does not establish
+/// Policy authority, satisfaction, admission, or a lifecycle outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MinimalPolicyRecord {
+    record_id: RecordId,
+    gate_scope_ref: RecordId,
+    operation_start_journal_ref: JournalReference,
+    supported_context_ids: Vec<u64>,
+}
+
+impl MinimalPolicyRecord {
+    /// Strictly decodes only the unambiguous, zero-optional-requirement POLICY
+    /// grammar. POLICY records with optional requirement fields remain outside
+    /// this bounded local decoder rather than receiving invented semantics.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(40).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 40
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(5).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 40 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let gate_scope_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(29).map_err(|_| RecordDecodeError)?;
+        let operation_start_journal_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(30).map_err(|_| RecordDecodeError)?;
+        let context_count = cursor.array().map_err(|_| RecordDecodeError)?;
+        if context_count == 0 || context_count > cursor.remaining() {
+            return Err(RecordDecodeError);
+        }
+        let mut supported_context_ids = Vec::with_capacity(context_count);
+        let mut previous_context_id = None;
+        for _ in 0..context_count {
+            let context_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+            if !matches!(context_id, 1..=5)
+                || previous_context_id.is_some_and(|previous| context_id <= previous)
+            {
+                return Err(RecordDecodeError);
+            }
+            previous_context_id = Some(context_id);
+            supported_context_ids.push(context_id);
+        }
+        if supported_context_ids.contains(&2)
+            || supported_context_ids.contains(&5)
+            || !cursor.finished()
+        {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            gate_scope_ref,
+            operation_start_journal_ref,
+            supported_context_ids,
+        })
+    }
+
+    /// The exact immutable identity of the strictly decoded POLICY Record.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The frozen Record Type ID for POLICY.
+    pub fn record_type_id(&self) -> RecordTypeId {
+        RecordTypeId::try_from(40).expect("POLICY is assigned in Record Schema v0.3")
+    }
+
+    /// The exact declared gate Scope Record identity, without resolving it.
+    pub fn gate_scope_ref(&self) -> RecordId {
+        self.gate_scope_ref
+    }
+
+    /// The exact locally framed operation-start Journal reference, without resolving it.
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+
+    /// The exact ordered supported-context IDs declared by this minimal Policy.
+    pub fn supported_context_ids(&self) -> &[u64] {
+        &self.supported_context_ids
+    }
+
+    /// Whether this exact minimal Policy explicitly declares FREEZE_COMMIT support.
+    pub fn declares_freeze_commit_support(&self) -> bool {
+        self.supported_context_ids.contains(&1)
+    }
+}
+
 /// Typed, Record-local fields for the frozen FREEZE_ATTEMPT_START Record schema.
 ///
 /// The Registry-relative root derivation and any later Journal authority binding
