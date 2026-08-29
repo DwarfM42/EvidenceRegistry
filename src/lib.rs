@@ -3234,6 +3234,93 @@ pub fn resolve_minimal_policy_gate_scope(
     })
 }
 
+/// Exact retained-history facts that bind a minimal POLICY Record to its
+/// `POLICY_RECORDED` event and declared operation-start chronology reference.
+///
+/// This establishes only strict local POLICY decoding, exact Record/event identity,
+/// retained event classification, and Journal order. It does not establish that an
+/// operation occurred, Policy authority or satisfaction, Scope semantics, admission,
+/// freshness, environment stability, lifecycle authority, custody, durability, or trust.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRecordedStructuralBinding {
+    policy_record_id: RecordId,
+    policy_event_reference: JournalReference,
+    operation_start_reference: JournalReference,
+}
+
+impl PolicyRecordedStructuralBinding {
+    /// The exact identity of the strictly decoded minimal POLICY Record.
+    pub fn policy_record_id(&self) -> RecordId {
+        self.policy_record_id
+    }
+
+    /// The exact retained `POLICY_RECORDED` reference bound to the POLICY bytes.
+    pub fn policy_event_reference(&self) -> &JournalReference {
+        &self.policy_event_reference
+    }
+
+    /// The exact strictly-prior retained operation-start chronology reference.
+    pub fn operation_start_reference(&self) -> &JournalReference {
+        &self.operation_start_reference
+    }
+}
+
+/// A fail-closed outcome while structurally binding a minimal POLICY registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyRecordedStructuralBindingError {
+    /// Supplied bytes did not satisfy the strict local minimal POLICY grammar.
+    PolicyDecode,
+    /// The supplied retained Policy-event reference was absent or differed from retained bytes.
+    PolicyEventReference(RetainedJournalError),
+    /// The resolved event was not the Record-backed `POLICY_RECORDED` Policy event shape.
+    PolicyEventMismatch,
+    /// Strictly decoded POLICY bytes did not self-hash to the retained event Record identity.
+    PolicyEventRecordIdentityMismatch,
+    /// The declared operation-start reference was absent or differed from retained bytes.
+    OperationStartReference(RetainedJournalError),
+    /// The declared operation-start entry was not strictly earlier than Policy registration.
+    OperationStartNotStrictlyPrior,
+}
+
+/// Structurally binds exact minimal POLICY bytes to one retained `POLICY_RECORDED` Entry.
+///
+/// The operation-start reference is checked only as retained same-Registry chronology. Its
+/// successful resolution does not make it an authority dependency or establish freshness,
+/// environmental stability, Policy applicability, or any lifecycle outcome.
+pub fn validate_policy_recorded_structural_binding(
+    retained_journal: &RetainedJournal,
+    policy_event_reference: &JournalReference,
+    policy_bytes: &[u8],
+) -> Result<PolicyRecordedStructuralBinding, PolicyRecordedStructuralBindingError> {
+    let policy = MinimalPolicyRecord::decode_authoritative(policy_bytes)
+        .map_err(|_| PolicyRecordedStructuralBindingError::PolicyDecode)?;
+    let policy_event = retained_journal
+        .resolve_reference(policy_event_reference)
+        .map_err(PolicyRecordedStructuralBindingError::PolicyEventReference)?;
+    if policy_event.event_type_id().value() != 400
+        || policy_event.event_type_id().required_record_type_id()
+            != RecordTypeId::try_from(40).expect("POLICY is assigned in Record Schema v0.3")
+        || policy_event.lifecycle_object_kind() != LifecycleObjectKind::Policy
+        || policy_event.lifecycle_object_id() != *policy_event.event_record_id().as_bytes()
+    {
+        return Err(PolicyRecordedStructuralBindingError::PolicyEventMismatch);
+    }
+    if policy_event.event_record_id().as_bytes() != policy.record_id().as_bytes() {
+        return Err(PolicyRecordedStructuralBindingError::PolicyEventRecordIdentityMismatch);
+    }
+    let operation_start = retained_journal
+        .resolve_reference(policy.operation_start_journal_ref())
+        .map_err(PolicyRecordedStructuralBindingError::OperationStartReference)?;
+    if operation_start.entry_index().value() >= policy_event.entry_index().value() {
+        return Err(PolicyRecordedStructuralBindingError::OperationStartNotStrictlyPrior);
+    }
+    Ok(PolicyRecordedStructuralBinding {
+        policy_record_id: policy.record_id(),
+        policy_event_reference: policy_event_reference.clone(),
+        operation_start_reference: policy.operation_start_journal_ref().clone(),
+    })
+}
+
 /// Typed, Record-local fields for the frozen FREEZE_ATTEMPT_START Record schema.
 ///
 /// The Registry-relative root derivation and any later Journal authority binding
