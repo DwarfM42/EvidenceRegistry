@@ -3079,6 +3079,161 @@ impl MinimalPolicyRecord {
     }
 }
 
+/// Typed, Record-local fields decoded from a SCOPE Record.
+///
+/// Profile IDs, versions, payload bytes, and labels are retained exactly as declared.
+/// Their profile semantics, applicability, authority, and authorization remain external.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeRecordInput {
+    pub scope_profile_id: u64,
+    pub scope_profile_version: u64,
+    pub scope_payload: Vec<u8>,
+    pub scope_label: Option<String>,
+}
+
+/// The exact-byte, Record-local SCOPE schema from Record Schema v0.3 §47.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeRecord {
+    record_id: RecordId,
+    input: ScopeRecordInput,
+}
+
+impl ScopeRecord {
+    /// Strictly decodes the complete local SCOPE grammar without interpreting its profile.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(20).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 20
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(field_count, 5 | 6) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 20 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let scope_profile_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let scope_profile_version = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let scope_payload = cursor.bstr().map_err(|_| RecordDecodeError)?;
+        let scope_label = if field_count == 6 {
+            cursor.key(19).map_err(|_| RecordDecodeError)?;
+            Some(cursor.text().map_err(|_| RecordDecodeError)?)
+        } else {
+            None
+        };
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            input: ScopeRecordInput {
+                scope_profile_id,
+                scope_profile_version,
+                scope_payload,
+                scope_label,
+            },
+        })
+    }
+
+    /// The exact immutable identity of the strictly decoded SCOPE Record.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The frozen Record Type ID for SCOPE.
+    pub fn record_type_id(&self) -> RecordTypeId {
+        RecordTypeId::try_from(20).expect("SCOPE is assigned in Record Schema v0.3")
+    }
+
+    /// Returns exact local SCOPE fields without profile or authority inference.
+    pub fn input(&self) -> &ScopeRecordInput {
+        &self.input
+    }
+}
+
+/// Exact structural facts obtained by resolving a minimal POLICY's declared gate Scope.
+///
+/// This result establishes only strict local decoding and exact self-hash identity binding.
+/// It does not establish Policy or Scope authority, satisfaction, admission, lifecycle
+/// legality, resolver persistence, custody, durability, filesystem truth, or external trust.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyScopeStructuralBinding {
+    policy_record_id: RecordId,
+    gate_scope_ref: RecordId,
+    scope_record: ScopeRecord,
+}
+
+impl PolicyScopeStructuralBinding {
+    /// The exact locally decoded minimal POLICY identity.
+    pub fn policy_record_id(&self) -> RecordId {
+        self.policy_record_id
+    }
+
+    /// The exact SCOPE identity declared at POLICY key 16.
+    pub fn gate_scope_ref(&self) -> RecordId {
+        self.gate_scope_ref
+    }
+
+    /// The exact local SCOPE fields supplied for the declared identity.
+    pub fn scope_record(&self) -> &ScopeRecord {
+        &self.scope_record
+    }
+}
+
+/// A fail-closed outcome while resolving the exact bytes declared by a minimal POLICY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyScopeStructuralBindingError {
+    /// The resolver had no bytes for the declared SCOPE identity; this proves no nonexistence fact.
+    ScopePayloadUnavailable,
+    /// Supplied bytes did not satisfy the strict local SCOPE grammar.
+    ScopeDecode,
+    /// Strictly decoded SCOPE bytes did not self-hash to the exact POLICY-declared identity.
+    ScopeIdentityMismatch,
+}
+
+/// Resolves and structurally binds the exact SCOPE bytes declared by a minimal POLICY.
+///
+/// The injected resolver supplies only purported bytes. A successful result is deliberately
+/// limited to the strict Policy-to-Scope identity and local declared fields; it is not a Policy
+/// evaluation or an authority, authorization, admission, or Scope-semantics result.
+pub fn resolve_minimal_policy_gate_scope(
+    policy: &MinimalPolicyRecord,
+    resolver: &impl ExactRecordByteResolver,
+) -> Result<PolicyScopeStructuralBinding, PolicyScopeStructuralBindingError> {
+    let gate_scope_ref = policy.gate_scope_ref();
+    let scope_bytes = resolver
+        .resolve(gate_scope_ref)
+        .ok_or(PolicyScopeStructuralBindingError::ScopePayloadUnavailable)?;
+    let scope_record = ScopeRecord::decode_authoritative(scope_bytes)
+        .map_err(|_| PolicyScopeStructuralBindingError::ScopeDecode)?;
+    if scope_record.record_id() != gate_scope_ref {
+        return Err(PolicyScopeStructuralBindingError::ScopeIdentityMismatch);
+    }
+    Ok(PolicyScopeStructuralBinding {
+        policy_record_id: policy.record_id(),
+        gate_scope_ref,
+        scope_record,
+    })
+}
+
 /// Typed, Record-local fields for the frozen FREEZE_ATTEMPT_START Record schema.
 ///
 /// The Registry-relative root derivation and any later Journal authority binding
