@@ -3,3 +3,13 @@ docs/FORMAL-VERIFICATION-IMPLEMENTATION-BOUNDARY-SPEC-v0.5.4.md -text
 docs/CROSS-REFERENCE-v0.3.md -text
 docs/IDENTITY-FORMAT-v0.3.md -text
 docs/RECORD-SCHEMA-v0.3.md -text
+
+docs/OWNER-USE-WORKFLOW-v0.1.md -text
+docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.3.md -text
+docs/CROSS-REFERENCE-v0.4.md -text
+
+*.md    -text
+*.rs    text eol=lf
+*.dfy   text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
