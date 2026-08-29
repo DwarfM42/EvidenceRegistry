@@ -1,9 +1,10 @@
 use evidence_registry::{
-    derive_freeze_root, validate_freeze_committed_binding, EventRecordId, EventTypeId,
-    FreezeAttemptId, FreezeAttemptStartRecord, FreezeAttemptStartRecordInput,
-    FreezeCommittedBindingInput, FreezeCommittedBindingOutcome, FreezeReceiptRecord,
-    JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
-    StrictRecordFrame,
+    derive_freeze_root, validate_freeze_committed_binding,
+    validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
+    ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
+    FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
+    FreezeReceiptRecord, JournalEntryHash, JournalEntryIndex, JournalReference, RecordId,
+    RegistryId, ResolvedFreezeCommittedBindingError, RetainedJournal, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -762,5 +763,152 @@ fn freeze_committed_binding_rejects_each_mutated_record_identity_relation() {
             freeze_receipt_record: &receipt,
         }),
         Err(evidence_registry::FreezeCommittedBindingError::AttemptStartRecordMismatch)
+    );
+}
+
+struct FixtureRecordResolver {
+    records: Vec<(RecordId, Vec<u8>)>,
+}
+
+impl ExactRecordByteResolver for FixtureRecordResolver {
+    fn resolve(&self, record_id: RecordId) -> Option<&[u8]> {
+        self.records
+            .iter()
+            .find_map(|(stored_id, bytes)| (*stored_id == record_id).then_some(bytes.as_slice()))
+    }
+}
+
+#[test]
+fn resolved_freeze_committed_binding_distinguishes_missing_and_invalid_record_payloads() {
+    let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
+    let missing_receipt = FixtureRecordResolver {
+        records: vec![(start_record.record_id(), hex_bytes(START_RECORD_HEX))],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            &journal,
+            committed_reference.clone(),
+            &missing_receipt
+        ),
+        Err(ResolvedFreezeCommittedBindingError::ReceiptPayloadUnavailable)
+    );
+
+    let invalid_receipt = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
+            (receipt.record_id(), vec![0]),
+        ],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(&journal, committed_reference, &invalid_receipt),
+        Err(ResolvedFreezeCommittedBindingError::ReceiptDecode)
+    );
+}
+
+#[test]
+fn resolved_freeze_committed_binding_rejects_a_valid_receipt_with_the_wrong_exact_identity() {
+    let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
+    let mut alternate_receipt_bytes = hex_bytes(RECEIPT_HEX);
+    replace_unique(
+        &mut alternate_receipt_bytes,
+        &[0x11, 0x58, 0x20, 0xb0],
+        3,
+        0xb1,
+    );
+    let records = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
+            (receipt.record_id(), alternate_receipt_bytes),
+        ],
+    };
+
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(&journal, committed_reference, &records),
+        Err(ResolvedFreezeCommittedBindingError::ReceiptIdentityMismatch)
+    );
+}
+
+#[test]
+fn resolved_freeze_committed_binding_distinguishes_missing_start_payload() {
+    let (journal, committed_reference, _, receipt) = fixed_binding_fixture();
+    let missing_start = FixtureRecordResolver {
+        records: vec![(receipt.record_id(), hex_bytes(RECEIPT_HEX))],
+    };
+
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(&journal, committed_reference, &missing_start),
+        Err(ResolvedFreezeCommittedBindingError::AttemptStartPayloadUnavailable)
+    );
+}
+
+#[test]
+fn resolved_freeze_committed_binding_rejects_wrong_type_and_invalid_or_mismatched_start_payloads() {
+    let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
+    let wrong_receipt_type = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
+            (receipt.record_id(), hex_bytes(START_RECORD_HEX)),
+        ],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            &journal,
+            committed_reference.clone(),
+            &wrong_receipt_type
+        ),
+        Err(ResolvedFreezeCommittedBindingError::ReceiptDecode)
+    );
+
+    let invalid_start = FixtureRecordResolver {
+        records: vec![
+            (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (start_record.record_id(), vec![0]),
+        ],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            &journal,
+            committed_reference.clone(),
+            &invalid_start
+        ),
+        Err(ResolvedFreezeCommittedBindingError::AttemptStartDecode)
+    );
+
+    let mut alternate_start_bytes = hex_bytes(START_RECORD_HEX);
+    replace_unique(
+        &mut alternate_start_bytes,
+        &[0x12, 0x58, 0x20, 0xe0],
+        3,
+        0xe1,
+    );
+    let mismatched_start = FixtureRecordResolver {
+        records: vec![
+            (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+            (start_record.record_id(), alternate_start_bytes),
+        ],
+    };
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            &journal,
+            committed_reference,
+            &mismatched_start
+        ),
+        Err(ResolvedFreezeCommittedBindingError::AttemptStartIdentityMismatch)
+    );
+}
+
+#[test]
+fn resolved_freeze_committed_binding_returns_authority_evidence_unavailable_for_exact_records() {
+    let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
+    let records = FixtureRecordResolver {
+        records: vec![
+            (start_record.record_id(), hex_bytes(START_RECORD_HEX)),
+            (receipt.record_id(), hex_bytes(RECEIPT_HEX)),
+        ],
+    };
+
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(&journal, committed_reference, &records),
+        Ok(FreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
     );
 }

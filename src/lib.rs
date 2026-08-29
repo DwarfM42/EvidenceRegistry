@@ -3197,6 +3197,105 @@ pub fn validate_freeze_committed_binding(
     Ok(FreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
 }
 
+/// Supplies exact authoritative Record bytes for a requested immutable Record identity.
+///
+/// This is an injected composition seam, not a persistent Record store or namespace
+/// contract. `None` means only that this supplier has no bytes for the requested
+/// identity; it does not establish deletion, nonexistence, or any authority fact.
+pub trait ExactRecordByteResolver {
+    /// Returns bytes purported to have exactly the requested Record identity.
+    fn resolve(&self, record_id: RecordId) -> Option<&[u8]>;
+}
+
+/// A failure while obtaining and composing exact START and Receipt Record bytes.
+///
+/// Each unavailable, invalid, or wrong-identity payload outcome remains distinct
+/// from the retained-Journal structural binding result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedFreezeCommittedBindingError {
+    /// Retained Journal context did not provide the required exact reference facts.
+    RetainedReference(RetainedJournalError),
+    /// The resolved terminal Entry is not the required FREEZE_COMMITTED event.
+    CommittedEventMismatch,
+    /// The exact Receipt Record bytes required by the terminal Entry were unavailable.
+    ReceiptPayloadUnavailable,
+    /// Supplied Receipt bytes did not satisfy the strict FREEZE_RECEIPT local grammar.
+    ReceiptDecode,
+    /// Strictly decoded Receipt bytes did not hash to the terminal Entry's exact Record ID.
+    ReceiptIdentityMismatch,
+    /// The Receipt's retained START reference was not the required START event.
+    AttemptStartReferenceMismatch,
+    /// The exact START Record bytes required by the retained START Entry were unavailable.
+    AttemptStartPayloadUnavailable,
+    /// Supplied START bytes did not satisfy the strict FREEZE_ATTEMPT_START local grammar.
+    AttemptStartDecode,
+    /// Strictly decoded START bytes did not hash to the retained START Entry's exact Record ID.
+    AttemptStartIdentityMismatch,
+    /// Available exact inputs failed the existing bounded structural binding check.
+    Binding(FreezeCommittedBindingError),
+}
+
+/// Resolves exact Record bytes only as required to compose one bounded FREEZE_COMMITTED check.
+///
+/// A non-error result remains `AuthorityEvidenceUnavailable`: this adapter proves no
+/// authority, admission, Policy satisfaction, semantic-MANIFEST validity, custody,
+/// durability, lifecycle truth, persistence, or external trust.
+pub fn validate_resolved_freeze_committed_binding(
+    retained_journal: &RetainedJournal,
+    committed_event_reference: JournalReference,
+    resolver: &impl ExactRecordByteResolver,
+) -> Result<FreezeCommittedBindingOutcome, ResolvedFreezeCommittedBindingError> {
+    let committed = retained_journal
+        .resolve_reference(&committed_event_reference)
+        .map_err(ResolvedFreezeCommittedBindingError::RetainedReference)?;
+    if committed.event_type_id().value() != 101
+        || committed.event_type_id().required_record_type_id().value() != 4
+        || committed.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+    {
+        return Err(ResolvedFreezeCommittedBindingError::CommittedEventMismatch);
+    }
+    let receipt_record_id = RecordId::try_from(committed.event_record_id().as_bytes().as_slice())
+        .expect("EventRecordId has the fixed RecordId width");
+    let receipt_bytes = resolver
+        .resolve(receipt_record_id)
+        .ok_or(ResolvedFreezeCommittedBindingError::ReceiptPayloadUnavailable)?;
+    let receipt = FreezeReceiptRecord::decode_authoritative(receipt_bytes)
+        .map_err(|_| ResolvedFreezeCommittedBindingError::ReceiptDecode)?;
+    if receipt.record_id() != receipt_record_id {
+        return Err(ResolvedFreezeCommittedBindingError::ReceiptIdentityMismatch);
+    }
+
+    let start_reference = &receipt.input().attempt_start_journal_ref;
+    let start = retained_journal
+        .resolve_reference(start_reference)
+        .map_err(ResolvedFreezeCommittedBindingError::RetainedReference)?;
+    if start.event_type_id().value() != 100
+        || start.event_type_id().required_record_type_id().value() != 3
+        || start.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt
+    {
+        return Err(ResolvedFreezeCommittedBindingError::AttemptStartReferenceMismatch);
+    }
+    let start_record_id = RecordId::try_from(start.event_record_id().as_bytes().as_slice())
+        .expect("EventRecordId has the fixed RecordId width");
+    let start_bytes = resolver
+        .resolve(start_record_id)
+        .ok_or(ResolvedFreezeCommittedBindingError::AttemptStartPayloadUnavailable)?;
+    let freeze_attempt_start_record =
+        FreezeAttemptStartRecord::decode_authoritative(start_bytes)
+            .map_err(|_| ResolvedFreezeCommittedBindingError::AttemptStartDecode)?;
+    if freeze_attempt_start_record.record_id() != start_record_id {
+        return Err(ResolvedFreezeCommittedBindingError::AttemptStartIdentityMismatch);
+    }
+
+    validate_freeze_committed_binding(FreezeCommittedBindingInput {
+        retained_journal,
+        committed_event_reference,
+        freeze_attempt_start_record: &freeze_attempt_start_record,
+        freeze_receipt_record: &receipt,
+    })
+    .map_err(ResolvedFreezeCommittedBindingError::Binding)
+}
+
 /// Typed, Record-local fields for the frozen GENESIS Record schema.
 ///
 /// These fields determine immutable Record identity only. They do not establish
