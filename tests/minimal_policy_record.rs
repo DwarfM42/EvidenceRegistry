@@ -1,4 +1,7 @@
-use evidence_registry::{MinimalPolicyRecord, RecordId, RecordTypeId, StrictRecordFrame};
+use evidence_registry::{
+    check_minimal_policy_context_declaration, MinimalPolicyContextDeclaration, MinimalPolicyRecord,
+    PolicyEvaluationContext, RecordId, RecordTypeId, StrictRecordFrame,
+};
 
 const MINIMAL_POLICY_RECORD_HEX: &str = concat!(
     "84781a45766964656e636552656769737472792e5265636f72642e7631182801a50001011828105820",
@@ -94,4 +97,43 @@ fn minimal_policy_record_rejects_optional_requirements_and_does_not_infer_contex
     let decoded = MinimalPolicyRecord::decode_authoritative(&non_freeze_context).unwrap();
     assert_eq!(decoded.supported_context_ids(), &[3]);
     assert!(!decoded.declares_freeze_commit_support());
+}
+
+#[test]
+fn minimal_policy_context_declaration_uses_only_the_caller_supplied_context_membership() {
+    let freeze_policy =
+        MinimalPolicyRecord::decode_authoritative(&hex_bytes(MINIMAL_POLICY_RECORD_HEX)).unwrap();
+    let mut closeout_policy_bytes = hex_bytes(MINIMAL_POLICY_RECORD_HEX);
+    *closeout_policy_bytes.last_mut().unwrap() = 3;
+    let closeout_policy =
+        MinimalPolicyRecord::decode_authoritative(&closeout_policy_bytes).unwrap();
+
+    assert_eq!(
+        check_minimal_policy_context_declaration(
+            &freeze_policy,
+            PolicyEvaluationContext::FreezeCommit,
+        ),
+        MinimalPolicyContextDeclaration::Declared,
+    );
+    assert_eq!(
+        check_minimal_policy_context_declaration(
+            &freeze_policy,
+            PolicyEvaluationContext::CloseoutCreation,
+        ),
+        MinimalPolicyContextDeclaration::ContextUnsupported,
+    );
+    assert_eq!(
+        check_minimal_policy_context_declaration(
+            &closeout_policy,
+            PolicyEvaluationContext::CloseoutCreation,
+        ),
+        MinimalPolicyContextDeclaration::Declared,
+    );
+    assert_eq!(
+        check_minimal_policy_context_declaration(
+            &closeout_policy,
+            PolicyEvaluationContext::ReviewAdmission,
+        ),
+        MinimalPolicyContextDeclaration::ContextUnsupported,
+    );
 }

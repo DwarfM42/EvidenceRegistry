@@ -2981,6 +2981,41 @@ pub struct MinimalPolicyRecord {
     supported_context_ids: Vec<u64>,
 }
 
+/// One caller-selected frozen Policy evaluation context.
+///
+/// This exact registry mapping is not inferred from POLICY fields. A context
+/// declaration is only one prerequisite for later Policy evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyEvaluationContext {
+    FreezeCommit,
+    ReviewAdmission,
+    CloseoutCreation,
+    CloseoutPostcondition,
+    ReviewRequestCreation,
+}
+
+impl PolicyEvaluationContext {
+    fn id(self) -> u64 {
+        match self {
+            Self::FreezeCommit => 1,
+            Self::ReviewAdmission => 2,
+            Self::CloseoutCreation => 3,
+            Self::CloseoutPostcondition => 4,
+            Self::ReviewRequestCreation => 5,
+        }
+    }
+}
+
+/// The exact result of checking whether a minimal POLICY declares one caller-selected context.
+///
+/// `Declared` is not a Policy applicability, satisfaction, authority, admission, Scope,
+/// lifecycle, or external-truth conclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimalPolicyContextDeclaration {
+    Declared,
+    ContextUnsupported,
+}
+
 impl MinimalPolicyRecord {
     /// Strictly decodes only the unambiguous, zero-optional-requirement POLICY
     /// grammar. POLICY records with optional requirement fields remain outside
@@ -3076,6 +3111,22 @@ impl MinimalPolicyRecord {
     /// Whether this exact minimal Policy explicitly declares FREEZE_COMMIT support.
     pub fn declares_freeze_commit_support(&self) -> bool {
         self.supported_context_ids.contains(&1)
+    }
+}
+
+/// Checks only the explicit caller-selected context membership of a minimal POLICY.
+///
+/// The caller supplies the operation's context. This deliberately does not infer a context from
+/// POLICY fields, evaluate the declared gate Scope, establish Policy applicability or
+/// satisfaction, validate authority, or make an admission decision.
+pub fn check_minimal_policy_context_declaration(
+    policy: &MinimalPolicyRecord,
+    context: PolicyEvaluationContext,
+) -> MinimalPolicyContextDeclaration {
+    if policy.supported_context_ids().contains(&context.id()) {
+        MinimalPolicyContextDeclaration::Declared
+    } else {
+        MinimalPolicyContextDeclaration::ContextUnsupported
     }
 }
 

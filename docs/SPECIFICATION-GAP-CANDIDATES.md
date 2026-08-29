@@ -201,3 +201,58 @@ present malformed bytes are invalid evidence; bytes whose recomputed Record ID
 differs from the requested exact ID are identity mismatches. None of those outcomes
 establish authority, admission, Policy satisfaction, semantic-MANIFEST validity,
 custody, durability, lifecycle truth, or external trust.
+
+## SG-005 — Generic POLICY gate-SCOPE operation relation
+
+**Affected lane:** determining whether a generic POLICY's required `gate_scope_ref`
+contains, covers, or otherwise applies to a concrete operation, event, subject, or
+object. This does not affect strict POLICY/SCOPE decoding, exact Record identity,
+or structural resolution of the exact SCOPE bytes declared by POLICY key 16.
+
+### Frozen authority and gap
+
+- POLICY requires `gate_scope_ref` as an exact `RecordId SCOPE`
+  (`docs/RECORD-SCHEMA-v0.3.md:1962-1988`), while the generic SCOPE schema
+  defines only profile ID, profile version, opaque payload, and optional label
+  (`docs/RECORD-SCHEMA-v0.3.md:2060-2074`). It provides no generic profile
+  registry, subject/object binding grammar, or operation-to-SCOPE comparison.
+- Policy applicability is defined from Policy field identity, an explicit supported
+  context, the caller's current evaluation context, and where applicable consumed
+  status-bearing Evidence (`docs/RECORD-SCHEMA-v0.3.md:1488-1506`). Its algorithm
+  requires exact Policy loading/identity, any operation-required authority, explicit
+  context support, structural obligations, and registered requirement evaluators
+  (`docs/RECORD-SCHEMA-v0.3.md:2025-2056`), but does not define a universal generic
+  gate-SCOPE containment predicate.
+- The formal boundary makes Scope definition-relative, prohibits a universal Scope
+  tuple, and requires every exact Definition to provide its own dimensions and
+  coverage rules (`docs/FORMAL-VERIFICATION-IMPLEMENTATION-BOUNDARY-SPEC-v0.5.4.md:637-719`).
+- One specialized Bootstrap Trust rule does require exact Scope-Record-ID equality
+  and expressly prohibits subset/superset inference
+  (`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:4451-4485`). That rule does not
+  define generic POLICY gate-SCOPE semantics for unrelated contexts or profiles.
+
+The frozen authorities therefore do not uniquely determine how a generic
+`gate_scope_ref` relates to a particular evaluated operation or subject.
+
+### Competing outcomes
+
+1. **Infer generic containment from profile IDs, labels, opaque payload bytes, or
+   names:** this invents profile and coverage semantics and is rejected.
+2. **Treat mere exact SCOPE resolution as operation coverage:** this promotes a
+   resolved Record reference into subject/object or operation applicability and is
+   rejected.
+3. **Apply the specialized Bootstrap exact-ID equality rule universally:** this
+   expands a named Bootstrap rule into unrelated POLICY contexts and is rejected.
+4. **Fail closed for generic gate-SCOPE applicability:** retain exact structural
+   Policy-to-SCOPE binding, but make no positive generic Policy-applicability,
+   satisfaction, authority, or Admission conclusion until a frozen Scope profile and
+   operation-binding rule exists.
+5. **A future frozen Scope/profile successor:** define profile IDs, payload grammar,
+   target bindings, and coverage/equality rules for the specific POLICY context.
+
+### Current bounded disposition
+
+The runtime may check only explicit caller-supplied Policy-context membership as a
+separate prerequisite. A positive membership result does not resolve this gap and
+must not be reported as Scope coverage, Policy applicability or satisfaction,
+authority, Admission, lifecycle truth, custody, durability, or external trust.
