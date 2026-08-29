@@ -71,6 +71,10 @@ fn minimal_policy_record_rejects_optional_requirements_and_does_not_infer_contex
     *non_freeze_context.last_mut().unwrap() = 3;
     let mut review_context_without_requirements = canonical.clone();
     *review_context_without_requirements.last_mut().unwrap() = 2;
+    let mut closeout_postcondition_without_requirements = canonical.clone();
+    *closeout_postcondition_without_requirements
+        .last_mut()
+        .unwrap() = 4;
 
     assert!(StrictRecordFrame::decode_authoritative(&optional_requirement).is_ok());
     assert!(MinimalPolicyRecord::decode_authoritative(&optional_requirement).is_err());
@@ -78,6 +82,14 @@ fn minimal_policy_record_rejects_optional_requirements_and_does_not_infer_contex
     assert!(
         MinimalPolicyRecord::decode_authoritative(&review_context_without_requirements).is_err()
     );
+    assert!(
+        StrictRecordFrame::decode_authoritative(&closeout_postcondition_without_requirements)
+            .is_ok()
+    );
+    assert!(MinimalPolicyRecord::decode_authoritative(
+        &closeout_postcondition_without_requirements
+    )
+    .is_err());
 
     let decoded = MinimalPolicyRecord::decode_authoritative(&non_freeze_context).unwrap();
     assert_eq!(decoded.supported_context_ids(), &[3]);

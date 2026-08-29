@@ -3034,6 +3034,7 @@ impl MinimalPolicyRecord {
             supported_context_ids.push(context_id);
         }
         if supported_context_ids.contains(&2)
+            || supported_context_ids.contains(&4)
             || supported_context_ids.contains(&5)
             || !cursor.finished()
         {
