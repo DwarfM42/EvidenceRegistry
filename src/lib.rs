@@ -3300,6 +3300,7 @@ pub struct ReviewAdmissionPolicyRecord {
     allowed_finding_states: Option<Vec<u64>>,
     acceptable_anchor_relation_ids: Option<Vec<u64>>,
     operation_start_journal_ref: JournalReference,
+    supported_context_ids: Vec<u64>,
 }
 
 fn decode_nonempty_sorted_uint_set(
@@ -3462,7 +3463,8 @@ impl ReviewAdmissionPolicyRecord {
         }
         let review_requirements = review_requirements.ok_or(RecordDecodeError)?;
         let operation_start_journal_ref = operation_start_journal_ref.ok_or(RecordDecodeError)?;
-        if supported_context_ids.as_deref() != Some(&[2]) || !cursor.finished() {
+        let supported_context_ids = supported_context_ids.ok_or(RecordDecodeError)?;
+        if !cursor.finished() {
             return Err(RecordDecodeError);
         }
         Ok(Self {
@@ -3473,6 +3475,7 @@ impl ReviewAdmissionPolicyRecord {
             allowed_finding_states,
             acceptable_anchor_relation_ids,
             operation_start_journal_ref,
+            supported_context_ids,
         })
     }
 
@@ -3489,6 +3492,11 @@ impl ReviewAdmissionPolicyRecord {
     /// The sole Policy evaluation context permitted by this bounded profile.
     pub fn supported_context(&self) -> PolicyEvaluationContext {
         PolicyEvaluationContext::ReviewAdmission
+    }
+
+    /// The exact ordered Policy context declarations from key 30.
+    pub fn supported_context_ids(&self) -> &[u64] {
+        &self.supported_context_ids
     }
 
     /// The exact nonempty Review selector set required for REVIEW_ADMISSION.
@@ -3516,6 +3524,30 @@ impl ReviewAdmissionPolicyRecord {
     /// The exact locally decoded Policy-registration chronology reference.
     pub fn operation_start_journal_ref(&self) -> &JournalReference {
         &self.operation_start_journal_ref
+    }
+}
+
+/// The typed pre-loop context-declaration result for an authoritative
+/// Review-Admission Policy Record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionPolicyContextDeclaration {
+    Declared,
+    PolicyContextUnsupported,
+}
+
+/// Checks only whether the exact authoritative Policy declares the frozen
+/// REVIEW_ADMISSION context. This occurs before §46 requirement evaluation and
+/// is not a completed Policy, evaluator, or Admission result.
+pub fn check_review_admission_policy_context(
+    policy: &ReviewAdmissionPolicyRecord,
+) -> ReviewAdmissionPolicyContextDeclaration {
+    if policy
+        .supported_context_ids()
+        .contains(&PolicyEvaluationContext::ReviewAdmission.id())
+    {
+        ReviewAdmissionPolicyContextDeclaration::Declared
+    } else {
+        ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported
     }
 }
 
@@ -3767,6 +3799,8 @@ impl ReviewAdmissionPolicyContextPrerequisites {
 pub enum ReviewAdmissionPolicyContextPrerequisitesError {
     /// Exact Policy bytes did not bind to the retained `POLICY_RECORDED` event.
     PolicyBinding(ReviewAdmissionPolicyRecordedBindingError),
+    /// The exact authoritative Policy does not declare REVIEW_ADMISSION.
+    PolicyContextUnsupported,
     /// The common Request/Result §82 identity prerequisite did not hold.
     CommonRequestResult(ReviewAdmissionCommonRequestResultError),
     /// The Policy-declared gate Scope was unavailable, malformed, mismatched, or unsupported.
@@ -3807,6 +3841,11 @@ pub fn validate_review_admission_policy_context_prerequisites(
             ReviewAdmissionPolicyRecordedBindingError::PolicyDecode,
         )
     })?;
+    if check_review_admission_policy_context(&policy)
+        == ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported
+    {
+        return Err(ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported);
+    }
     let gate_scope_ref = policy.gate_scope_ref();
     resolve_review_admission_exact_scope_profile(gate_scope_ref, resolver)
         .map_err(ReviewAdmissionPolicyContextPrerequisitesError::GateScope)?;

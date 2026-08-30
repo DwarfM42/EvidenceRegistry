@@ -1,11 +1,11 @@
 use evidence_registry::{
-    resolve_review_admission_exact_scope_profile,
+    check_review_admission_policy_context, resolve_review_admission_exact_scope_profile,
     validate_review_admission_policy_context_prerequisites,
     validate_review_admission_policy_recorded_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, GenesisJournalEntry, JournalEntryHash, JournalEntryIndex,
     JournalReference, PolicyEvaluationContext, RecordId, RegistryId, RetainedJournal,
-    ReviewAdmissionCommonRequestResultError, ReviewAdmissionPolicyContextPrerequisitesError,
-    ReviewAdmissionPolicyRecord, StrictRecordFrame,
+    ReviewAdmissionCommonRequestResultError, ReviewAdmissionPolicyContextDeclaration,
+    ReviewAdmissionPolicyContextPrerequisitesError, ReviewAdmissionPolicyRecord, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -317,4 +317,25 @@ fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes
     assert_eq!(prerequisites.policy_record_id(), policy_record_id);
     assert_eq!(prerequisites.gate_scope_ref(), scope_id);
     assert_eq!(prerequisites.common_review_scope_ref(), scope_id);
+}
+
+#[test]
+fn review_admission_policy_preserves_context_unsupported_before_requirement_evaluation() {
+    let genesis = genesis();
+    let mut policy_bytes = independently_construct_review_admission_policy(
+        &genesis_reference(&genesis),
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
+    let context_offset = policy_bytes
+        .windows(3)
+        .position(|window| window == [0x18, 0x1e, 0x81])
+        .unwrap()
+        + 3;
+    policy_bytes[context_offset] = 1;
+    let policy = ReviewAdmissionPolicyRecord::decode_authoritative(&policy_bytes).unwrap();
+
+    assert_eq!(
+        check_review_admission_policy_context(&policy),
+        ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported,
+    );
 }
