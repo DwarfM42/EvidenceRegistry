@@ -4978,6 +4978,139 @@ impl ReviewResultRecord {
     }
 }
 
+/// The strictly decoded ACCEPTED `REVIEW_ADMISSION` Record local grammar.
+///
+/// This narrow first slice accepts only disposition `1` and requires its three
+/// exact resolved authority references. It establishes neither the §82/§46
+/// facts that select ACCEPTED nor an event-302 publication effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionRecord {
+    record_id: RecordId,
+    disposition_id: u64,
+    review_request_ref: JournalReference,
+    review_result_ref: JournalReference,
+    policy_authority_ref: JournalReference,
+    reason_codes: Vec<String>,
+    operation_start_journal_ref: JournalReference,
+}
+
+impl ReviewAdmissionRecord {
+    /// Strictly decodes the exact local ACCEPTED REVIEW_ADMISSION Record shape.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(32).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 32
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(8).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 32 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let disposition_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if disposition_id != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let review_request_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let review_result_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(19).map_err(|_| RecordDecodeError)?;
+        let policy_authority_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        if review_request_ref.event_type_id().value() != 300
+            || review_result_ref.event_type_id().value() != 301
+            || policy_authority_ref.event_type_id().value() != 400
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(22).map_err(|_| RecordDecodeError)?;
+        let reason_code_count = cursor.array().map_err(|_| RecordDecodeError)?;
+        if reason_code_count > cursor.remaining() {
+            return Err(RecordDecodeError);
+        }
+        let mut reason_codes = Vec::with_capacity(reason_code_count);
+        let mut previous_reason_code: Option<String> = None;
+        for _ in 0..reason_code_count {
+            let reason_code = cursor.text().map_err(|_| RecordDecodeError)?;
+            if previous_reason_code
+                .as_ref()
+                .is_some_and(|previous| previous.as_bytes() >= reason_code.as_bytes())
+            {
+                return Err(RecordDecodeError);
+            }
+            previous_reason_code = Some(reason_code.clone());
+            reason_codes.push(reason_code);
+        }
+        cursor.key(23).map_err(|_| RecordDecodeError)?;
+        let operation_start_journal_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            disposition_id,
+            review_request_ref,
+            review_result_ref,
+            policy_authority_ref,
+            reason_codes,
+            operation_start_journal_ref,
+        })
+    }
+
+    /// The exact self-hash identity of the strictly decoded Admission Record.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The frozen Review Admission disposition registry identity, exactly ACCEPTED here.
+    pub fn disposition_id(&self) -> u64 {
+        self.disposition_id
+    }
+
+    /// The exact retained REVIEW_REQUEST_RECORDED candidate reference.
+    pub fn review_request_ref(&self) -> Option<&JournalReference> {
+        Some(&self.review_request_ref)
+    }
+
+    /// The exact retained REVIEW_RESULT_RECORDED candidate reference.
+    pub fn review_result_ref(&self) -> Option<&JournalReference> {
+        Some(&self.review_result_ref)
+    }
+
+    /// The exact retained POLICY_RECORDED authority reference.
+    pub fn policy_authority_ref(&self) -> Option<&JournalReference> {
+        Some(&self.policy_authority_ref)
+    }
+
+    /// The canonical sorted reason-code set carried by this record.
+    pub fn reason_codes(&self) -> &[String] {
+        &self.reason_codes
+    }
+
+    /// The exact Record-local operation-start chronology reference.
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+}
+
 /// Fail-closed §82 prerequisite failures while comparing the exact common
 /// Request/Result fields required before Policy evaluation.
 ///
