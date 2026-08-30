@@ -86,3 +86,30 @@ fn accepted_review_admission_requires_exact_resolved_request_result_and_policy_r
         RecordId::try_from(admission.record_id().as_bytes().as_slice()).unwrap(),
     );
 }
+
+#[test]
+fn rejected_review_admission_preserves_successfully_resolved_authority_references() {
+    let mut bytes = independently_construct_accepted_review_admission();
+    let disposition_offset = bytes
+        .windows(3)
+        .position(|window| window == [0x10, 0x01, 0x11])
+        .unwrap()
+        + 1;
+    bytes[disposition_offset] = 2;
+
+    let admission = ReviewAdmissionRecord::decode_authoritative(&bytes).unwrap();
+
+    assert_eq!(admission.disposition_id(), 2);
+    assert_eq!(
+        admission.review_request_ref(),
+        Some(&reference(1, 300, 0x20))
+    );
+    assert_eq!(
+        admission.review_result_ref(),
+        Some(&reference(2, 301, 0x40))
+    );
+    assert_eq!(
+        admission.policy_authority_ref(),
+        Some(&reference(3, 400, 0x60))
+    );
+}

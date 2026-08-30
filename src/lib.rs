@@ -4978,11 +4978,11 @@ impl ReviewResultRecord {
     }
 }
 
-/// The strictly decoded ACCEPTED `REVIEW_ADMISSION` Record local grammar.
+/// The strictly decoded terminal `REVIEW_ADMISSION` Record local grammar.
 ///
-/// This narrow first slice accepts only disposition `1` and requires its three
-/// exact resolved authority references. It establishes neither the §82/§46
-/// facts that select ACCEPTED nor an event-302 publication effect.
+/// This narrow first slice accepts only terminal Records whose exact Request,
+/// Result, and Policy authority references all resolved. It establishes neither
+/// the §82/§46 facts that select a disposition nor a Journal publication effect.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewAdmissionRecord {
     record_id: RecordId,
@@ -4995,7 +4995,8 @@ pub struct ReviewAdmissionRecord {
 }
 
 impl ReviewAdmissionRecord {
-    /// Strictly decodes the exact local ACCEPTED REVIEW_ADMISSION Record shape.
+    /// Strictly decodes the exact local terminal REVIEW_ADMISSION Record shape
+    /// when all three authority references were successfully resolved.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
         if frame.record_type_id() != RecordTypeId::try_from(32).expect("assigned Record Type") {
@@ -5022,7 +5023,7 @@ impl ReviewAdmissionRecord {
         }
         cursor.key(16).map_err(|_| RecordDecodeError)?;
         let disposition_id = cursor.uint().map_err(|_| RecordDecodeError)?;
-        if disposition_id != 1 {
+        if !matches!(disposition_id, 1 | 2) {
             return Err(RecordDecodeError);
         }
         cursor.key(17).map_err(|_| RecordDecodeError)?;
@@ -5080,7 +5081,7 @@ impl ReviewAdmissionRecord {
         self.record_id
     }
 
-    /// The frozen Review Admission disposition registry identity, exactly ACCEPTED here.
+    /// The frozen Review Admission disposition registry identity.
     pub fn disposition_id(&self) -> u64 {
         self.disposition_id
     }
