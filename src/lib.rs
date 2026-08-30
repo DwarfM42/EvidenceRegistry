@@ -5205,6 +5205,139 @@ impl ReviewAdmissionRecord {
     }
 }
 
+/// Typed inputs for a terminal Review Admission Journal Entry.
+///
+/// The Admission Record fixes terminal direction and exact direct authorities;
+/// this construction layer does not select a disposition or publish bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub admission: ReviewAdmissionRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+/// A rejected terminal Review Admission Journal Entry construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionJournalEntryError;
+
+/// A canonical terminal Review Admission Journal Entry, not a publication effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_type_id: EventTypeId,
+    event_record_id: EventRecordId,
+    admission: ReviewAdmissionRecord,
+    authority_dependencies: AuthorityDependencyCollection,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl ReviewAdmissionJournalEntry {
+    /// Constructs the terminal Entry whose event type and direct authority
+    /// dependencies are determined by the exact terminal Admission Record.
+    pub fn new(
+        input: ReviewAdmissionJournalEntryInput,
+    ) -> Result<Self, ReviewAdmissionJournalEntryError> {
+        if input.entry_index.value() == 0 {
+            return Err(ReviewAdmissionJournalEntryError);
+        }
+        let event_type_id = EventTypeId::try_from(match input.admission.disposition_id() {
+            1 => 302,
+            2 => 303,
+            _ => return Err(ReviewAdmissionJournalEntryError),
+        })
+        .expect("terminal REVIEW_ADMISSION event IDs are registered");
+        let event_record_id =
+            EventRecordId::try_from(input.admission.record_id().as_bytes().as_slice())
+                .expect("RecordId has EventRecordId width");
+        let authority_dependencies =
+            AuthorityDependencyCollection::from_unordered_semantic_elements(
+                AuthorityDependencyContext::new(input.registry_id, input.entry_index),
+                vec![
+                    input
+                        .admission
+                        .review_request_ref()
+                        .expect("this resolved Admission shape always retains Request")
+                        .clone(),
+                    input
+                        .admission
+                        .review_result_ref()
+                        .expect("this resolved Admission shape always retains Result")
+                        .clone(),
+                    input
+                        .admission
+                        .policy_authority_ref()
+                        .expect("this resolved Admission shape always retains Policy")
+                        .clone(),
+                ],
+            )
+            .map_err(|_| ReviewAdmissionJournalEntryError)?;
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_type_id,
+            event_record_id,
+            admission: input.admission,
+            authority_dependencies,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    /// The terminal event selected only by the Admission disposition.
+    pub fn event_type_id(&self) -> EventTypeId {
+        self.event_type_id
+    }
+
+    /// The exact Admission Record identity carried as the event Record ID.
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+
+    /// The exact terminal Admission Record carried by this Entry.
+    pub fn admission(&self) -> &ReviewAdmissionRecord {
+        &self.admission
+    }
+
+    /// Every exact direct authority dependency in canonical Journal order.
+    pub fn authority_dependencies(&self) -> &[JournalReference] {
+        &self.authority_dependencies.elements
+    }
+
+    /// Emits exact canonical terminal Review Admission Journal Entry bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(600);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id.value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07]);
+        bytes.extend_from_slice(&self.authority_dependencies.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x06, 0x09]);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes
+    }
+}
+
 /// Fail-closed §82 prerequisite failures while comparing the exact common
 /// Request/Result fields required before Policy evaluation.
 ///
