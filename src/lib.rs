@@ -3454,162 +3454,6 @@ pub fn review_admission_scope_profile_1_v1() -> ReviewAdmissionScopeProfileRegis
     EVALUATOR_1015_SCOPE_PROFILE
 }
 
-/// The exact POLICY fields already established by the Review Admission authority layer.
-///
-/// Constructing this input does not establish POLICY authority. `None` at the evaluator
-/// boundary represents unavailable required authoritative Policy input and remains a
-/// pre-completion outcome.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReviewAdmissionGateScopePolicy {
-    gate_scope_ref: RecordId,
-    supported_context_ids: Vec<u64>,
-}
-
-impl ReviewAdmissionGateScopePolicy {
-    pub fn new(gate_scope_ref: RecordId, supported_context_ids: Vec<u64>) -> Self {
-        Self {
-            gate_scope_ref,
-            supported_context_ids,
-        }
-    }
-
-    pub fn gate_scope_ref(&self) -> RecordId {
-        self.gate_scope_ref
-    }
-}
-
-/// The completed evaluator-local result for frozen evaluator 1015.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Evaluator1015Result {
-    Pass,
-    Fail,
-}
-
-/// §82 failure that prevents evaluator 1015 from running.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReviewAdmissionPrerequisiteFailure {
-    ReviewScopeMismatch,
-}
-
-/// A fail-closed input boundary before a completed §46 Policy result exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReviewAdmissionPreCompletion {
-    AuthoritativePolicyUnavailable,
-    AuthoritativeScopeUnavailable,
-    AuthoritativeScopeIdentityInvalid,
-    UnsupportedScopeProfileVersion {
-        profile_id: u64,
-        profile_version: u64,
-    },
-    ProfilePayloadNotEmpty,
-}
-
-/// The only outcomes evaluator 1015 may produce at this boundary.
-///
-/// In particular, neither prerequisite nor pre-completion branches manufacture
-/// `SATISFIED`, `GATE_UNSATISFIED`, or `GATE_INDETERMINATE`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReviewAdmissionGateScopeEvaluation {
-    PrerequisiteFailure(ReviewAdmissionPrerequisiteFailure),
-    PolicyContextUnsupported,
-    PreCompletion(ReviewAdmissionPreCompletion),
-    Completed(Evaluator1015Result),
-}
-
-fn resolve_evaluator_1015_scope(
-    scope_ref: RecordId,
-    resolver: &impl ExactRecordByteResolver,
-) -> Result<ScopeRecord, ReviewAdmissionPreCompletion> {
-    let bytes = resolver
-        .resolve(scope_ref)
-        .ok_or(ReviewAdmissionPreCompletion::AuthoritativeScopeUnavailable)?;
-    let scope = ScopeRecord::decode_authoritative(bytes)
-        .map_err(|_| ReviewAdmissionPreCompletion::AuthoritativeScopeIdentityInvalid)?;
-    if scope.record_id().as_bytes() != scope_ref.as_bytes() {
-        return Err(ReviewAdmissionPreCompletion::AuthoritativeScopeIdentityInvalid);
-    }
-    Ok(scope)
-}
-
-fn validate_evaluator_1015_profile(
-    scope: &ScopeRecord,
-) -> Result<(), ReviewAdmissionPreCompletion> {
-    let input = scope.input();
-    if input.scope_profile_id != EVALUATOR_1015_SCOPE_PROFILE.profile_id
-        || input.scope_profile_version != EVALUATOR_1015_SCOPE_PROFILE.profile_version
-    {
-        return Err(
-            ReviewAdmissionPreCompletion::UnsupportedScopeProfileVersion {
-                profile_id: input.scope_profile_id,
-                profile_version: input.scope_profile_version,
-            },
-        );
-    }
-    if !input.scope_payload.is_empty() {
-        return Err(ReviewAdmissionPreCompletion::ProfilePayloadNotEmpty);
-    }
-    Ok(())
-}
-
-/// Evaluates Record Schema v0.4 evaluator 1015 only.
-///
-/// This operation first enforces the Lifecycle §82 exact Review Scope prerequisite;
-/// `ReviewRequest.review_scope_ref` and `ReviewResult.review_scope_ref` must be equal
-/// before any evaluator work occurs. It then validates the two exact SCOPE identities and
-/// Profile 1/1 input shape. The sole applicability relation is byte-for-byte equality of
-/// the established common Review Scope and `POLICY.gate_scope_ref` in REVIEW_ADMISSION.
-/// It performs no containment, hierarchy, label, payload, selector, or generic Scope logic.
-pub fn evaluate_review_admission_gate_scope_1015(
-    policy: Option<&ReviewAdmissionGateScopePolicy>,
-    review_request_scope_ref: RecordId,
-    review_result_scope_ref: RecordId,
-    resolver: &impl ExactRecordByteResolver,
-) -> ReviewAdmissionGateScopeEvaluation {
-    if review_request_scope_ref.as_bytes() != review_result_scope_ref.as_bytes() {
-        return ReviewAdmissionGateScopeEvaluation::PrerequisiteFailure(
-            ReviewAdmissionPrerequisiteFailure::ReviewScopeMismatch,
-        );
-    }
-    let Some(policy) = policy else {
-        return ReviewAdmissionGateScopeEvaluation::PreCompletion(
-            ReviewAdmissionPreCompletion::AuthoritativePolicyUnavailable,
-        );
-    };
-    if policy.supported_context_ids.as_slice() != [PolicyEvaluationContext::ReviewAdmission.id()] {
-        return ReviewAdmissionGateScopeEvaluation::PolicyContextUnsupported;
-    }
-
-    let common_scope = match resolve_evaluator_1015_scope(review_request_scope_ref, resolver) {
-        Ok(scope) => scope,
-        Err(reason) => return ReviewAdmissionGateScopeEvaluation::PreCompletion(reason),
-    };
-    if let Err(reason) = validate_evaluator_1015_profile(&common_scope) {
-        return ReviewAdmissionGateScopeEvaluation::PreCompletion(reason);
-    }
-    let policy_gate_scope = match resolve_evaluator_1015_scope(policy.gate_scope_ref(), resolver) {
-        Ok(scope) => scope,
-        Err(reason) => return ReviewAdmissionGateScopeEvaluation::PreCompletion(reason),
-    };
-    if let Err(reason) = validate_evaluator_1015_profile(&policy_gate_scope) {
-        return ReviewAdmissionGateScopeEvaluation::PreCompletion(reason);
-    }
-
-    if policy.gate_scope_ref().as_bytes() == review_request_scope_ref.as_bytes() {
-        ReviewAdmissionGateScopeEvaluation::Completed(Evaluator1015Result::Pass)
-    } else {
-        ReviewAdmissionGateScopeEvaluation::Completed(Evaluator1015Result::Fail)
-    }
-}
-
-/// A registered evaluator outcome supplied by an already-applicable, separately evaluated
-/// Policy requirement. This does not change any other evaluator's semantics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OtherPolicyEvaluatorResult {
-    Pass,
-    Fail,
-    Indeterminate,
-}
-
 /// A §82 returned-Anchor comparison that prevents Policy evaluation from starting.
 ///
 /// This is deliberately outside evaluator 1015 and §46's completed-result grammar.
@@ -3666,6 +3510,20 @@ pub fn route_review_admission_after_anchor_comparison(
 /// comparison may a separately established Policy process be notified of an
 /// eligible route. This function does not receive or return Policy completion,
 /// Admission, terminal Record construction, or Journal publication.
+///
+/// ```compile_fail
+/// use evidence_registry::{
+///     compose_review_admission_policy_46,
+///     derive_review_admission_lifecycle_outcome,
+///     evaluate_review_admission_gate_scope_1015,
+///     PolicyCompositionResult,
+///     ReviewAdmissionGateScopePolicy,
+///     ReviewAdmissionLifecycleOutcome,
+/// };
+/// ```
+///
+/// The generic retained-history route intentionally exposes none of those
+/// unavailable evaluator, §46, or terminal-direction surfaces.
 pub fn route_retained_review_admission_section_82(
     retained_journal: &RetainedJournal,
     request_event_reference: &JournalReference,
@@ -3692,63 +3550,6 @@ pub fn route_retained_review_admission_section_82(
         compare_retained_journal_anchor_history(retained_journal, &anchor),
         on_policy_route_eligible,
     )
-}
-
-/// The bounded §46 composition outcome needed for REVIEW_ADMISSION dispatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PolicyCompositionResult {
-    PreCompletion,
-    Satisfied,
-    GateUnsatisfied,
-    GateIndeterminate,
-}
-
-/// Composes evaluator 1015 with already-applicable requirements under §46.
-///
-/// Pre-completion and §82 branches remain outside completed Policy results. A pass from
-/// evaluator 1015 alone is not a lifecycle event; lifecycle dispatch consumes only this
-/// whole composition result.
-pub fn compose_review_admission_policy_46(
-    evaluator_1015: ReviewAdmissionGateScopeEvaluation,
-    other_results: &[OtherPolicyEvaluatorResult],
-) -> PolicyCompositionResult {
-    let ReviewAdmissionGateScopeEvaluation::Completed(evaluator_1015_result) = evaluator_1015
-    else {
-        return PolicyCompositionResult::PreCompletion;
-    };
-    if evaluator_1015_result == Evaluator1015Result::Fail {
-        return PolicyCompositionResult::GateUnsatisfied;
-    }
-    if other_results.contains(&OtherPolicyEvaluatorResult::Fail) {
-        return PolicyCompositionResult::GateUnsatisfied;
-    }
-    if other_results.contains(&OtherPolicyEvaluatorResult::Indeterminate) {
-        return PolicyCompositionResult::GateIndeterminate;
-    }
-    PolicyCompositionResult::Satisfied
-}
-
-/// The frozen REVIEW_ADMISSION lifecycle dispatch after a completed §46 result.
-///
-/// This returns only the disposition/event direction; it does not create, rewrite, or append
-/// a Journal event or a historical Record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReviewAdmissionLifecycleOutcome {
-    NoEvent,
-    AcceptedEvent302,
-    RejectedEvent303,
-}
-
-pub fn derive_review_admission_lifecycle_outcome(
-    result: PolicyCompositionResult,
-) -> ReviewAdmissionLifecycleOutcome {
-    match result {
-        PolicyCompositionResult::PreCompletion => ReviewAdmissionLifecycleOutcome::NoEvent,
-        PolicyCompositionResult::Satisfied => ReviewAdmissionLifecycleOutcome::AcceptedEvent302,
-        PolicyCompositionResult::GateUnsatisfied | PolicyCompositionResult::GateIndeterminate => {
-            ReviewAdmissionLifecycleOutcome::RejectedEvent303
-        }
-    }
 }
 
 /// Exact structural facts obtained by resolving a minimal POLICY's declared gate Scope.
@@ -3984,6 +3785,7 @@ impl ReviewRequestRecord {
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
         cursor.key(25).map_err(|_| RecordDecodeError)?;
+
         let review_package_anchor_binding_version = cursor.uint().map_err(|_| RecordDecodeError)?;
         if review_package_anchor_binding_version != 1 || !cursor.finished() {
             return Err(RecordDecodeError);

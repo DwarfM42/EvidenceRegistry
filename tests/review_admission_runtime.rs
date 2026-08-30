@@ -1,13 +1,13 @@
 use evidence_registry::{
     compare_retained_journal_anchor_history, resolve_retained_review_package_anchor_input,
-    route_retained_review_admission_section_82, validate_review_package_anchor_transport,
-    validate_review_request_recorded_binding, validate_review_result_recorded_binding,
-    EventRecordId, GenesisJournalEntry, JournalAnchor, JournalAnchorHistoryComparison,
-    JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
-    RetainedReviewPackageAnchorInputError, ReviewAdmissionSection82PrerequisiteFailure,
-    ReviewAdmissionSection82RoutingOutcome, ReviewPackageAnchorTransportError, ReviewRequestRecord,
-    ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
-    StrictRecordFrame,
+    route_retained_review_admission_section_82, route_review_admission_after_anchor_comparison,
+    validate_review_package_anchor_transport, validate_review_request_recorded_binding,
+    validate_review_result_recorded_binding, EventRecordId, GenesisJournalEntry, JournalAnchor,
+    JournalAnchorHistoryComparison, JournalEntryHash, JournalEntryIndex, JournalReference,
+    RecordId, RegistryId, RetainedJournal, RetainedReviewPackageAnchorInputError,
+    ReviewAdmissionSection82PrerequisiteFailure, ReviewAdmissionSection82RoutingOutcome,
+    ReviewPackageAnchorTransportError, ReviewRequestRecord, ReviewRequestRecordedBindingError,
+    ReviewResultRecord, ReviewResultRecordedBindingError, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -85,10 +85,34 @@ fn independently_construct_version_1_review_request_with_anchor_id(
     bytes
 }
 
+fn append_identity_dependencies(output: &mut Vec<u8>, dependencies: &[(u8, [u8; 32])]) {
+    assert!(dependencies.len() < 24);
+    output.push(0x80 + dependencies.len() as u8);
+    for (kind, value) in dependencies {
+        output.extend_from_slice(&[0x82, *kind]);
+        append_bstr_32(output, *value);
+    }
+}
+
 fn review_request_recorded_entry(
     previous_entry_hash: JournalEntryHash,
     review_request_record_id: RecordId,
     review_package_anchor_id: Option<[u8; 32]>,
+) -> Vec<u8> {
+    let identity_dependencies = review_package_anchor_id
+        .map(|anchor_id| vec![(2, anchor_id)])
+        .unwrap_or_default();
+    review_request_recorded_entry_with_identity_dependencies(
+        previous_entry_hash,
+        review_request_record_id,
+        &identity_dependencies,
+    )
+}
+
+fn review_request_recorded_entry_with_identity_dependencies(
+    previous_entry_hash: JournalEntryHash,
+    review_request_record_id: RecordId,
+    identity_dependencies: &[(u8, [u8; 32])],
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
@@ -100,12 +124,7 @@ fn review_request_recorded_entry(
     bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x2c, 0x05]);
     append_bstr_32(&mut bytes, *review_request_record_id.as_bytes());
     bytes.push(0x06);
-    if let Some(review_package_anchor_id) = review_package_anchor_id {
-        bytes.extend_from_slice(&[0x81, 0x82, 0x02]);
-        append_bstr_32(&mut bytes, review_package_anchor_id);
-    } else {
-        bytes.push(0x80);
-    }
+    append_identity_dependencies(&mut bytes, identity_dependencies);
     bytes.extend_from_slice(&[0x07, 0x80, 0x08, 0x04, 0x09]);
     append_bstr_32(&mut bytes, *review_request_record_id.as_bytes());
     bytes.extend_from_slice(&[0x0a]);
@@ -158,6 +177,25 @@ fn review_result_recorded_entry(
     review_package_anchor_id: Option<[u8; 32]>,
     request_authority_dependency: Option<&JournalReference>,
 ) -> Vec<u8> {
+    let identity_dependencies = review_package_anchor_id
+        .map(|anchor_id| vec![(2, anchor_id)])
+        .unwrap_or_default();
+    review_result_recorded_entry_with_identity_dependencies(
+        entry_index,
+        previous_entry_hash,
+        review_result_record_id,
+        &identity_dependencies,
+        request_authority_dependency,
+    )
+}
+
+fn review_result_recorded_entry_with_identity_dependencies(
+    entry_index: u8,
+    previous_entry_hash: JournalEntryHash,
+    review_result_record_id: RecordId,
+    identity_dependencies: &[(u8, [u8; 32])],
+    request_authority_dependency: Option<&JournalReference>,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
     bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
@@ -168,12 +206,7 @@ fn review_result_recorded_entry(
     bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x2d, 0x05]);
     append_bstr_32(&mut bytes, *review_result_record_id.as_bytes());
     bytes.push(0x06);
-    if let Some(review_package_anchor_id) = review_package_anchor_id {
-        bytes.extend_from_slice(&[0x81, 0x82, 0x02]);
-        append_bstr_32(&mut bytes, review_package_anchor_id);
-    } else {
-        bytes.push(0x80);
-    }
+    append_identity_dependencies(&mut bytes, identity_dependencies);
     bytes.push(0x07);
     if let Some(request_authority_dependency) = request_authority_dependency {
         bytes.push(0x81);
@@ -289,6 +322,43 @@ fn retained_anchor_history_comparator_classifies_every_section_116_relation() {
         compare_retained_journal_anchor_history(&journal, &invalid_anchor),
         JournalAnchorHistoryComparison::AnchorInvalid
     );
+}
+
+#[test]
+fn returned_anchor_router_is_preterminal_on_failure_and_neutral_on_handoff() {
+    for comparison in [
+        JournalAnchorHistoryComparison::JournalDivergence,
+        JournalAnchorHistoryComparison::JournalHistoryBehindAnchor,
+        JournalAnchorHistoryComparison::AnchorFromDifferentRegistry,
+        JournalAnchorHistoryComparison::AnchorInvalid,
+    ] {
+        let handoff_calls = std::cell::Cell::new(0_u8);
+        let outcome = route_review_admission_after_anchor_comparison(comparison, || {
+            handoff_calls.set(handoff_calls.get() + 1)
+        });
+        assert_eq!(
+            outcome,
+            ReviewAdmissionSection82RoutingOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(comparison)
+            )
+        );
+        assert_eq!(handoff_calls.get(), 0);
+    }
+
+    for comparison in [
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead,
+        JournalAnchorHistoryComparison::AnchorIsValidAncestor,
+    ] {
+        let handoff_calls = std::cell::Cell::new(0_u8);
+        let outcome = route_review_admission_after_anchor_comparison(comparison, || {
+            handoff_calls.set(handoff_calls.get() + 1)
+        });
+        assert_eq!(
+            outcome,
+            ReviewAdmissionSection82RoutingOutcome::PolicyRouteEligible
+        );
+        assert_eq!(handoff_calls.get(), 1);
+    }
 }
 
 #[test]
@@ -490,6 +560,72 @@ fn version_1_review_result_recorded_event_rejects_a_substituted_anchor_identity_
         validate_review_result_recorded_binding(&journal, &recorded_reference, &result_bytes),
         Err(ReviewResultRecordedBindingError::ResultEventAnchorIdentityDependencyMismatch),
     );
+}
+
+#[test]
+fn version_1_review_request_recorded_event_rejects_wrong_kind_or_multiple_anchor_commitments() {
+    let genesis = genesis();
+    let request_bytes = independently_construct_version_1_review_request();
+    let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
+    let expected_anchor = *request.review_package_anchor_id().as_bytes();
+    let assert_mismatch = |identity_dependencies: &[(u8, [u8; 32])]| {
+        let entry = review_request_recorded_entry_with_identity_dependencies(
+            genesis.entry_hash(),
+            request.record_id(),
+            identity_dependencies,
+        );
+        let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+        let recorded_reference = JournalReference::new(
+            RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+            JournalEntryIndex::try_from(1_u64).unwrap(),
+            JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+            evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
+            EventRecordId::try_from(request.record_id().as_bytes().as_slice()).unwrap(),
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+        journal.append_strict_entry(&entry).unwrap();
+        assert_eq!(
+            validate_review_request_recorded_binding(&journal, &recorded_reference, &request_bytes),
+            Err(ReviewRequestRecordedBindingError::RequestEventAnchorIdentityDependencyMismatch)
+        );
+    };
+
+    assert_mismatch(&[(1, expected_anchor)]);
+    assert_mismatch(&[(2, expected_anchor), (2, id(0x11))]);
+}
+
+#[test]
+fn version_1_review_result_recorded_event_rejects_wrong_kind_or_multiple_anchor_commitments() {
+    let genesis = genesis();
+    let result_bytes = independently_construct_version_1_review_result();
+    let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
+    let expected_anchor = *result.review_package_anchor_id().as_bytes();
+    let assert_mismatch = |identity_dependencies: &[(u8, [u8; 32])]| {
+        let entry = review_result_recorded_entry_with_identity_dependencies(
+            1,
+            genesis.entry_hash(),
+            result.record_id(),
+            identity_dependencies,
+            None,
+        );
+        let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+        let recorded_reference = JournalReference::new(
+            RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+            JournalEntryIndex::try_from(1_u64).unwrap(),
+            JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+            evidence_registry::EventTypeId::try_from(301_u64).unwrap(),
+            EventRecordId::try_from(result.record_id().as_bytes().as_slice()).unwrap(),
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+        journal.append_strict_entry(&entry).unwrap();
+        assert_eq!(
+            validate_review_result_recorded_binding(&journal, &recorded_reference, &result_bytes),
+            Err(ReviewResultRecordedBindingError::ResultEventAnchorIdentityDependencyMismatch)
+        );
+    };
+
+    assert_mismatch(&[(1, expected_anchor)]);
+    assert_mismatch(&[(2, expected_anchor), (2, id(0x11))]);
 }
 
 #[test]
