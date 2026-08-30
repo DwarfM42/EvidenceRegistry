@@ -4199,6 +4199,252 @@ pub fn route_retained_review_admission_policy_context(
     }
 }
 
+/// One retained individual result from an applicable REVIEW_ADMISSION Policy
+/// evaluator. This is not a completed Policy result or Lifecycle disposition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionIndividualEvaluatorResult {
+    evaluator_id: u16,
+    outcome: ReviewAdmissionGateScope1015Result,
+}
+
+impl ReviewAdmissionIndividualEvaluatorResult {
+    /// The exact frozen evaluator identity invoked for this applicable requirement.
+    pub fn evaluator_id(&self) -> u16 {
+        self.evaluator_id
+    }
+
+    /// The individual evaluator outcome retained for §46 composition.
+    pub fn outcome(&self) -> ReviewAdmissionGateScope1015Result {
+        self.outcome
+    }
+}
+
+/// The three completed results defined by Record Schema §46.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionCompletedPolicyResult {
+    Satisfied,
+    GateUnsatisfied,
+    GateIndeterminate,
+}
+
+/// A completed Review Admission §46 result together with every applicable
+/// individual evaluator outcome. This type does not determine §83 disposition,
+/// construct an Admission, or construct/publish a Journal event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionPolicy46Completion {
+    result: ReviewAdmissionCompletedPolicyResult,
+    evaluator_results: Vec<ReviewAdmissionIndividualEvaluatorResult>,
+}
+
+impl ReviewAdmissionPolicy46Completion {
+    /// The completed §46 Policy result.
+    pub fn result(&self) -> ReviewAdmissionCompletedPolicyResult {
+        self.result
+    }
+
+    /// Every individual outcome retained before this completed result was composed.
+    pub fn evaluator_results(&self) -> &[ReviewAdmissionIndividualEvaluatorResult] {
+        &self.evaluator_results
+    }
+}
+
+/// The only outcomes of the retained Review Admission §46 route.
+///
+/// Pre-terminal and context-precondition outcomes are not completed Policy
+/// results and cannot be transformed into §83 lifecycle direction here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionPolicy46RouteOutcome {
+    PreTerminal(ReviewAdmissionSection82PrerequisiteFailure),
+    PolicyContextPrecondition(ReviewAdmissionPolicyContextRouteError),
+    Completed(ReviewAdmissionPolicy46Completion),
+}
+
+fn review_admission_anchor_relation_id(comparison: JournalAnchorHistoryComparison) -> Option<u64> {
+    match comparison {
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead => Some(1),
+        JournalAnchorHistoryComparison::AnchorIsValidAncestor => Some(2),
+        JournalAnchorHistoryComparison::JournalDivergence
+        | JournalAnchorHistoryComparison::JournalHistoryBehindAnchor
+        | JournalAnchorHistoryComparison::AnchorFromDifferentRegistry
+        | JournalAnchorHistoryComparison::AnchorInvalid => None,
+    }
+}
+
+fn retain_review_admission_evaluator_result(
+    results: &mut Vec<ReviewAdmissionIndividualEvaluatorResult>,
+    evaluator_id: u16,
+    passed: bool,
+) {
+    results.push(ReviewAdmissionIndividualEvaluatorResult {
+        evaluator_id,
+        outcome: if passed {
+            ReviewAdmissionGateScope1015Result::Pass
+        } else {
+            ReviewAdmissionGateScope1015Result::Fail
+        },
+    });
+}
+
+/// Derives and evaluates every currently applicable frozen REVIEW_ADMISSION
+/// Policy requirement from retained Request/Result/Policy inputs only.
+///
+/// The function repeats the retained §82 routing order rather than accepting a
+/// caller-provided Scope, evaluator result collection, Policy completion,
+/// Lifecycle direction, or validation flag. Any unavailable or unsupported
+/// prerequisite remains pre-completion. Once that boundary is crossed, the
+/// exact Policy fields determine the applicable evaluators mechanically:
+/// Review selector (1001), optional Method status (1003), optional Finding
+/// state (1004), optional Anchor relation (1009), and profile-1 gate Scope
+/// binding (1015).
+pub fn evaluate_retained_review_admission_policy_46(
+    retained_journal: &RetainedJournal,
+    request_event_reference: &JournalReference,
+    request_bytes: &[u8],
+    result_event_reference: &JournalReference,
+    result_bytes: &[u8],
+    resolver: &impl ExactRecordByteResolver,
+) -> ReviewAdmissionPolicy46RouteOutcome {
+    let anchor = match resolve_retained_review_package_anchor_input(
+        retained_journal,
+        request_event_reference,
+        request_bytes,
+        result_event_reference,
+        result_bytes,
+    ) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            return ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::RetainedAnchorInput(error),
+            );
+        }
+    };
+    let anchor_comparison = compare_retained_journal_anchor_history(retained_journal, &anchor);
+    let anchor_relation_id = match review_admission_anchor_relation_id(anchor_comparison) {
+        Some(relation_id) => relation_id,
+        None => {
+            return ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(
+                    anchor_comparison,
+                ),
+            );
+        }
+    };
+    let request = match ReviewRequestRecord::decode_authoritative(request_bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
+                ReviewAdmissionPolicyContextRouteError::RequestDecode,
+            );
+        }
+    };
+    let policy_event_reference = request.policy_authority_ref();
+    let policy_record_id = match RecordId::try_from(
+        policy_event_reference
+            .event_record_id()
+            .as_bytes()
+            .as_slice(),
+    ) {
+        Ok(record_id) => record_id,
+        Err(_) => unreachable!("EventRecordId has RecordId width"),
+    };
+    let policy_bytes = match resolver.resolve(policy_record_id) {
+        Some(bytes) => bytes,
+        None => {
+            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
+                ReviewAdmissionPolicyContextRouteError::PolicyPayloadUnavailable,
+            );
+        }
+    };
+    let prerequisites = match validate_review_admission_policy_context_prerequisites(
+        retained_journal,
+        policy_event_reference,
+        policy_bytes,
+        request_bytes,
+        result_bytes,
+        resolver,
+    ) {
+        Ok(prerequisites) => prerequisites,
+        Err(error) => {
+            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
+                ReviewAdmissionPolicyContextRouteError::PolicyContextPrerequisites(error),
+            );
+        }
+    };
+    let policy = match ReviewAdmissionPolicyRecord::decode_authoritative(policy_bytes) {
+        Ok(policy) => policy,
+        Err(_) => unreachable!("validated Policy prerequisites retain the strict Policy decode"),
+    };
+    let result = match ReviewResultRecord::decode_authoritative(result_bytes) {
+        Ok(result) => result,
+        Err(_) => {
+            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
+                ReviewAdmissionPolicyContextRouteError::PolicyContextPrerequisites(
+                    ReviewAdmissionPolicyContextPrerequisitesError::CommonRequestResult(
+                        ReviewAdmissionCommonRequestResultError::ResultDecode,
+                    ),
+                ),
+            );
+        }
+    };
+
+    let mut evaluator_results = Vec::new();
+    retain_review_admission_evaluator_result(
+        &mut evaluator_results,
+        1015,
+        evaluate_review_admission_gate_scope_1015(prerequisites)
+            == ReviewAdmissionGateScope1015Result::Pass,
+    );
+    for requirement in policy.review_requirements() {
+        retain_review_admission_evaluator_result(
+            &mut evaluator_results,
+            1001,
+            requirement.review_role_id() == request.review_role_id()
+                && requirement.review_scope_ref() == request.review_scope_ref()
+                && requirement.review_method_ref() == request.review_method_ref()
+                && requirement.required_checks_ref() == request.required_checks_ref(),
+        );
+    }
+    if !policy.required_method_statuses().is_empty() {
+        retain_review_admission_evaluator_result(
+            &mut evaluator_results,
+            1003,
+            policy
+                .required_method_statuses()
+                .contains(&result.method_status()),
+        );
+    }
+    if !policy.allowed_finding_states().is_empty() {
+        retain_review_admission_evaluator_result(
+            &mut evaluator_results,
+            1004,
+            policy
+                .allowed_finding_states()
+                .contains(&result.finding_state()),
+        );
+    }
+    if !policy.acceptable_anchor_relation_ids().is_empty() {
+        retain_review_admission_evaluator_result(
+            &mut evaluator_results,
+            1009,
+            policy
+                .acceptable_anchor_relation_ids()
+                .contains(&anchor_relation_id),
+        );
+    }
+    let result = if evaluator_results
+        .iter()
+        .all(|result| result.outcome() == ReviewAdmissionGateScope1015Result::Pass)
+    {
+        ReviewAdmissionCompletedPolicyResult::Satisfied
+    } else {
+        ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+    };
+    ReviewAdmissionPolicy46RouteOutcome::Completed(ReviewAdmissionPolicy46Completion {
+        result,
+        evaluator_results,
+    })
+}
+
 /// Exact structural facts obtained by resolving a minimal POLICY's declared gate Scope.
 ///
 /// This result establishes only strict local decoding and exact self-hash identity binding.

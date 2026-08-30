@@ -1,13 +1,15 @@
 use evidence_registry::{
-    compare_retained_journal_anchor_history, policy_evaluator_registry,
-    resolve_retained_review_package_anchor_input, route_retained_review_admission_policy_context,
-    route_retained_review_admission_section_82, route_review_admission_after_anchor_comparison,
+    compare_retained_journal_anchor_history, evaluate_retained_review_admission_policy_46,
+    policy_evaluator_registry, resolve_retained_review_package_anchor_input,
+    route_retained_review_admission_policy_context, route_retained_review_admission_section_82,
+    route_review_admission_after_anchor_comparison,
     validate_review_admission_common_request_result_fields,
     validate_review_package_anchor_transport, validate_review_request_recorded_binding,
     validate_review_result_recorded_binding, EventRecordId, ExactRecordByteResolver,
     GenesisJournalEntry, JournalAnchor, JournalAnchorHistoryComparison, JournalEntryHash,
     JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
     RetainedReviewPackageAnchorInputError, ReviewAdmissionCommonRequestResultError,
+    ReviewAdmissionCompletedPolicyResult, ReviewAdmissionPolicy46RouteOutcome,
     ReviewAdmissionPolicyContextRouteOutcome, ReviewAdmissionSection82PrerequisiteFailure,
     ReviewAdmissionSection82RoutingOutcome, ReviewPackageAnchorTransportError, ReviewRequestRecord,
     ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
@@ -1110,10 +1112,24 @@ fn retained_anchor_route_derives_authoritative_policy_from_the_retained_request(
         &result_bytes,
         &resolver,
     );
+    let policy_46_outcome = evaluate_retained_review_admission_policy_46(
+        &journal,
+        &request_reference,
+        &request_bytes,
+        &result_reference,
+        &result_bytes,
+        &resolver,
+    );
 
     assert!(matches!(
         outcome,
         ReviewAdmissionPolicyContextRouteOutcome::PolicyContextReady(prerequisites)
             if prerequisites.policy_record_id() == policy_id
+    ));
+    assert!(matches!(
+        policy_46_outcome,
+        ReviewAdmissionPolicy46RouteOutcome::Completed(completion)
+            if completion.result() == ReviewAdmissionCompletedPolicyResult::Satisfied
+                && completion.evaluator_results().iter().any(|result| result.evaluator_id() == 1015)
     ));
 }
