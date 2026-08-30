@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 mod authoritative_store;
 pub use authoritative_store::{
-    AcceptedAuthoritativeReviewAdmission, AuthoritativeFreezeCommittedBinding,
-    AuthoritativeFreezeCommittedBindingError, AuthoritativeRegistryStore,
-    AuthoritativeRegistryStoreOpenError, AuthoritativeReviewAdmissionAcceptanceError,
-    AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error,
+    evaluate_authoritative_review_admission_policy_46, AcceptedAuthoritativeReviewAdmission,
+    AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError,
+    AuthoritativeRegistryStore, AuthoritativeRegistryStoreOpenError,
+    AuthoritativeReviewAdmissionAcceptanceError, AuthoritativeReviewAdmissionSection82,
+    AuthoritativeReviewAdmissionSection82Error,
 };
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
@@ -4455,9 +4456,16 @@ pub fn route_retained_review_admission_policy_context(
 /// One retained individual result from an applicable REVIEW_ADMISSION Policy
 /// evaluator. This is not a completed Policy result or Lifecycle disposition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionIndividualEvaluatorOutcome {
+    Pass,
+    Fail,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReviewAdmissionIndividualEvaluatorResult {
     evaluator_id: u16,
-    outcome: ReviewAdmissionGateScope1015Result,
+    outcome: ReviewAdmissionIndividualEvaluatorOutcome,
 }
 
 impl ReviewAdmissionIndividualEvaluatorResult {
@@ -4467,7 +4475,7 @@ impl ReviewAdmissionIndividualEvaluatorResult {
     }
 
     /// The individual evaluator outcome retained for §46 composition.
-    pub fn outcome(&self) -> ReviewAdmissionGateScope1015Result {
+    pub fn outcome(&self) -> ReviewAdmissionIndividualEvaluatorOutcome {
         self.outcome
     }
 }

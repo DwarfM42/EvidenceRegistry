@@ -709,6 +709,9 @@ struct ReviewAdmissionFixtureOverrides {
     common_scope_bytes: Option<Vec<u8>>,
     request_operation_start: Option<JournalReference>,
     result_operation_start: Option<JournalReference>,
+    result_method_status: Option<u8>,
+    result_finding_state: Option<u8>,
+    policy_anchor_current_head_only: bool,
 }
 
 struct FutureReviewAdmissionPair {
@@ -785,6 +788,9 @@ fn authoritative_review_admission_fixture_with_overrides(
         common_scope_bytes,
         request_operation_start,
         result_operation_start,
+        result_method_status,
+        result_finding_state,
+        policy_anchor_current_head_only,
     } = overrides;
     let genesis = genesis();
     let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
@@ -844,6 +850,14 @@ fn authoritative_review_admission_fixture_with_overrides(
     );
     if let Some(policy_context_id) = policy_context_id {
         *policy_bytes.last_mut().unwrap() = policy_context_id;
+    }
+    if policy_anchor_current_head_only {
+        let anchor_requirement = policy_bytes
+            .windows(7)
+            .position(|window| window == [0x18, 0x18, 0xa1, 0x00, 0x82, 0x01, 0x02])
+            .unwrap();
+        policy_bytes[anchor_requirement + 4] = 0x81;
+        policy_bytes.remove(anchor_requirement + 6);
     }
     let policy_id = RecordId::try_from(Sha256::digest(&policy_bytes).as_slice()).unwrap();
     let policy_entry = policy_recorded_entry_at(
@@ -933,16 +947,27 @@ fn authoritative_review_admission_fixture_with_overrides(
         evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
         EventRecordId::try_from(request.record_id().as_bytes().as_slice()).unwrap(),
     );
-    let result_bytes = independently_construct_version_1_review_result_with_freeze_scope_and_start(
-        &request_reference,
-        &freeze_authority_reference,
-        common_scope_id,
-        *package_anchor.anchor_id().as_bytes(),
-        result_operation_start
-            .as_ref()
-            .unwrap_or(&request_reference),
-        manifest_id,
-    );
+    let mut result_bytes =
+        independently_construct_version_1_review_result_with_freeze_scope_and_start(
+            &request_reference,
+            &freeze_authority_reference,
+            common_scope_id,
+            *package_anchor.anchor_id().as_bytes(),
+            result_operation_start
+                .as_ref()
+                .unwrap_or(&request_reference),
+            manifest_id,
+        );
+    let status_fields = result_bytes
+        .windows(6)
+        .position(|window| window == [0x16, 0x01, 0x17, 0x01, 0x18, 0x18])
+        .unwrap();
+    if let Some(method_status) = result_method_status {
+        result_bytes[status_fields + 1] = method_status;
+    }
+    if let Some(finding_state) = result_finding_state {
+        result_bytes[status_fields + 3] = finding_state;
+    }
     let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
     let result_entry = match result_authorities {
         AuthorityDependencyMode::Missing => review_result_recorded_entry(
@@ -2441,6 +2466,178 @@ fn authoritative_store_derives_complete_section_82_without_caller_record_authori
         store.complete_authoritative_review_admission_section_82(substituted),
         Err(
             evidence_registry::AuthoritativeReviewAdmissionSection82Error::PresentedRequestMismatch
+        )
+    );
+}
+
+#[test]
+fn authoritative_policy_46_composes_one_1001_result_and_mandatory_1015() {
+    fn complete(
+        fixture: &AuthoritativeReviewAdmissionFixture,
+    ) -> evidence_registry::ReviewAdmissionPolicy46Completion {
+        let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(fixture);
+        let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+        let accepted = store
+            .accept_authoritative_review_admission(
+                fixture.request_reference.clone(),
+                &fixture.request_bytes,
+                fixture.result_reference.clone(),
+                &fixture.result_bytes,
+            )
+            .unwrap();
+        let section_82 = store
+            .complete_authoritative_review_admission_section_82(accepted)
+            .unwrap();
+        evidence_registry::evaluate_authoritative_review_admission_policy_46(section_82)
+    }
+
+    fn fixture_with(
+        overrides: ReviewAdmissionFixtureOverrides,
+    ) -> AuthoritativeReviewAdmissionFixture {
+        authoritative_review_admission_fixture_with_overrides(
+            true,
+            &[7],
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            overrides,
+        )
+    }
+
+    fn assert_only_failure(
+        completion: &evidence_registry::ReviewAdmissionPolicy46Completion,
+        evaluator_id: u16,
+    ) {
+        assert_eq!(
+            completion.result(),
+            evidence_registry::ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+        );
+        assert_eq!(
+            completion
+                .evaluator_results()
+                .iter()
+                .filter(|result| {
+                    result.outcome()
+                        == evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Fail
+                })
+                .map(|result| result.evaluator_id())
+                .collect::<Vec<_>>(),
+            vec![evaluator_id]
+        );
+    }
+
+    let alternate_selector_matches = complete(&authoritative_review_admission_fixture_with_roles(
+        true,
+        &[6, 7],
+    ));
+    assert_eq!(
+        alternate_selector_matches.result(),
+        evidence_registry::ReviewAdmissionCompletedPolicyResult::Satisfied
+    );
+    assert_eq!(
+        alternate_selector_matches
+            .evaluator_results()
+            .iter()
+            .map(|result| result.evaluator_id())
+            .collect::<Vec<_>>(),
+        vec![1001, 1003, 1004, 1009, 1015]
+    );
+    assert_eq!(
+        alternate_selector_matches
+            .evaluator_results()
+            .iter()
+            .filter(|result| result.evaluator_id() == 1001)
+            .count(),
+        1
+    );
+    assert_eq!(
+        alternate_selector_matches.evaluator_results()[0].outcome(),
+        evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Pass
+    );
+
+    let no_selector_matches = complete(&authoritative_review_admission_fixture_with_roles(
+        true,
+        &[6],
+    ));
+    assert_eq!(
+        no_selector_matches.result(),
+        evidence_registry::ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+    );
+    assert_eq!(
+        no_selector_matches.evaluator_results()[0].outcome(),
+        evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Fail
+    );
+
+    let gate_scope_mismatch = complete(&authoritative_review_admission_fixture(false));
+    assert_eq!(
+        gate_scope_mismatch.result(),
+        evidence_registry::ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+    );
+    assert_eq!(
+        gate_scope_mismatch
+            .evaluator_results()
+            .iter()
+            .find(|result| result.evaluator_id() == 1015)
+            .unwrap()
+            .outcome(),
+        evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Fail
+    );
+
+    assert_only_failure(
+        &complete(&fixture_with(ReviewAdmissionFixtureOverrides {
+            result_method_status: Some(2),
+            ..Default::default()
+        })),
+        1003,
+    );
+    assert_only_failure(
+        &complete(&fixture_with(ReviewAdmissionFixtureOverrides {
+            result_finding_state: Some(2),
+            ..Default::default()
+        })),
+        1004,
+    );
+    assert_only_failure(
+        &complete(&fixture_with(ReviewAdmissionFixtureOverrides {
+            policy_anchor_current_head_only: true,
+            ..Default::default()
+        })),
+        1009,
+    );
+}
+
+#[test]
+fn authoritative_policy_context_unsupported_never_becomes_a_completed_policy_result() {
+    let fixture = authoritative_review_admission_fixture_with_overrides(
+        true,
+        &[7],
+        IdentityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        ReviewAdmissionFixtureOverrides {
+            policy_context_id: Some(1),
+            ..Default::default()
+        },
+    );
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    let accepted = store
+        .accept_authoritative_review_admission(
+            fixture.request_reference,
+            &fixture.request_bytes,
+            fixture.result_reference,
+            &fixture.result_bytes,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.complete_authoritative_review_admission_section_82(accepted),
+        Err(
+            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
+                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported,
+                ),
+            ),
         )
     );
 }

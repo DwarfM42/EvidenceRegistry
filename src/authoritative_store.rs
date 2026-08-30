@@ -606,6 +606,113 @@ impl AuthoritativeRegistryStore {
     }
 }
 
+/// Executes every Policy requirement mechanically applicable to an authoritative §82 witness.
+///
+/// Evaluator 1001 emits exactly one result over the complete Review selector set: any exact
+/// selector match passes Admission compatibility. Evaluator 1015 remains a distinct mandatory
+/// profile-specific result. Individual results are retained and only this §46 composition step
+/// creates a completed Policy result.
+pub fn evaluate_authoritative_review_admission_policy_46(
+    section_82: AuthoritativeReviewAdmissionSection82,
+) -> ReviewAdmissionPolicy46Completion {
+    let policy = section_82.policy();
+    let request = section_82.request();
+    let result = section_82.result();
+    let mut evaluator_results = Vec::with_capacity(5);
+
+    let selector_matches = policy.review_requirements().iter().any(|requirement| {
+        requirement.review_role_id() == request.review_role_id()
+            && requirement.review_scope_ref() == request.review_scope_ref()
+            && requirement.review_method_ref() == request.review_method_ref()
+            && requirement.required_checks_ref() == request.required_checks_ref()
+    });
+    evaluator_results.push(ReviewAdmissionIndividualEvaluatorResult {
+        evaluator_id: 1001,
+        outcome: pass_or_fail(selector_matches),
+    });
+
+    if !policy.required_method_statuses().is_empty() {
+        evaluator_results.push(ReviewAdmissionIndividualEvaluatorResult {
+            evaluator_id: 1003,
+            outcome: pass_or_fail(
+                policy
+                    .required_method_statuses()
+                    .contains(&result.method_status()),
+            ),
+        });
+    }
+    if !policy.allowed_finding_states().is_empty() {
+        evaluator_results.push(ReviewAdmissionIndividualEvaluatorResult {
+            evaluator_id: 1004,
+            outcome: pass_or_fail(
+                policy
+                    .allowed_finding_states()
+                    .contains(&result.finding_state()),
+            ),
+        });
+    }
+    if !policy.acceptable_anchor_relation_ids().is_empty() {
+        evaluator_results.push(ReviewAdmissionIndividualEvaluatorResult {
+            evaluator_id: 1009,
+            outcome: pass_or_fail(
+                policy
+                    .acceptable_anchor_relation_ids()
+                    .contains(&anchor_relation_id(section_82.anchor_comparison())),
+            ),
+        });
+    }
+    evaluator_results.push(ReviewAdmissionIndividualEvaluatorResult {
+        evaluator_id: 1015,
+        outcome: match evaluate_review_admission_gate_scope_1015(
+            section_82.policy_context_prerequisites(),
+        ) {
+            ReviewAdmissionGateScope1015Result::Pass => {
+                ReviewAdmissionIndividualEvaluatorOutcome::Pass
+            }
+            ReviewAdmissionGateScope1015Result::Fail => {
+                ReviewAdmissionIndividualEvaluatorOutcome::Fail
+            }
+        },
+    });
+
+    let result = if evaluator_results
+        .iter()
+        .any(|result| result.outcome == ReviewAdmissionIndividualEvaluatorOutcome::Fail)
+    {
+        ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+    } else if evaluator_results
+        .iter()
+        .any(|result| result.outcome == ReviewAdmissionIndividualEvaluatorOutcome::Indeterminate)
+    {
+        ReviewAdmissionCompletedPolicyResult::GateIndeterminate
+    } else {
+        ReviewAdmissionCompletedPolicyResult::Satisfied
+    };
+    ReviewAdmissionPolicy46Completion {
+        result,
+        evaluator_results,
+    }
+}
+
+fn pass_or_fail(condition: bool) -> ReviewAdmissionIndividualEvaluatorOutcome {
+    if condition {
+        ReviewAdmissionIndividualEvaluatorOutcome::Pass
+    } else {
+        ReviewAdmissionIndividualEvaluatorOutcome::Fail
+    }
+}
+
+fn anchor_relation_id(comparison: JournalAnchorHistoryComparison) -> u64 {
+    match comparison {
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead => 1,
+        JournalAnchorHistoryComparison::AnchorIsValidAncestor => 2,
+        JournalAnchorHistoryComparison::JournalDivergence => 3,
+        JournalAnchorHistoryComparison::JournalHistoryBehindAnchor => 4,
+        JournalAnchorHistoryComparison::AnchorFromDifferentRegistry => 5,
+        JournalAnchorHistoryComparison::AnchorInvalid => 6,
+    }
+}
+
 impl ExactRecordByteResolver for AuthoritativeRegistryStore {
     fn resolve(&self, record_id: RecordId) -> Option<&[u8]> {
         self.records
