@@ -4,7 +4,8 @@ use evidence_registry::{
     ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
     FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
     FreezeReceiptRecord, IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference,
-    RecordId, RegistryId, ResolvedFreezeCommittedBindingError, RetainedJournal, StrictRecordFrame,
+    RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
+    ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -375,8 +376,7 @@ fn freeze_committed_bytes(
 }
 
 #[test]
-fn freeze_committed_binding_returns_explicit_authority_evidence_unavailable_after_exact_structural_binding(
-) {
+fn freeze_committed_binding_remains_structural_without_resolved_manifest_evidence() {
     let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
     let start_record = start_record(registry_id);
     let genesis = evidence_registry::GenesisJournalEntry::new(
@@ -794,7 +794,7 @@ impl ExactRecordByteResolver for FixtureRecordResolver {
 
 fn resolved_binding_result_for_manifest_bytes(
     manifest_bytes: Vec<u8>,
-) -> Result<FreezeCommittedBindingOutcome, ResolvedFreezeCommittedBindingError> {
+) -> Result<ResolvedFreezeCommittedBindingOutcome, ResolvedFreezeCommittedBindingError> {
     let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
     let start_record = start_record(registry_id);
     let genesis = evidence_registry::GenesisJournalEntry::new(
@@ -1054,7 +1054,7 @@ fn resolved_freeze_committed_binding_rejects_wrong_type_and_invalid_or_mismatche
 }
 
 #[test]
-fn resolved_freeze_committed_binding_returns_authority_evidence_unavailable_for_exact_records() {
+fn resolved_freeze_committed_binding_keeps_exact_structural_inputs_non_authoritative() {
     let (journal, committed_reference, start_record, receipt) = fixed_binding_fixture();
     let records = FixtureRecordResolver {
         records: vec![
@@ -1066,7 +1066,7 @@ fn resolved_freeze_committed_binding_returns_authority_evidence_unavailable_for_
 
     assert_eq!(
         validate_resolved_freeze_committed_binding(&journal, committed_reference, &records),
-        Ok(FreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
+        Ok(ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
     );
 }
 

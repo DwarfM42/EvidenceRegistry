@@ -5,7 +5,7 @@
 //! FreezeRoot tuple, rather than a generic identity envelope.
 
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
@@ -1326,15 +1326,17 @@ impl ResolvedJournalReference {
 ///     let _divergent_history = journal.clone();
 /// }
 /// ```
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct RetainedJournal {
     live_instance_identity: Arc<RetainedJournalInstanceIdentity>,
     registry_id: RegistryId,
     entries: Vec<RetainedJournalEntry>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct RetainedJournalInstanceIdentity;
+#[derive(Debug)]
+struct RetainedJournalInstanceIdentity {
+    outstanding_review_admissions: AtomicUsize,
+}
 
 /// Lifecycle facts reconstructed from every retained Entry, starting at GENESIS.
 ///
@@ -1490,7 +1492,9 @@ impl RetainedJournal {
     pub fn from_genesis(genesis: GenesisJournalEntry) -> Result<Self, RetainedJournalError> {
         let registry_id = genesis.registry_id;
         let mut journal = Self {
-            live_instance_identity: Arc::new(RetainedJournalInstanceIdentity),
+            live_instance_identity: Arc::new(RetainedJournalInstanceIdentity {
+                outstanding_review_admissions: AtomicUsize::new(0),
+            }),
             registry_id,
             entries: Vec::new(),
         };
@@ -2153,6 +2157,19 @@ impl RetainedJournal {
         self.entries
             .get(entry_index)
             .map(RetainedJournalEntry::identity_dependencies)
+            .ok_or(RetainedJournalError::MissingReference)
+    }
+
+    fn authority_dependencies_for_reference(
+        &self,
+        reference: &JournalReference,
+    ) -> Result<&[JournalReference], RetainedJournalError> {
+        self.resolve_reference(reference)?;
+        let entry_index = usize::try_from(reference.entry_index().value())
+            .map_err(|_| RetainedJournalError::MissingReference)?;
+        self.entries
+            .get(entry_index)
+            .map(RetainedJournalEntry::authority_dependencies)
             .ok_or(RetainedJournalError::MissingReference)
     }
 }
@@ -3998,33 +4015,6 @@ pub fn policy_evaluator_registry() -> &'static [PolicyEvaluatorRegistration] {
     &POLICY_EVALUATOR_REGISTRY
 }
 
-/// Exact §82 authority and chronology facts established before Policy evaluation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReviewAdmissionSection82AuthorityWitness {
-    request_record_id: RecordId,
-    result_record_id: RecordId,
-    freeze_authority_ref: JournalReference,
-    manifest_id: RecordId,
-}
-
-impl ReviewAdmissionSection82AuthorityWitness {
-    pub fn request_record_id(&self) -> RecordId {
-        self.request_record_id
-    }
-
-    pub fn result_record_id(&self) -> RecordId {
-        self.result_record_id
-    }
-
-    pub fn freeze_authority_ref(&self) -> &JournalReference {
-        &self.freeze_authority_ref
-    }
-
-    pub fn manifest_id(&self) -> RecordId {
-        self.manifest_id
-    }
-}
-
 /// A fail-closed §82 authority, identity, or chronology failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewAdmissionSection82AuthorityError {
@@ -4033,31 +4023,48 @@ pub enum ReviewAdmissionSection82AuthorityError {
     RequestDecode,
     ResultDecode,
     CommonRequestResult(ReviewAdmissionCommonRequestResultError),
+    RequestIdentityDependencies(RetainedJournalError),
+    RequestIdentityDependencySetMismatch,
+    RequestAuthorityDependencies(RetainedJournalError),
+    RequestAuthorityDependencySetMismatch,
+    ResultAuthorityDependencies(RetainedJournalError),
+    ResultAuthorityDependencySetMismatch,
+    PolicyAuthorityReference(RetainedJournalError),
+    PolicyAuthorityEventMismatch,
+    PolicyPayloadUnavailable,
+    PolicyDecode,
+    PolicyIdentityMismatch,
     RequestOperationStartReference(RetainedJournalError),
     RequestOperationStartNotStrictlyPrior,
     ResultOperationStartReference(RetainedJournalError),
     ResultOperationStartNotStrictlyPrior,
     FreezeBinding(ResolvedFreezeCommittedBindingError),
+    /// Exact retained topology and purported Record bytes do not establish
+    /// authoritative Journal/store provenance or an authoritative Record namespace.
+    FreezeAuthorityEvidenceUnavailable,
     FreezeReceiptPayloadUnavailable,
     FreezeReceiptDecode,
     FreezeReceiptIdentityMismatch,
     FreezeManifestMismatch,
 }
 
-/// Establishes the complete exact retained §82 input witness before §46.
+/// Checks every exact retained §82 input available through the current
+/// structural Journal and exact-byte resolver seams.
 ///
-/// Equal Request/Result fields alone are insufficient. This path also binds the
-/// exact Request and Result events, their chronology, the authoritative returned
-/// Anchor, and the retained FREEZE_COMMITTED Receipt/START/MANIFEST chain. It
-/// returns no Policy result or terminal direction.
-pub fn validate_review_admission_section_82_authority(
+/// Equal Request/Result fields alone are insufficient. This path also checks the
+/// exact Request and Result events, their chronology, the returned Anchor, and
+/// the retained FREEZE_COMMITTED Receipt/START/MANIFEST topology. The current
+/// inputs cannot prove authoritative Journal/store provenance or an authoritative
+/// Record namespace, so even a structurally complete chain ends with
+/// `FreezeAuthorityEvidenceUnavailable` before Policy evaluation.
+fn check_review_admission_section_82_authority_inputs(
     retained_journal: &RetainedJournal,
     request_event_reference: &JournalReference,
     request_bytes: &[u8],
     result_event_reference: &JournalReference,
     result_bytes: &[u8],
     resolver: &impl ExactRecordByteResolver,
-) -> Result<ReviewAdmissionSection82AuthorityWitness, ReviewAdmissionSection82AuthorityError> {
+) -> Result<(), ReviewAdmissionSection82AuthorityError> {
     let anchor = resolve_retained_review_package_anchor_input(
         retained_journal,
         request_event_reference,
@@ -4080,6 +4087,65 @@ pub fn validate_review_admission_section_82_authority(
     validate_review_admission_common_request_result_fields(request_bytes, result_bytes)
         .map_err(ReviewAdmissionSection82AuthorityError::CommonRequestResult)?;
 
+    let request_identity_dependencies = retained_journal
+        .identity_dependencies_for_reference(request_event_reference)
+        .map_err(ReviewAdmissionSection82AuthorityError::RequestIdentityDependencies)?;
+    let expected_request_identity_dependencies = [
+        IdentityDependency::RecordId(request.manifest_id()),
+        IdentityDependency::RecordId(request.required_checks_ref()),
+        IdentityDependency::RecordId(request.review_scope_ref()),
+        IdentityDependency::RecordId(request.review_method_ref()),
+        IdentityDependency::JournalAnchorId(request.review_package_anchor_id()),
+    ];
+    if request_identity_dependencies.len() != expected_request_identity_dependencies.len()
+        || expected_request_identity_dependencies
+            .iter()
+            .any(|dependency| !request_identity_dependencies.contains(dependency))
+    {
+        return Err(ReviewAdmissionSection82AuthorityError::RequestIdentityDependencySetMismatch);
+    }
+    let request_authority_dependencies = retained_journal
+        .authority_dependencies_for_reference(request_event_reference)
+        .map_err(ReviewAdmissionSection82AuthorityError::RequestAuthorityDependencies)?;
+    if request_authority_dependencies.len() != 2
+        || !request_authority_dependencies.contains(request.freeze_authority_ref())
+        || !request_authority_dependencies.contains(request.policy_authority_ref())
+    {
+        return Err(ReviewAdmissionSection82AuthorityError::RequestAuthorityDependencySetMismatch);
+    }
+    let result_authority_dependencies = retained_journal
+        .authority_dependencies_for_reference(result_event_reference)
+        .map_err(ReviewAdmissionSection82AuthorityError::ResultAuthorityDependencies)?;
+    if result_authority_dependencies != [request_event_reference.clone()] {
+        return Err(ReviewAdmissionSection82AuthorityError::ResultAuthorityDependencySetMismatch);
+    }
+
+    let policy_authority = retained_journal
+        .resolve_reference(request.policy_authority_ref())
+        .map_err(ReviewAdmissionSection82AuthorityError::PolicyAuthorityReference)?;
+    if policy_authority.event_type_id().value() != 400
+        || policy_authority
+            .event_type_id()
+            .required_record_type_id()
+            .value()
+            != 40
+        || policy_authority.lifecycle_object_kind() != LifecycleObjectKind::Policy
+        || policy_authority.lifecycle_object_id() != *policy_authority.event_record_id().as_bytes()
+    {
+        return Err(ReviewAdmissionSection82AuthorityError::PolicyAuthorityEventMismatch);
+    }
+    let policy_record_id =
+        RecordId::try_from(policy_authority.event_record_id().as_bytes().as_slice())
+            .expect("EventRecordId has RecordId width");
+    let policy_bytes = resolver
+        .resolve(policy_record_id)
+        .ok_or(ReviewAdmissionSection82AuthorityError::PolicyPayloadUnavailable)?;
+    let policy = ReviewAdmissionPolicyRecord::decode_authoritative(policy_bytes)
+        .map_err(|_| ReviewAdmissionSection82AuthorityError::PolicyDecode)?;
+    if policy.record_id() != policy_record_id {
+        return Err(ReviewAdmissionSection82AuthorityError::PolicyIdentityMismatch);
+    }
+
     let request_operation_start = retained_journal
         .resolve_reference(request.operation_start_journal_ref())
         .map_err(ReviewAdmissionSection82AuthorityError::RequestOperationStartReference)?;
@@ -4096,12 +4162,15 @@ pub fn validate_review_admission_section_82_authority(
         return Err(ReviewAdmissionSection82AuthorityError::ResultOperationStartNotStrictlyPrior);
     }
 
-    validate_resolved_freeze_committed_binding(
+    match validate_resolved_freeze_committed_binding(
         retained_journal,
         request.freeze_authority_ref().clone(),
         resolver,
     )
-    .map_err(ReviewAdmissionSection82AuthorityError::FreezeBinding)?;
+    .map_err(ReviewAdmissionSection82AuthorityError::FreezeBinding)?
+    {
+        ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable => {}
+    }
     let receipt_record_id = RecordId::try_from(
         request
             .freeze_authority_ref()
@@ -4122,12 +4191,7 @@ pub fn validate_review_admission_section_82_authority(
         return Err(ReviewAdmissionSection82AuthorityError::FreezeManifestMismatch);
     }
 
-    Ok(ReviewAdmissionSection82AuthorityWitness {
-        request_record_id: request.record_id(),
-        result_record_id: result.record_id(),
-        freeze_authority_ref: request.freeze_authority_ref().clone(),
-        manifest_id: request.manifest_id(),
-    })
+    Err(ReviewAdmissionSection82AuthorityError::FreezeAuthorityEvidenceUnavailable)
 }
 
 /// A §82 returned-Anchor comparison that prevents Policy evaluation from starting.
@@ -4139,6 +4203,10 @@ pub fn validate_review_admission_section_82_authority(
 pub enum ReviewAdmissionSection82PrerequisiteFailure {
     /// Full retained Request/Result/Freeze/Manifest authority input did not bind.
     AuthorityInput(ReviewAdmissionSection82AuthorityError),
+    /// The presented Request authority was recorded after this operation's immutable `L(A)`.
+    RequestAuthorityAfterOperationStart,
+    /// The presented Result authority was recorded after this operation's immutable `L(A)`.
+    ResultAuthorityAfterOperationStart,
     /// Strict Request/Result-to-retained-Anchor recovery did not establish a
     /// §82 returned-Anchor input. This is not an evaluator or Policy result.
     RetainedAnchorInput(RetainedReviewPackageAnchorInputError),
@@ -4258,7 +4326,7 @@ pub fn route_retained_review_admission_section_82(
     )
 }
 
-/// The bounded post-Anchor route into authoritative Review Admission Policy
+/// The bounded post-Anchor route into structural Review Admission Policy
 /// context prerequisites.
 ///
 /// `PolicyContextReady` establishes only the retained Request-selected Policy
@@ -4282,15 +4350,15 @@ pub enum ReviewAdmissionPolicyContextRouteError {
     PolicyContextPrerequisites(ReviewAdmissionPolicyContextPrerequisitesError),
 }
 
-/// Resolves the sole authoritative Review Admission Policy from the exact
-/// retained Review Request after, and only after, the retained-Journal Anchor
-/// prerequisite succeeds.
+/// Resolves the sole Request-selected Review Admission Policy bytes after, and
+/// only after, the retained-Journal Anchor prerequisite succeeds.
 ///
 /// The caller supplies no Policy reference or Policy bytes: both are derived
 /// from the strictly decoded Request's `policy_authority_ref`, retained Journal
 /// binding, and exact Record-id keyed byte resolver. This function deliberately
 /// stops before evaluator dispatch, §46 composition, Admission construction,
-/// terminal events, or publication.
+/// terminal events, or publication. These structural inputs do not prove that
+/// the selected Policy bytes came from an authoritative Record namespace.
 pub fn route_retained_review_admission_policy_context(
     retained_journal: &RetainedJournal,
     request_event_reference: &JournalReference,
@@ -4459,43 +4527,13 @@ pub fn derive_review_admission_section_83_disposition(
     }
 }
 
-fn review_admission_anchor_relation_id(comparison: JournalAnchorHistoryComparison) -> Option<u64> {
-    match comparison {
-        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead => Some(1),
-        JournalAnchorHistoryComparison::AnchorIsValidAncestor => Some(2),
-        JournalAnchorHistoryComparison::JournalDivergence
-        | JournalAnchorHistoryComparison::JournalHistoryBehindAnchor
-        | JournalAnchorHistoryComparison::AnchorFromDifferentRegistry
-        | JournalAnchorHistoryComparison::AnchorInvalid => None,
-    }
-}
-
-fn retain_review_admission_evaluator_result(
-    results: &mut Vec<ReviewAdmissionIndividualEvaluatorResult>,
-    evaluator_id: u16,
-    passed: bool,
-) {
-    results.push(ReviewAdmissionIndividualEvaluatorResult {
-        evaluator_id,
-        outcome: if passed {
-            ReviewAdmissionGateScope1015Result::Pass
-        } else {
-            ReviewAdmissionGateScope1015Result::Fail
-        },
-    });
-}
-
-/// Derives and evaluates every currently applicable frozen REVIEW_ADMISSION
-/// Policy requirement from retained Request/Result/Policy inputs only.
+/// Applies the retained §82 authority-input gate before any REVIEW_ADMISSION
+/// Policy evaluator can run.
 ///
-/// The function repeats the retained §82 routing order rather than accepting a
-/// caller-provided Scope, evaluator result collection, Policy completion,
-/// Lifecycle direction, or validation flag. Any unavailable or unsupported
-/// prerequisite remains pre-completion. Once that boundary is crossed, the
-/// exact Policy fields determine the applicable evaluators mechanically:
-/// Review selector (1001), optional Method status (1003), optional Finding
-/// state (1004), optional Anchor relation (1009), and profile-1 gate Scope
-/// binding (1015).
+/// The current structural Journal and exact-byte resolver cannot establish
+/// authoritative Journal/store provenance or an authoritative Record namespace.
+/// Therefore this route always returns a preterminal §82 authority-input outcome;
+/// it cannot construct evaluator results or a completed §46 result.
 pub fn evaluate_retained_review_admission_policy_46(
     retained_journal: &RetainedJournal,
     request_event_reference: &JournalReference,
@@ -4504,7 +4542,7 @@ pub fn evaluate_retained_review_admission_policy_46(
     result_bytes: &[u8],
     resolver: &impl ExactRecordByteResolver,
 ) -> ReviewAdmissionPolicy46RouteOutcome {
-    if let Err(error) = validate_review_admission_section_82_authority(
+    let authority_error = match check_review_admission_section_82_authority_inputs(
         retained_journal,
         request_event_reference,
         request_bytes,
@@ -4512,149 +4550,12 @@ pub fn evaluate_retained_review_admission_policy_46(
         result_bytes,
         resolver,
     ) {
-        return ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
-            ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(error),
-        );
-    }
-    let anchor = match resolve_retained_review_package_anchor_input(
-        retained_journal,
-        request_event_reference,
-        request_bytes,
-        result_event_reference,
-        result_bytes,
-    ) {
-        Ok(anchor) => anchor,
-        Err(error) => {
-            return ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
-                ReviewAdmissionSection82PrerequisiteFailure::RetainedAnchorInput(error),
-            );
-        }
+        Err(error) => error,
+        Ok(()) => ReviewAdmissionSection82AuthorityError::FreezeAuthorityEvidenceUnavailable,
     };
-    let anchor_comparison = compare_retained_journal_anchor_history(retained_journal, &anchor);
-    let anchor_relation_id = match review_admission_anchor_relation_id(anchor_comparison) {
-        Some(relation_id) => relation_id,
-        None => {
-            return ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
-                ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(
-                    anchor_comparison,
-                ),
-            );
-        }
-    };
-    let request = match ReviewRequestRecord::decode_authoritative(request_bytes) {
-        Ok(request) => request,
-        Err(_) => {
-            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
-                ReviewAdmissionPolicyContextRouteError::RequestDecode,
-            );
-        }
-    };
-    let policy_event_reference = request.policy_authority_ref();
-    let policy_record_id = match RecordId::try_from(
-        policy_event_reference
-            .event_record_id()
-            .as_bytes()
-            .as_slice(),
-    ) {
-        Ok(record_id) => record_id,
-        Err(_) => unreachable!("EventRecordId has RecordId width"),
-    };
-    let policy_bytes = match resolver.resolve(policy_record_id) {
-        Some(bytes) => bytes,
-        None => {
-            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
-                ReviewAdmissionPolicyContextRouteError::PolicyPayloadUnavailable,
-            );
-        }
-    };
-    let prerequisites = match validate_review_admission_policy_context_prerequisites(
-        retained_journal,
-        policy_event_reference,
-        policy_bytes,
-        request_bytes,
-        result_bytes,
-        resolver,
-    ) {
-        Ok(prerequisites) => prerequisites,
-        Err(error) => {
-            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
-                ReviewAdmissionPolicyContextRouteError::PolicyContextPrerequisites(error),
-            );
-        }
-    };
-    let policy = match ReviewAdmissionPolicyRecord::decode_authoritative(policy_bytes) {
-        Ok(policy) => policy,
-        Err(_) => unreachable!("validated Policy prerequisites retain the strict Policy decode"),
-    };
-    let result = match ReviewResultRecord::decode_authoritative(result_bytes) {
-        Ok(result) => result,
-        Err(_) => {
-            return ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(
-                ReviewAdmissionPolicyContextRouteError::PolicyContextPrerequisites(
-                    ReviewAdmissionPolicyContextPrerequisitesError::CommonRequestResult(
-                        ReviewAdmissionCommonRequestResultError::ResultDecode,
-                    ),
-                ),
-            );
-        }
-    };
-
-    let mut evaluator_results = Vec::new();
-    retain_review_admission_evaluator_result(
-        &mut evaluator_results,
-        1015,
-        evaluate_review_admission_gate_scope_1015(prerequisites)
-            == ReviewAdmissionGateScope1015Result::Pass,
-    );
-    retain_review_admission_evaluator_result(
-        &mut evaluator_results,
-        1001,
-        policy.review_requirements().iter().any(|requirement| {
-            requirement.review_role_id() == request.review_role_id()
-                && requirement.review_scope_ref() == request.review_scope_ref()
-                && requirement.review_method_ref() == request.review_method_ref()
-                && requirement.required_checks_ref() == request.required_checks_ref()
-        }),
-    );
-    if !policy.required_method_statuses().is_empty() {
-        retain_review_admission_evaluator_result(
-            &mut evaluator_results,
-            1003,
-            policy
-                .required_method_statuses()
-                .contains(&result.method_status()),
-        );
-    }
-    if !policy.allowed_finding_states().is_empty() {
-        retain_review_admission_evaluator_result(
-            &mut evaluator_results,
-            1004,
-            policy
-                .allowed_finding_states()
-                .contains(&result.finding_state()),
-        );
-    }
-    if !policy.acceptable_anchor_relation_ids().is_empty() {
-        retain_review_admission_evaluator_result(
-            &mut evaluator_results,
-            1009,
-            policy
-                .acceptable_anchor_relation_ids()
-                .contains(&anchor_relation_id),
-        );
-    }
-    let result = if evaluator_results
-        .iter()
-        .all(|result| result.outcome() == ReviewAdmissionGateScope1015Result::Pass)
-    {
-        ReviewAdmissionCompletedPolicyResult::Satisfied
-    } else {
-        ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
-    };
-    ReviewAdmissionPolicy46RouteOutcome::Completed(ReviewAdmissionPolicy46Completion {
-        result,
-        evaluator_results,
-    })
+    ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+        ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(authority_error),
+    )
 }
 
 /// Exact structural facts obtained by resolving a minimal POLICY's declared gate Scope.
@@ -5515,14 +5416,19 @@ impl ReviewAdmissionJournalEntry {
 }
 
 static NEXT_REVIEW_ADMISSION_ACCEPTANCE_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// Maximum combined opaque Request and Result bytes owned by one live acceptance.
+pub const REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES: usize = 1_048_576;
+/// Maximum unconsumed acceptance capabilities owned by one live Journal instance.
+pub const REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES: usize = 64;
 
-/// One live Review Admission command accepted at the exact Journal-head snapshot
-/// selected by Lifecycle v0.10.6 `L(A)`.
+/// One process-local Review Admission command accepted with a live retained-head
+/// snapshot intended for the Lifecycle v0.10.6 `L(A)` boundary.
 ///
 /// This value is intentionally non-cloneable and has no public constructor. Its
 /// private execution token is local process state, not a Record field, Journal
 /// field, caller identity, or persisted continuation. Request and Result payloads
 /// remain opaque bytes until this value is consumed by `complete_review_admission`.
+/// The token and snapshot do not establish authoritative Journal/store provenance.
 ///
 /// ```compile_fail
 /// use evidence_registry::AcceptedReviewAdmission;
@@ -5541,82 +5447,58 @@ pub struct AcceptedReviewAdmission {
 }
 
 impl AcceptedReviewAdmission {
-    /// The first and only authoritative head bound at this acceptance instance's `L(A)`.
+    /// The first and only live retained head captured for this acceptance instance.
     pub fn operation_start_journal_ref(&self) -> &JournalReference {
         &self.operation_start_journal_ref
+    }
+}
+
+impl Drop for AcceptedReviewAdmission {
+    fn drop(&mut self) {
+        let previous = self
+            .origin_journal_instance_identity
+            .outstanding_review_admissions
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
     }
 }
 
 /// The bounded failure to create a fresh live Review Admission acceptance instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewAdmissionAcceptanceError {
+    /// The combined opaque Request and Result payload exceeds the local bounded-input policy.
+    InputTooLarge,
+    /// This live Journal already owns the maximum number of unconsumed acceptances.
+    TooManyOutstandingAcceptances,
+    /// Owned opaque input storage could not be reserved without panicking this route.
+    InputAllocationFailed,
     /// The process-local opaque token space was exhausted without reuse.
     AcceptanceTokenExhausted,
 }
 
-/// One successfully published terminal Review Admission and the exact completed
-/// Policy result that selected its Lifecycle disposition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublishedReviewAdmission {
-    admission_record: ReviewAdmissionRecord,
-    terminal_reference: JournalReference,
-    terminal_authority_dependencies: Vec<JournalReference>,
-    policy_completion: ReviewAdmissionPolicy46Completion,
-}
-
-impl PublishedReviewAdmission {
-    /// The canonical terminal Record constructed from the retained authorities and `Hstart(A)`.
-    pub fn admission_record(&self) -> &ReviewAdmissionRecord {
-        &self.admission_record
-    }
-
-    /// The exact retained event-302 or event-303 reference after successful append.
-    pub fn terminal_reference(&self) -> &JournalReference {
-        &self.terminal_reference
-    }
-
-    /// The exact direct authorities encoded in the appended terminal Entry.
-    pub fn terminal_authority_dependencies(&self) -> &[JournalReference] {
-        &self.terminal_authority_dependencies
-    }
-
-    /// The completed §46 result, including mandatory evaluator 1015 participation.
-    pub fn policy_completion(&self) -> &ReviewAdmissionPolicy46Completion {
-        &self.policy_completion
-    }
-}
-
-/// The only authoritative runtime outcomes after consuming one live acceptance instance.
+/// The bounded local runtime outcomes after consuming one live acceptance instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReviewAdmissionRuntimeOutcome {
     /// §82 or a pre-§46 context obligation failed; no terminal bytes were appended.
     PreTerminal(ReviewAdmissionPolicy46RouteOutcome),
-    /// §46 completed, §83 selected a disposition, and its terminal event was appended.
-    Published(Box<PublishedReviewAdmission>),
 }
 
-/// A local construction or retained-Journal failure before terminal publication succeeds.
-///
-/// Every variant is returned before `append_strict_entry` mutates retained history,
-/// or from that append's own preflight-before-push path. The consumed acceptance
-/// instance ends and cannot be replayed or refreshed after an error.
+/// A local acceptance-capability failure before §82 input checking begins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewAdmissionRuntimeError {
     AcceptanceJournalMismatch,
-    AdmissionRecordConstruction,
-    TerminalEntryConstruction,
-    RetainedJournal(RetainedJournalError),
 }
 
 impl RetainedJournal {
     /// Atomically accepts one opaque Review Admission command and snapshots the
-    /// exact authoritative retained head at the same `L(A)` linearization point.
+    /// exact live retained head at one local linearization point.
     ///
     /// This method performs no Request, Result, Policy, or Scope decoding. Safe
     /// Rust aliasing requires exclusive access for any append, so observing the
     /// head through this shared borrow serializes every append wholly before or
     /// wholly after this action. No caller-provided operation-start reference is
-    /// accepted by this production API.
+    /// accepted by this API. This local operation does not itself establish the
+    /// authoritative Journal/store provenance required by `L(A)`.
     ///
     /// ```compile_fail
     /// use evidence_registry::{JournalReference, RetainedJournal};
@@ -5642,122 +5524,137 @@ impl RetainedJournal {
         result_event_reference: JournalReference,
         result_bytes: &[u8],
     ) -> Result<AcceptedReviewAdmission, ReviewAdmissionAcceptanceError> {
+        if request_bytes
+            .len()
+            .checked_add(result_bytes.len())
+            .is_none_or(|length| length > REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES)
+        {
+            return Err(ReviewAdmissionAcceptanceError::InputTooLarge);
+        }
+        self.live_instance_identity
+            .outstanding_review_admissions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES).then_some(current + 1)
+            })
+            .map_err(|_| ReviewAdmissionAcceptanceError::TooManyOutstandingAcceptances)?;
         let acceptance_token = NEXT_REVIEW_ADMISSION_ACCEPTANCE_TOKEN
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
-            .map_err(|_| ReviewAdmissionAcceptanceError::AcceptanceTokenExhausted)?;
+            .map_err(|_| {
+                self.live_instance_identity
+                    .outstanding_review_admissions
+                    .fetch_sub(1, Ordering::AcqRel);
+                ReviewAdmissionAcceptanceError::AcceptanceTokenExhausted
+            })?;
         let operation_start_journal_ref = self.current_head_reference();
+        let mut owned_request_bytes = Vec::new();
+        if owned_request_bytes
+            .try_reserve_exact(request_bytes.len())
+            .is_err()
+        {
+            self.live_instance_identity
+                .outstanding_review_admissions
+                .fetch_sub(1, Ordering::AcqRel);
+            return Err(ReviewAdmissionAcceptanceError::InputAllocationFailed);
+        }
+        owned_request_bytes.extend_from_slice(request_bytes);
+        let mut owned_result_bytes = Vec::new();
+        if owned_result_bytes
+            .try_reserve_exact(result_bytes.len())
+            .is_err()
+        {
+            self.live_instance_identity
+                .outstanding_review_admissions
+                .fetch_sub(1, Ordering::AcqRel);
+            return Err(ReviewAdmissionAcceptanceError::InputAllocationFailed);
+        }
+        owned_result_bytes.extend_from_slice(result_bytes);
         Ok(AcceptedReviewAdmission {
             acceptance_token,
             origin_journal_instance_identity: Arc::clone(&self.live_instance_identity),
             request_event_reference,
-            request_bytes: request_bytes.to_vec(),
+            request_bytes: owned_request_bytes,
             result_event_reference,
-            result_bytes: result_bytes.to_vec(),
+            result_bytes: owned_result_bytes,
             operation_start_journal_ref,
         })
     }
 
-    /// Consumes one live `L(A)` binding through §82, mandatory §46 evaluation,
-    /// §83 disposition selection, canonical Record/Event construction, and the
-    /// existing retained-Journal append preflight.
+    /// Consumes one live local acceptance through the §82 authority-input gate.
     ///
-    /// `Hstart(A)` is never refreshed. The terminal Entry index and predecessor
-    /// are derived separately from the then-current Journal head, so intervening
-    /// authoritative appends remain ordered between `Hstart(A)` and publication.
+    /// `Hstart(A)` is never refreshed. With the current structural Journal and
+    /// exact-byte resolver, complete §82 authority remains unavailable, so this
+    /// method returns a preterminal outcome before evaluators or terminal
+    /// publication. This runtime method exposes no terminal construction path
+    /// and accepts no caller-selected predecessor, storage-capability, or
+    /// environment identity.
+    ///
+    /// ```compile_fail
+    /// use evidence_registry::{
+    ///     AcceptedReviewAdmission, ExactRecordByteResolver, RecordId, RetainedJournal,
+    /// };
+    /// fn inject_terminal_observations(
+    ///     journal: &mut RetainedJournal,
+    ///     accepted: AcceptedReviewAdmission,
+    ///     resolver: &impl ExactRecordByteResolver,
+    ///     storage: RecordId,
+    ///     environment: RecordId,
+    /// ) {
+    ///     let _ = journal.complete_review_admission(
+    ///         accepted,
+    ///         resolver,
+    ///         storage,
+    ///         environment,
+    ///     );
+    /// }
+    /// ```
     pub fn complete_review_admission(
         &mut self,
         accepted: AcceptedReviewAdmission,
         resolver: &impl ExactRecordByteResolver,
-        storage_capability_class_id: RecordId,
-        environment_observation_id: RecordId,
     ) -> Result<ReviewAdmissionRuntimeOutcome, ReviewAdmissionRuntimeError> {
-        let AcceptedReviewAdmission {
-            acceptance_token,
-            origin_journal_instance_identity,
-            request_event_reference,
-            request_bytes,
-            result_event_reference,
-            result_bytes,
-            operation_start_journal_ref,
-        } = accepted;
-        let _consumed_acceptance_token = acceptance_token;
         if !Arc::ptr_eq(
-            &origin_journal_instance_identity,
+            &accepted.origin_journal_instance_identity,
             &self.live_instance_identity,
         ) {
             return Err(ReviewAdmissionRuntimeError::AcceptanceJournalMismatch);
         }
-
-        let policy_outcome = evaluate_retained_review_admission_policy_46(
+        if accepted.request_event_reference.entry_index().value()
+            > accepted.operation_start_journal_ref.entry_index().value()
+        {
+            return Ok(ReviewAdmissionRuntimeOutcome::PreTerminal(
+                ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                    ReviewAdmissionSection82PrerequisiteFailure::RequestAuthorityAfterOperationStart,
+                ),
+            ));
+        }
+        if accepted.result_event_reference.entry_index().value()
+            > accepted.operation_start_journal_ref.entry_index().value()
+        {
+            return Ok(ReviewAdmissionRuntimeOutcome::PreTerminal(
+                ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                    ReviewAdmissionSection82PrerequisiteFailure::ResultAuthorityAfterOperationStart,
+                ),
+            ));
+        }
+        let _consumed_acceptance_token = accepted.acceptance_token;
+        let authority_error = match check_review_admission_section_82_authority_inputs(
             self,
-            &request_event_reference,
-            &request_bytes,
-            &result_event_reference,
-            &result_bytes,
+            &accepted.request_event_reference,
+            &accepted.request_bytes,
+            &accepted.result_event_reference,
+            &accepted.result_bytes,
             resolver,
-        );
-        let disposition = derive_review_admission_section_83_disposition(&policy_outcome);
-        let (policy_completion, disposition_id) = match (policy_outcome, disposition) {
-            (
-                ReviewAdmissionPolicy46RouteOutcome::Completed(completion),
-                ReviewAdmissionSection83Disposition::ReviewAdmissionAccepted,
-            ) => (completion, 1),
-            (
-                ReviewAdmissionPolicy46RouteOutcome::Completed(completion),
-                ReviewAdmissionSection83Disposition::ReviewAdmissionRejected,
-            ) => (completion, 2),
-            (outcome, ReviewAdmissionSection83Disposition::PreTerminal) => {
-                return Ok(ReviewAdmissionRuntimeOutcome::PreTerminal(outcome));
-            }
-            _ => return Err(ReviewAdmissionRuntimeError::AdmissionRecordConstruction),
+        ) {
+            Err(error) => error,
+            Ok(()) => ReviewAdmissionSection82AuthorityError::FreezeAuthorityEvidenceUnavailable,
         };
-        let request = ReviewRequestRecord::decode_authoritative(&request_bytes)
-            .map_err(|_| ReviewAdmissionRuntimeError::AdmissionRecordConstruction)?;
-        let admission_record = ReviewAdmissionRecord::new(ReviewAdmissionRecordInput {
-            disposition_id,
-            review_request_ref: request_event_reference,
-            review_result_ref: result_event_reference,
-            policy_authority_ref: request.policy_authority_ref().clone(),
-            // Record Schema defines a required sorted semantic set but no
-            // supplementary token for these §83 mappings. Preserve the exact
-            // empty set rather than inventing an unfrozen reason-code meaning.
-            reason_codes: Vec::new(),
-            operation_start_journal_ref,
-        })
-        .map_err(|_| ReviewAdmissionRuntimeError::AdmissionRecordConstruction)?;
-
-        let publication_head = self.current_head_reference();
-        let entry_index = publication_head
-            .entry_index()
-            .value()
-            .checked_add(1)
-            .and_then(|value| JournalEntryIndex::try_from(value).ok())
-            .ok_or(ReviewAdmissionRuntimeError::RetainedJournal(
-                RetainedJournalError::UnexpectedEntryIndex,
-            ))?;
-        let terminal_entry = ReviewAdmissionJournalEntry::new(ReviewAdmissionJournalEntryInput {
-            registry_id: publication_head.registry_id(),
-            entry_index,
-            previous_entry_hash: publication_head.entry_hash(),
-            admission: admission_record.clone(),
-            storage_capability_class_id,
-            environment_observation_id,
-        })
-        .map_err(|_| ReviewAdmissionRuntimeError::TerminalEntryConstruction)?;
-        let terminal_authority_dependencies = terminal_entry.authority_dependencies().to_vec();
-        self.append_strict_entry(&terminal_entry.authoritative_cbor())
-            .map_err(ReviewAdmissionRuntimeError::RetainedJournal)?;
-        let terminal_reference = self.current_head_reference();
-        Ok(ReviewAdmissionRuntimeOutcome::Published(Box::new(
-            PublishedReviewAdmission {
-                admission_record,
-                terminal_reference,
-                terminal_authority_dependencies,
-                policy_completion,
-            },
-        )))
+        Ok(ReviewAdmissionRuntimeOutcome::PreTerminal(
+            ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(authority_error),
+            ),
+        ))
     }
 }
 
@@ -6388,7 +6285,7 @@ impl FreezeReceiptRecord {
 ///
 /// This input deliberately contains no Manifest, Policy, storage, custody, or
 /// external-authority evidence. Those absences prohibit a positive authority or
-/// admission outcome.
+/// Admission outcome from this structural layer alone.
 #[derive(Clone, Debug)]
 pub struct FreezeCommittedBindingInput<'a> {
     pub retained_journal: &'a RetainedJournal,
@@ -6406,10 +6303,14 @@ pub enum FreezeCommittedBindingError {
     CommittedEventMismatch,
     /// The terminal Journal event does not bind the exact Receipt Record identity.
     ReceiptRecordMismatch,
+    /// FREEZE_COMMITTED does not authority-depend on exactly its retained START.
+    CommittedAuthorityDependencySetMismatch,
     /// The Receipt's start reference does not resolve to the retained FREEZE_ATTEMPT_STARTED event.
     AttemptStartReferenceMismatch,
     /// The retained FREEZE_ATTEMPT_STARTED event does not bind the exact START Record identity.
     AttemptStartRecordMismatch,
+    /// FREEZE_ATTEMPT_STARTED carries an authority dependency forbidden by its event shape.
+    AttemptStartAuthorityDependencySetMismatch,
     /// The exact START Record root does not match the retained START Journal root.
     IntendedRootMismatch,
     /// The START, Receipt, and terminal event do not bind one Freeze Attempt identity.
@@ -6422,21 +6323,18 @@ pub enum FreezeCommittedBindingError {
     AttemptStartNotPrior,
 }
 
-/// The only non-error outcome of the bounded FREEZE_COMMITTED binding check.
-///
-/// This is explicitly non-success for authority and admission: all available
-/// structural bindings agree, but required authority evidence is unavailable.
+/// The only non-error outcome of the bounded FREEZE_COMMITTED structural check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FreezeCommittedBindingOutcome {
-    /// Structural bindings agree; no authority or admission verdict is available.
+    /// Structural bindings agree; the evidence required for authority is not in this input.
     AuthorityEvidenceUnavailable,
 }
 
 /// Validates only the exact retained Journal / START / Receipt bindings available
-/// to this runtime for FREEZE_COMMITTED.
+/// to this structural layer.
 ///
-/// A successful return never means authority, admission, durability, custody,
-/// policy satisfaction, or lifecycle truth has been established.
+/// A successful return is not an authority, Admission, Policy, external-custody,
+/// durability, or persistence verdict.
 pub fn validate_freeze_committed_binding(
     input: FreezeCommittedBindingInput<'_>,
 ) -> Result<FreezeCommittedBindingOutcome, FreezeCommittedBindingError> {
@@ -6484,10 +6382,24 @@ pub fn validate_freeze_committed_binding(
     {
         return Err(FreezeCommittedBindingError::AttemptStartReferenceMismatch);
     }
+    let committed_authority_dependencies = input
+        .retained_journal
+        .authority_dependencies_for_reference(&input.committed_event_reference)
+        .map_err(FreezeCommittedBindingError::RetainedReference)?;
+    if committed_authority_dependencies != [start_reference.clone()] {
+        return Err(FreezeCommittedBindingError::CommittedAuthorityDependencySetMismatch);
+    }
     if start.event_record_id().as_bytes()
         != input.freeze_attempt_start_record.record_id().as_bytes()
     {
         return Err(FreezeCommittedBindingError::AttemptStartRecordMismatch);
+    }
+    let start_authority_dependencies = input
+        .retained_journal
+        .authority_dependencies_for_reference(start_reference)
+        .map_err(FreezeCommittedBindingError::RetainedReference)?;
+    if !start_authority_dependencies.is_empty() {
+        return Err(FreezeCommittedBindingError::AttemptStartAuthorityDependencySetMismatch);
     }
     if start.freeze_attempt_intended_root_id()
         != Some(input.freeze_attempt_start_record.input.intended_root_id)
@@ -6551,21 +6463,34 @@ pub enum ResolvedFreezeCommittedBindingError {
     AttemptStartDecode,
     /// Strictly decoded START bytes did not hash to the retained START Entry's exact Record ID.
     AttemptStartIdentityMismatch,
-    /// Available exact inputs failed the existing bounded structural binding check.
+    /// Available exact inputs failed the bounded structural binding check.
     Binding(FreezeCommittedBindingError),
 }
 
-/// Resolves exact Record bytes only as required to compose one bounded FREEZE_COMMITTED check.
+/// The bounded result after resolving every exact START, Receipt,
+/// FREEZE_COMMITTED, and Manifest input available through the retained-history
+/// and exact-byte composition seams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedFreezeCommittedBindingOutcome {
+    /// Structural topology and exact local Record identity agree, but these
+    /// inputs do not prove authoritative Journal/store provenance or an
+    /// authoritative exact-ID Record namespace.
+    AuthorityEvidenceUnavailable,
+}
+
+/// Resolves exact Record bytes required to check the retained §55
+/// FREEZE_COMMITTED topology and local Record identity chain.
 ///
-/// A non-error result remains `AuthorityEvidenceUnavailable`: this adapter proves no
-/// authority, admission, Policy satisfaction, semantic-MANIFEST profile validity, custody,
-/// durability, lifecycle truth, persistence, or external trust. It establishes only
-/// exact local MANIFEST identity plus Receipt subject/profile continuity.
+/// A non-error result remains non-authoritative because `RetainedJournal` is an
+/// in-memory structural reconstruction and `ExactRecordByteResolver` returns
+/// only purported bytes. It proves no Freeze authority, Admission, Policy
+/// satisfaction, canonical-store provenance, external custody, persistence, or
+/// stronger durability than the supplied Receipt fields record.
 pub fn validate_resolved_freeze_committed_binding(
     retained_journal: &RetainedJournal,
     committed_event_reference: JournalReference,
     resolver: &impl ExactRecordByteResolver,
-) -> Result<FreezeCommittedBindingOutcome, ResolvedFreezeCommittedBindingError> {
+) -> Result<ResolvedFreezeCommittedBindingOutcome, ResolvedFreezeCommittedBindingError> {
     let committed = retained_journal
         .resolve_reference(&committed_event_reference)
         .map_err(ResolvedFreezeCommittedBindingError::RetainedReference)?;
@@ -6623,13 +6548,17 @@ pub fn validate_resolved_freeze_committed_binding(
         return Err(ResolvedFreezeCommittedBindingError::AttemptStartIdentityMismatch);
     }
 
-    validate_freeze_committed_binding(FreezeCommittedBindingInput {
+    match validate_freeze_committed_binding(FreezeCommittedBindingInput {
         retained_journal,
         committed_event_reference,
         freeze_attempt_start_record: &freeze_attempt_start_record,
         freeze_receipt_record: &receipt,
     })
-    .map_err(ResolvedFreezeCommittedBindingError::Binding)
+    .map_err(ResolvedFreezeCommittedBindingError::Binding)?
+    {
+        FreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable => {}
+    }
+    Ok(ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
 }
 
 /// Typed, Record-local fields for the frozen GENESIS Record schema.
