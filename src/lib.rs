@@ -4394,6 +4394,60 @@ impl ReviewResultRecord {
     }
 }
 
+/// Fail-closed §82 prerequisite failures while comparing the exact common
+/// Request/Result fields required before Policy evaluation.
+///
+/// These are not Policy evaluator results and must remain pre-terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionCommonRequestResultError {
+    /// The prospective Review Request fails strict local decoding.
+    RequestDecode,
+    /// The prospective Review Result fails strict local decoding.
+    ResultDecode,
+    /// Request and Result name different Freeze authority references.
+    FreezeAuthorityMismatch,
+    /// Request and Result name different Manifest identities.
+    ManifestMismatch,
+    /// Request and Result name different Review roles.
+    ReviewRoleMismatch,
+    /// Request and Result name different Review Scope identities.
+    ReviewScopeMismatch,
+    /// Request and Result name different Review Method identities.
+    ReviewMethodMismatch,
+}
+
+/// Validates the exact common Request/Result identity equalities which are
+/// explicit §82 prerequisites before Policy evaluation.
+///
+/// A successful result is only the common Review Scope identity. It does not
+/// establish retained-event binding, Request authority, Policy authority,
+/// satisfaction, Admission, a terminal disposition, or publication.
+pub fn validate_review_admission_common_request_result_fields(
+    request_bytes: &[u8],
+    result_bytes: &[u8],
+) -> Result<RecordId, ReviewAdmissionCommonRequestResultError> {
+    let request = ReviewRequestRecord::decode_authoritative(request_bytes)
+        .map_err(|_| ReviewAdmissionCommonRequestResultError::RequestDecode)?;
+    let result = ReviewResultRecord::decode_authoritative(result_bytes)
+        .map_err(|_| ReviewAdmissionCommonRequestResultError::ResultDecode)?;
+    if request.freeze_authority_ref() != result.freeze_authority_ref() {
+        return Err(ReviewAdmissionCommonRequestResultError::FreezeAuthorityMismatch);
+    }
+    if request.manifest_id() != result.manifest_id() {
+        return Err(ReviewAdmissionCommonRequestResultError::ManifestMismatch);
+    }
+    if request.review_role_id() != result.review_role_id() {
+        return Err(ReviewAdmissionCommonRequestResultError::ReviewRoleMismatch);
+    }
+    if request.review_scope_ref() != result.review_scope_ref() {
+        return Err(ReviewAdmissionCommonRequestResultError::ReviewScopeMismatch);
+    }
+    if request.review_method_ref() != result.review_method_ref() {
+        return Err(ReviewAdmissionCommonRequestResultError::ReviewMethodMismatch);
+    }
+    Ok(request.review_scope_ref())
+}
+
 /// A local failure while checking version-1 Review Package Anchor transport.
 ///
 /// These outcomes do not classify an evaluator result or any Admission result.

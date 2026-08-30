@@ -1,11 +1,13 @@
 use evidence_registry::{
     compare_retained_journal_anchor_history, policy_evaluator_registry,
     resolve_retained_review_package_anchor_input, route_retained_review_admission_section_82,
-    route_review_admission_after_anchor_comparison, validate_review_package_anchor_transport,
-    validate_review_request_recorded_binding, validate_review_result_recorded_binding,
-    EventRecordId, GenesisJournalEntry, JournalAnchor, JournalAnchorHistoryComparison,
-    JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
-    RetainedReviewPackageAnchorInputError, ReviewAdmissionSection82PrerequisiteFailure,
+    route_review_admission_after_anchor_comparison,
+    validate_review_admission_common_request_result_fields,
+    validate_review_package_anchor_transport, validate_review_request_recorded_binding,
+    validate_review_result_recorded_binding, EventRecordId, GenesisJournalEntry, JournalAnchor,
+    JournalAnchorHistoryComparison, JournalEntryHash, JournalEntryIndex, JournalReference,
+    RecordId, RegistryId, RetainedJournal, RetainedReviewPackageAnchorInputError,
+    ReviewAdmissionCommonRequestResultError, ReviewAdmissionSection82PrerequisiteFailure,
     ReviewAdmissionSection82RoutingOutcome, ReviewPackageAnchorTransportError, ReviewRequestRecord,
     ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
     StrictRecordFrame,
@@ -146,7 +148,18 @@ fn independently_construct_version_1_review_result_with_transport(
     request_authority: JournalReference,
     review_package_anchor_id: [u8; 32],
 ) -> Vec<u8> {
-    let freeze_authority = reference(2, 101, 0x40);
+    independently_construct_version_1_review_result_with_section_82_fields(
+        request_authority,
+        reference(2, 101, 0x40),
+        review_package_anchor_id,
+    )
+}
+
+fn independently_construct_version_1_review_result_with_section_82_fields(
+    request_authority: JournalReference,
+    freeze_authority: JournalReference,
+    review_package_anchor_id: [u8; 32],
+) -> Vec<u8> {
     let operation_start = reference(3, 300, 0x60);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
@@ -419,6 +432,38 @@ fn version_1_review_records_expose_exact_section_82_comparison_fields() {
     assert_eq!(result.review_method_ref().as_bytes(), &id(0xe0));
     assert_eq!(result.method_status(), 1);
     assert_eq!(result.finding_state(), 1);
+}
+
+#[test]
+fn section_82_common_request_result_fields_require_exact_identity_equality() {
+    let request_bytes = independently_construct_version_1_review_request();
+    let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
+    let result_bytes = independently_construct_version_1_review_result_with_section_82_fields(
+        reference(1, 300, 0x20),
+        request.freeze_authority_ref().clone(),
+        id(0x10),
+    );
+
+    assert_eq!(
+        validate_review_admission_common_request_result_fields(&request_bytes, &result_bytes)
+            .unwrap()
+            .as_bytes(),
+        &id(0xc0),
+    );
+
+    let mut scope_mismatched_result = result_bytes;
+    let scope_offset = scope_mismatched_result
+        .windows(4)
+        .position(|window| window == [0x14, 0x58, 0x20, 0xc0])
+        .unwrap();
+    scope_mismatched_result[scope_offset + 3] = 0xc1;
+    assert_eq!(
+        validate_review_admission_common_request_result_fields(
+            &request_bytes,
+            &scope_mismatched_result,
+        ),
+        Err(ReviewAdmissionCommonRequestResultError::ReviewScopeMismatch),
+    );
 }
 
 #[test]
