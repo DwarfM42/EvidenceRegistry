@@ -3519,6 +3519,89 @@ impl ReviewAdmissionPolicyRecord {
     }
 }
 
+/// Exact retained-history facts binding a REVIEW_ADMISSION Policy to its
+/// `POLICY_RECORDED` event and strictly-prior registration chronology.
+///
+/// This is only a structural retained-history binding. It does not establish
+/// Policy authority, §82 prerequisites, §46 completion, Policy satisfaction,
+/// Admission, an event 302/303, or publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionPolicyRecordedBinding {
+    policy_record_id: RecordId,
+    policy_event_reference: JournalReference,
+    operation_start_reference: JournalReference,
+}
+
+impl ReviewAdmissionPolicyRecordedBinding {
+    /// The exact self-hash identity of the bound Policy Record.
+    pub fn policy_record_id(&self) -> RecordId {
+        self.policy_record_id
+    }
+
+    /// The exact retained `POLICY_RECORDED` event reference.
+    pub fn policy_event_reference(&self) -> &JournalReference {
+        &self.policy_event_reference
+    }
+
+    /// The exact strictly-prior registration chronology reference.
+    pub fn operation_start_reference(&self) -> &JournalReference {
+        &self.operation_start_reference
+    }
+}
+
+/// Fail-closed outcomes while binding a REVIEW_ADMISSION Policy registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionPolicyRecordedBindingError {
+    /// The supplied Policy bytes fail the bounded Review-Admission Policy grammar.
+    PolicyDecode,
+    /// The supplied Policy event reference is absent or differs from retained history.
+    PolicyEventReference(RetainedJournalError),
+    /// The resolved retained entry is not a `POLICY_RECORDED` Policy event.
+    PolicyEventMismatch,
+    /// The Policy bytes and retained event Record identity differ.
+    PolicyEventRecordIdentityMismatch,
+    /// The declared registration chronology reference is absent or differs from retained history.
+    OperationStartReference(RetainedJournalError),
+    /// The declared registration chronology reference is not strictly prior to Policy recording.
+    OperationStartNotStrictlyPrior,
+}
+
+/// Structurally binds exact REVIEW_ADMISSION Policy bytes to one retained
+/// `POLICY_RECORDED` entry.
+pub fn validate_review_admission_policy_recorded_binding(
+    retained_journal: &RetainedJournal,
+    policy_event_reference: &JournalReference,
+    policy_bytes: &[u8],
+) -> Result<ReviewAdmissionPolicyRecordedBinding, ReviewAdmissionPolicyRecordedBindingError> {
+    let policy = ReviewAdmissionPolicyRecord::decode_authoritative(policy_bytes)
+        .map_err(|_| ReviewAdmissionPolicyRecordedBindingError::PolicyDecode)?;
+    let policy_event = retained_journal
+        .resolve_reference(policy_event_reference)
+        .map_err(ReviewAdmissionPolicyRecordedBindingError::PolicyEventReference)?;
+    if policy_event.event_type_id().value() != 400
+        || policy_event.event_type_id().required_record_type_id()
+            != RecordTypeId::try_from(40).expect("POLICY is assigned in Record Schema v0.3")
+        || policy_event.lifecycle_object_kind() != LifecycleObjectKind::Policy
+        || policy_event.lifecycle_object_id() != *policy_event.event_record_id().as_bytes()
+    {
+        return Err(ReviewAdmissionPolicyRecordedBindingError::PolicyEventMismatch);
+    }
+    if policy_event.event_record_id().as_bytes() != policy.record_id().as_bytes() {
+        return Err(ReviewAdmissionPolicyRecordedBindingError::PolicyEventRecordIdentityMismatch);
+    }
+    let operation_start = retained_journal
+        .resolve_reference(policy.operation_start_journal_ref())
+        .map_err(ReviewAdmissionPolicyRecordedBindingError::OperationStartReference)?;
+    if operation_start.entry_index().value() >= policy_event.entry_index().value() {
+        return Err(ReviewAdmissionPolicyRecordedBindingError::OperationStartNotStrictlyPrior);
+    }
+    Ok(ReviewAdmissionPolicyRecordedBinding {
+        policy_record_id: policy.record_id(),
+        policy_event_reference: policy_event_reference.clone(),
+        operation_start_reference: policy.operation_start_journal_ref().clone(),
+    })
+}
+
 /// Typed, Record-local fields decoded from a SCOPE Record.
 ///
 /// Profile IDs, versions, payload bytes, and labels are retained exactly as declared.
@@ -4076,6 +4159,41 @@ impl ReviewRequestRecord {
     pub fn review_package_anchor_binding_version(&self) -> u64 {
         self.review_package_anchor_binding_version
     }
+
+    /// The exact retained Freeze authority reference required for §82 comparison.
+    pub fn freeze_authority_ref(&self) -> &JournalReference {
+        &self.freeze_authority_ref
+    }
+
+    /// The exact Manifest identity required for §82 comparison.
+    pub fn manifest_id(&self) -> RecordId {
+        self.manifest_id
+    }
+
+    /// The exact Review role identifier required for §82 comparison.
+    pub fn review_role_id(&self) -> u64 {
+        self.review_role_id
+    }
+
+    /// The exact required CheckSet identity required for §82 comparison.
+    pub fn required_checks_ref(&self) -> RecordId {
+        self.required_checks_ref
+    }
+
+    /// The exact Policy authority reference named by this Review Request.
+    pub fn policy_authority_ref(&self) -> &JournalReference {
+        &self.policy_authority_ref
+    }
+
+    /// The exact Review Scope identity required for §82 comparison.
+    pub fn review_scope_ref(&self) -> RecordId {
+        self.review_scope_ref
+    }
+
+    /// The exact Review Method identity required for §82 comparison.
+    pub fn review_method_ref(&self) -> RecordId {
+        self.review_method_ref
+    }
 }
 
 /// The exact version-1 Review Package Anchor transport fields and predecessor
@@ -4238,6 +4356,41 @@ impl ReviewResultRecord {
     /// The required prospective carrier binding version, which is exactly one.
     pub fn review_package_anchor_binding_version(&self) -> u64 {
         self.review_package_anchor_binding_version
+    }
+
+    /// The exact retained Freeze authority reference required for §82 comparison.
+    pub fn freeze_authority_ref(&self) -> &JournalReference {
+        &self.freeze_authority_ref
+    }
+
+    /// The exact Manifest identity required for §82 comparison.
+    pub fn manifest_id(&self) -> RecordId {
+        self.manifest_id
+    }
+
+    /// The exact Review role identifier required for §82 comparison.
+    pub fn review_role_id(&self) -> u64 {
+        self.review_role_id
+    }
+
+    /// The exact Review Scope identity required for §82 comparison.
+    pub fn review_scope_ref(&self) -> RecordId {
+        self.review_scope_ref
+    }
+
+    /// The exact Review Method identity required for §82 comparison.
+    pub fn review_method_ref(&self) -> RecordId {
+        self.review_method_ref
+    }
+
+    /// The exact Method-status registry value carried by the Review Result.
+    pub fn method_status(&self) -> u64 {
+        self.method_status
+    }
+
+    /// The exact Finding-state registry value carried by the Review Result.
+    pub fn finding_state(&self) -> u64 {
+        self.finding_state
     }
 }
 

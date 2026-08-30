@@ -395,6 +395,33 @@ fn version_1_review_result_strictly_decodes_the_exact_anchor_transport_fields() 
 }
 
 #[test]
+fn version_1_review_records_expose_exact_section_82_comparison_fields() {
+    let request = ReviewRequestRecord::decode_authoritative(
+        &independently_construct_version_1_review_request(),
+    )
+    .unwrap();
+    let result = ReviewResultRecord::decode_authoritative(
+        &independently_construct_version_1_review_result(),
+    )
+    .unwrap();
+
+    assert_eq!(request.freeze_authority_ref().event_type_id().value(), 101);
+    assert_eq!(request.manifest_id().as_bytes(), &id(0x80));
+    assert_eq!(request.review_role_id(), 7);
+    assert_eq!(request.required_checks_ref().as_bytes(), &id(0xa0));
+    assert_eq!(request.policy_authority_ref().event_type_id().value(), 400);
+    assert_eq!(request.review_scope_ref().as_bytes(), &id(0xc0));
+    assert_eq!(request.review_method_ref().as_bytes(), &id(0xe0));
+    assert_eq!(result.freeze_authority_ref().event_type_id().value(), 101);
+    assert_eq!(result.manifest_id().as_bytes(), &id(0x80));
+    assert_eq!(result.review_role_id(), 7);
+    assert_eq!(result.review_scope_ref().as_bytes(), &id(0xc0));
+    assert_eq!(result.review_method_ref().as_bytes(), &id(0xe0));
+    assert_eq!(result.method_status(), 1);
+    assert_eq!(result.finding_state(), 1);
+}
+
+#[test]
 fn version_1_review_request_requires_its_exact_retained_recorded_event() {
     let genesis = genesis();
     let request_bytes = independently_construct_version_1_review_request();
