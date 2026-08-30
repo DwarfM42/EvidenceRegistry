@@ -1,13 +1,17 @@
 use evidence_registry::{
     derive_freeze_root, validate_freeze_committed_binding,
-    validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
-    ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
+    validate_resolved_freeze_committed_binding, AuthoritativeRegistryStore, EventRecordId,
+    EventTypeId, ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
     FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
-    FreezeReceiptRecord, IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference,
-    RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
-    ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
+    FreezeReceiptRecord, GenesisJournalEntry, GenesisRecord, GenesisRecordInput, IntendedRootId,
+    JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId,
+    ResolvedFreezeCommittedBindingError, ResolvedFreezeCommittedBindingOutcome, RetainedJournal,
+    StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const GENESIS_HASH_HEX: &str = "ae1919549c80a0c3708cce0485af881a5223fbcf80c6b27a2bbe602418dabd51";
 const START_RECORD_ID_HEX: &str =
@@ -84,6 +88,47 @@ fn hex_id(hex: &str) -> [u8; 32] {
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+static NEXT_AUTHORITATIVE_STORE_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+struct AuthoritativeStoreFixtureDir {
+    path: PathBuf,
+}
+
+impl AuthoritativeStoreFixtureDir {
+    fn new() -> Self {
+        let sequence = NEXT_AUTHORITATIVE_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "evidence-registry-authoritative-freeze-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(path.join("registry")).unwrap();
+        fs::create_dir(path.join("journal")).unwrap();
+        fs::create_dir(path.join("records")).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for AuthoritativeStoreFixtureDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn record_filename(record_id: RecordId) -> String {
+    let mut name = String::with_capacity(69);
+    for byte in record_id.as_bytes() {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").unwrap();
+    }
+    name.push_str(".cbor");
+    name
+}
+
+fn write_record(root: &Path, record_id: RecordId, bytes: &[u8]) {
+    fs::write(root.join("records").join(record_filename(record_id)), bytes).unwrap();
 }
 
 fn fixed_binding_fixture() -> (
@@ -1143,5 +1188,137 @@ fn freeze_committed_binding_rejects_start_record_root_that_disagrees_with_retain
             freeze_receipt_record: &receipt,
         }),
         Err(evidence_registry::FreezeCommittedBindingError::IntendedRootMismatch)
+    );
+}
+
+#[test]
+fn authoritative_store_derives_positive_freeze_authority_from_its_retained_namespaces() {
+    let fixture = AuthoritativeStoreFixtureDir::new();
+    let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
+    let storage_capability_class_id = RecordId::try_from(id(0x40).as_slice()).unwrap();
+    let environment_observation_id = RecordId::try_from(id(0x60).as_slice()).unwrap();
+    let genesis_record = GenesisRecord::new(GenesisRecordInput {
+        registry_id,
+        journal_format_version: 1,
+        record_identity_profile_id: 1,
+        storage_capability_class_id,
+        environment_observation_id,
+        created_by_tool_version: "authoritative-store-test".to_owned(),
+    })
+    .unwrap();
+    let genesis_entry = GenesisJournalEntry::new(
+        registry_id,
+        EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+        storage_capability_class_id,
+        environment_observation_id,
+    );
+    let start_record = start_record(registry_id);
+    let start_entry_bytes = freeze_start_bytes(genesis_entry.entry_hash(), &start_record);
+    let mut structural_journal = RetainedJournal::from_genesis(genesis_entry.clone()).unwrap();
+    structural_journal
+        .append_strict_entry(&start_entry_bytes)
+        .unwrap();
+    let start_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        structural_journal
+            .reconstruct_state()
+            .unwrap()
+            .journal_head_hash(),
+        EventTypeId::try_from(100_u64).unwrap(),
+        EventRecordId::try_from(start_record.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let manifest_bytes = hex_bytes(MANIFEST_RECORD_HEX);
+    let manifest_id = RecordId::try_from(sha256(&manifest_bytes).as_slice()).unwrap();
+    let receipt_bytes = receipt_bytes(&start_reference, manifest_id);
+    let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes).unwrap();
+    let committed_entry_bytes = freeze_committed_bytes(
+        start_reference.entry_hash(),
+        &start_reference,
+        receipt.record_id(),
+    );
+    structural_journal
+        .append_strict_entry(&committed_entry_bytes)
+        .unwrap();
+    let committed_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(2_u64).unwrap(),
+        structural_journal
+            .reconstruct_state()
+            .unwrap()
+            .journal_head_hash(),
+        EventTypeId::try_from(101_u64).unwrap(),
+        EventRecordId::try_from(receipt.record_id().as_bytes().as_slice()).unwrap(),
+    );
+
+    fs::write(
+        fixture.path.join("registry/genesis.cbor"),
+        genesis_record.authoritative_cbor(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("journal/00000000000000000000.cbor"),
+        genesis_entry.authoritative_cbor(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("journal/00000000000000000001.cbor"),
+        &start_entry_bytes,
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("journal/00000000000000000002.cbor"),
+        &committed_entry_bytes,
+    )
+    .unwrap();
+    write_record(
+        &fixture.path,
+        genesis_record.record_id(),
+        &genesis_record.authoritative_cbor(),
+    );
+    write_record(
+        &fixture.path,
+        start_record.record_id(),
+        &start_record.authoritative_cbor(),
+    );
+    write_record(&fixture.path, manifest_id, &manifest_bytes);
+    write_record(&fixture.path, receipt.record_id(), &receipt_bytes);
+
+    let store = AuthoritativeRegistryStore::open(&fixture.path).unwrap();
+    let witness = store
+        .validate_freeze_committed_authority(committed_reference.clone())
+        .unwrap();
+
+    assert_eq!(witness.registry_id(), registry_id);
+    assert_eq!(witness.committed_event_reference(), &committed_reference);
+    assert_eq!(witness.start_event_reference(), &start_reference);
+    assert_eq!(witness.receipt_record_id(), receipt.record_id());
+    assert_eq!(witness.manifest_record_id(), manifest_id);
+    assert_eq!(witness.start_record_id(), start_record.record_id());
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            store.retained_journal(),
+            committed_reference.clone(),
+            &store,
+        ),
+        Ok(ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
+    );
+
+    drop(store);
+    fs::remove_file(
+        fixture
+            .path
+            .join("records")
+            .join(record_filename(receipt.record_id())),
+    )
+    .unwrap();
+    let missing_receipt_store = AuthoritativeRegistryStore::open(&fixture.path).unwrap();
+    assert_eq!(
+        missing_receipt_store.validate_freeze_committed_authority(committed_reference),
+        Err(
+            evidence_registry::AuthoritativeFreezeCommittedBindingError::Structural(
+                ResolvedFreezeCommittedBindingError::ReceiptPayloadUnavailable,
+            ),
+        )
     );
 }

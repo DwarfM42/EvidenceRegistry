@@ -8,6 +8,12 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+mod authoritative_store;
+pub use authoritative_store::{
+    AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError,
+    AuthoritativeRegistryStore, AuthoritativeRegistryStoreOpenError,
+};
+
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
 const ID_LENGTH: usize = 32;
 
