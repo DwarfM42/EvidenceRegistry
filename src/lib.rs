@@ -5,6 +5,8 @@
 //! FreezeRoot tuple, rather than a generic identity envelope.
 
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
 const ID_LENGTH: usize = 32;
@@ -1314,12 +1316,25 @@ impl ResolvedJournalReference {
 ///
 /// It verifies exact Entry hashes, indexes, predecessor links, and reference
 /// field equality for entries it retains. This is structural/history validation,
-/// not an authority or admission decision.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// not an authority or admission decision. A live Journal is intentionally not
+/// cloneable: reconstructing the same retained bytes creates a distinct mutation
+/// domain and cannot inherit an outstanding live-operation capability.
+///
+/// ```compile_fail
+/// use evidence_registry::RetainedJournal;
+/// fn fork_live_history(journal: RetainedJournal) {
+///     let _divergent_history = journal.clone();
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct RetainedJournal {
+    live_instance_identity: Arc<RetainedJournalInstanceIdentity>,
     registry_id: RegistryId,
     entries: Vec<RetainedJournalEntry>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct RetainedJournalInstanceIdentity;
 
 /// Lifecycle facts reconstructed from every retained Entry, starting at GENESIS.
 ///
@@ -1475,6 +1490,7 @@ impl RetainedJournal {
     pub fn from_genesis(genesis: GenesisJournalEntry) -> Result<Self, RetainedJournalError> {
         let registry_id = genesis.registry_id;
         let mut journal = Self {
+            live_instance_identity: Arc::new(RetainedJournalInstanceIdentity),
             registry_id,
             entries: Vec::new(),
         };
@@ -3982,6 +3998,138 @@ pub fn policy_evaluator_registry() -> &'static [PolicyEvaluatorRegistration] {
     &POLICY_EVALUATOR_REGISTRY
 }
 
+/// Exact §82 authority and chronology facts established before Policy evaluation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionSection82AuthorityWitness {
+    request_record_id: RecordId,
+    result_record_id: RecordId,
+    freeze_authority_ref: JournalReference,
+    manifest_id: RecordId,
+}
+
+impl ReviewAdmissionSection82AuthorityWitness {
+    pub fn request_record_id(&self) -> RecordId {
+        self.request_record_id
+    }
+
+    pub fn result_record_id(&self) -> RecordId {
+        self.result_record_id
+    }
+
+    pub fn freeze_authority_ref(&self) -> &JournalReference {
+        &self.freeze_authority_ref
+    }
+
+    pub fn manifest_id(&self) -> RecordId {
+        self.manifest_id
+    }
+}
+
+/// A fail-closed §82 authority, identity, or chronology failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionSection82AuthorityError {
+    RetainedAnchorInput(RetainedReviewPackageAnchorInputError),
+    ReturnedAnchorComparison(JournalAnchorHistoryComparison),
+    RequestDecode,
+    ResultDecode,
+    CommonRequestResult(ReviewAdmissionCommonRequestResultError),
+    RequestOperationStartReference(RetainedJournalError),
+    RequestOperationStartNotStrictlyPrior,
+    ResultOperationStartReference(RetainedJournalError),
+    ResultOperationStartNotStrictlyPrior,
+    FreezeBinding(ResolvedFreezeCommittedBindingError),
+    FreezeReceiptPayloadUnavailable,
+    FreezeReceiptDecode,
+    FreezeReceiptIdentityMismatch,
+    FreezeManifestMismatch,
+}
+
+/// Establishes the complete exact retained §82 input witness before §46.
+///
+/// Equal Request/Result fields alone are insufficient. This path also binds the
+/// exact Request and Result events, their chronology, the authoritative returned
+/// Anchor, and the retained FREEZE_COMMITTED Receipt/START/MANIFEST chain. It
+/// returns no Policy result or terminal direction.
+pub fn validate_review_admission_section_82_authority(
+    retained_journal: &RetainedJournal,
+    request_event_reference: &JournalReference,
+    request_bytes: &[u8],
+    result_event_reference: &JournalReference,
+    result_bytes: &[u8],
+    resolver: &impl ExactRecordByteResolver,
+) -> Result<ReviewAdmissionSection82AuthorityWitness, ReviewAdmissionSection82AuthorityError> {
+    let anchor = resolve_retained_review_package_anchor_input(
+        retained_journal,
+        request_event_reference,
+        request_bytes,
+        result_event_reference,
+        result_bytes,
+    )
+    .map_err(ReviewAdmissionSection82AuthorityError::RetainedAnchorInput)?;
+    match compare_retained_journal_anchor_history(retained_journal, &anchor) {
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead
+        | JournalAnchorHistoryComparison::AnchorIsValidAncestor => {}
+        failure => {
+            return Err(ReviewAdmissionSection82AuthorityError::ReturnedAnchorComparison(failure));
+        }
+    }
+    let request = ReviewRequestRecord::decode_authoritative(request_bytes)
+        .map_err(|_| ReviewAdmissionSection82AuthorityError::RequestDecode)?;
+    let result = ReviewResultRecord::decode_authoritative(result_bytes)
+        .map_err(|_| ReviewAdmissionSection82AuthorityError::ResultDecode)?;
+    validate_review_admission_common_request_result_fields(request_bytes, result_bytes)
+        .map_err(ReviewAdmissionSection82AuthorityError::CommonRequestResult)?;
+
+    let request_operation_start = retained_journal
+        .resolve_reference(request.operation_start_journal_ref())
+        .map_err(ReviewAdmissionSection82AuthorityError::RequestOperationStartReference)?;
+    if request_operation_start.entry_index().value()
+        >= request_event_reference.entry_index().value()
+    {
+        return Err(ReviewAdmissionSection82AuthorityError::RequestOperationStartNotStrictlyPrior);
+    }
+    let result_operation_start = retained_journal
+        .resolve_reference(result.operation_start_journal_ref())
+        .map_err(ReviewAdmissionSection82AuthorityError::ResultOperationStartReference)?;
+    if result_operation_start.entry_index().value() >= result_event_reference.entry_index().value()
+    {
+        return Err(ReviewAdmissionSection82AuthorityError::ResultOperationStartNotStrictlyPrior);
+    }
+
+    validate_resolved_freeze_committed_binding(
+        retained_journal,
+        request.freeze_authority_ref().clone(),
+        resolver,
+    )
+    .map_err(ReviewAdmissionSection82AuthorityError::FreezeBinding)?;
+    let receipt_record_id = RecordId::try_from(
+        request
+            .freeze_authority_ref()
+            .event_record_id()
+            .as_bytes()
+            .as_slice(),
+    )
+    .expect("EventRecordId has RecordId width");
+    let receipt_bytes = resolver
+        .resolve(receipt_record_id)
+        .ok_or(ReviewAdmissionSection82AuthorityError::FreezeReceiptPayloadUnavailable)?;
+    let receipt = FreezeReceiptRecord::decode_authoritative(receipt_bytes)
+        .map_err(|_| ReviewAdmissionSection82AuthorityError::FreezeReceiptDecode)?;
+    if receipt.record_id() != receipt_record_id {
+        return Err(ReviewAdmissionSection82AuthorityError::FreezeReceiptIdentityMismatch);
+    }
+    if receipt.input().manifest_id != request.manifest_id() {
+        return Err(ReviewAdmissionSection82AuthorityError::FreezeManifestMismatch);
+    }
+
+    Ok(ReviewAdmissionSection82AuthorityWitness {
+        request_record_id: request.record_id(),
+        result_record_id: result.record_id(),
+        freeze_authority_ref: request.freeze_authority_ref().clone(),
+        manifest_id: request.manifest_id(),
+    })
+}
+
 /// A §82 returned-Anchor comparison that prevents Policy evaluation from starting.
 ///
 /// This is deliberately outside evaluator 1015 and §46's completed-result grammar.
@@ -3989,6 +4137,8 @@ pub fn policy_evaluator_registry() -> &'static [PolicyEvaluatorRegistration] {
 /// event, Journal publication, or generic Policy semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewAdmissionSection82PrerequisiteFailure {
+    /// Full retained Request/Result/Freeze/Manifest authority input did not bind.
+    AuthorityInput(ReviewAdmissionSection82AuthorityError),
     /// Strict Request/Result-to-retained-Anchor recovery did not establish a
     /// §82 returned-Anchor input. This is not an evaluator or Policy result.
     RetainedAnchorInput(RetainedReviewPackageAnchorInputError),
@@ -4047,9 +4197,8 @@ pub fn route_review_admission_after_anchor_comparison(
 /// use evidence_registry::derive_review_admission_lifecycle_outcome;
 /// ```
 ///
-/// ```compile_fail
-/// use evidence_registry::evaluate_review_admission_gate_scope_1015;
-/// ```
+/// The generic retained-history route itself returns none of those evaluator,
+/// §46, or terminal-direction surfaces.
 ///
 /// ```compile_fail
 /// use evidence_registry::PolicyCompositionResult;
@@ -4355,6 +4504,18 @@ pub fn evaluate_retained_review_admission_policy_46(
     result_bytes: &[u8],
     resolver: &impl ExactRecordByteResolver,
 ) -> ReviewAdmissionPolicy46RouteOutcome {
+    if let Err(error) = validate_review_admission_section_82_authority(
+        retained_journal,
+        request_event_reference,
+        request_bytes,
+        result_event_reference,
+        result_bytes,
+        resolver,
+    ) {
+        return ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+            ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(error),
+        );
+    }
     let anchor = match resolve_retained_review_package_anchor_input(
         retained_journal,
         request_event_reference,
@@ -4445,16 +4606,16 @@ pub fn evaluate_retained_review_admission_policy_46(
         evaluate_review_admission_gate_scope_1015(prerequisites)
             == ReviewAdmissionGateScope1015Result::Pass,
     );
-    for requirement in policy.review_requirements() {
-        retain_review_admission_evaluator_result(
-            &mut evaluator_results,
-            1001,
+    retain_review_admission_evaluator_result(
+        &mut evaluator_results,
+        1001,
+        policy.review_requirements().iter().any(|requirement| {
             requirement.review_role_id() == request.review_role_id()
                 && requirement.review_scope_ref() == request.review_scope_ref()
                 && requirement.review_method_ref() == request.review_method_ref()
-                && requirement.required_checks_ref() == request.required_checks_ref(),
-        );
-    }
+                && requirement.required_checks_ref() == request.required_checks_ref()
+        }),
+    );
     if !policy.required_method_statuses().is_empty() {
         retain_review_admission_evaluator_result(
             &mut evaluator_results,
@@ -4798,6 +4959,11 @@ impl ReviewRequestRecord {
     pub fn review_method_ref(&self) -> RecordId {
         self.review_method_ref
     }
+
+    /// The exact operation-start chronology reference carried by the Request.
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
 }
 
 /// The exact version-1 Review Package Anchor transport fields and predecessor
@@ -4985,6 +5151,16 @@ impl ReviewResultRecord {
     /// The exact Review Method identity required for §82 comparison.
     pub fn review_method_ref(&self) -> RecordId {
         self.review_method_ref
+    }
+
+    /// The exact retained Review Request authority selected by this Result.
+    pub fn review_request_authority_ref(&self) -> &JournalReference {
+        &self.review_request_authority_ref
+    }
+
+    /// The exact operation-start chronology reference carried by the Result.
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
     }
 
     /// The exact Method-status registry value carried by the Review Result.
@@ -5335,6 +5511,253 @@ impl ReviewAdmissionJournalEntry {
         bytes.push(0x0b);
         encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
         bytes
+    }
+}
+
+static NEXT_REVIEW_ADMISSION_ACCEPTANCE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// One live Review Admission command accepted at the exact Journal-head snapshot
+/// selected by Lifecycle v0.10.6 `L(A)`.
+///
+/// This value is intentionally non-cloneable and has no public constructor. Its
+/// private execution token is local process state, not a Record field, Journal
+/// field, caller identity, or persisted continuation. Request and Result payloads
+/// remain opaque bytes until this value is consumed by `complete_review_admission`.
+///
+/// ```compile_fail
+/// use evidence_registry::AcceptedReviewAdmission;
+/// fn duplicate(value: AcceptedReviewAdmission) {
+///     let _replay = value.clone();
+/// }
+/// ```
+pub struct AcceptedReviewAdmission {
+    acceptance_token: u64,
+    origin_journal_instance_identity: Arc<RetainedJournalInstanceIdentity>,
+    request_event_reference: JournalReference,
+    request_bytes: Vec<u8>,
+    result_event_reference: JournalReference,
+    result_bytes: Vec<u8>,
+    operation_start_journal_ref: JournalReference,
+}
+
+impl AcceptedReviewAdmission {
+    /// The first and only authoritative head bound at this acceptance instance's `L(A)`.
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+}
+
+/// The bounded failure to create a fresh live Review Admission acceptance instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionAcceptanceError {
+    /// The process-local opaque token space was exhausted without reuse.
+    AcceptanceTokenExhausted,
+}
+
+/// One successfully published terminal Review Admission and the exact completed
+/// Policy result that selected its Lifecycle disposition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedReviewAdmission {
+    admission_record: ReviewAdmissionRecord,
+    terminal_reference: JournalReference,
+    terminal_authority_dependencies: Vec<JournalReference>,
+    policy_completion: ReviewAdmissionPolicy46Completion,
+}
+
+impl PublishedReviewAdmission {
+    /// The canonical terminal Record constructed from the retained authorities and `Hstart(A)`.
+    pub fn admission_record(&self) -> &ReviewAdmissionRecord {
+        &self.admission_record
+    }
+
+    /// The exact retained event-302 or event-303 reference after successful append.
+    pub fn terminal_reference(&self) -> &JournalReference {
+        &self.terminal_reference
+    }
+
+    /// The exact direct authorities encoded in the appended terminal Entry.
+    pub fn terminal_authority_dependencies(&self) -> &[JournalReference] {
+        &self.terminal_authority_dependencies
+    }
+
+    /// The completed §46 result, including mandatory evaluator 1015 participation.
+    pub fn policy_completion(&self) -> &ReviewAdmissionPolicy46Completion {
+        &self.policy_completion
+    }
+}
+
+/// The only authoritative runtime outcomes after consuming one live acceptance instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionRuntimeOutcome {
+    /// §82 or a pre-§46 context obligation failed; no terminal bytes were appended.
+    PreTerminal(ReviewAdmissionPolicy46RouteOutcome),
+    /// §46 completed, §83 selected a disposition, and its terminal event was appended.
+    Published(Box<PublishedReviewAdmission>),
+}
+
+/// A local construction or retained-Journal failure before terminal publication succeeds.
+///
+/// Every variant is returned before `append_strict_entry` mutates retained history,
+/// or from that append's own preflight-before-push path. The consumed acceptance
+/// instance ends and cannot be replayed or refreshed after an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionRuntimeError {
+    AcceptanceJournalMismatch,
+    AdmissionRecordConstruction,
+    TerminalEntryConstruction,
+    RetainedJournal(RetainedJournalError),
+}
+
+impl RetainedJournal {
+    /// Atomically accepts one opaque Review Admission command and snapshots the
+    /// exact authoritative retained head at the same `L(A)` linearization point.
+    ///
+    /// This method performs no Request, Result, Policy, or Scope decoding. Safe
+    /// Rust aliasing requires exclusive access for any append, so observing the
+    /// head through this shared borrow serializes every append wholly before or
+    /// wholly after this action. No caller-provided operation-start reference is
+    /// accepted by this production API.
+    ///
+    /// ```compile_fail
+    /// use evidence_registry::{JournalReference, RetainedJournal};
+    /// fn inject_head(
+    ///     journal: &RetainedJournal,
+    ///     request: JournalReference,
+    ///     result: JournalReference,
+    ///     caller_head: JournalReference,
+    /// ) {
+    ///     let _ = journal.accept_review_admission(
+    ///         request,
+    ///         &[],
+    ///         result,
+    ///         &[],
+    ///         caller_head,
+    ///     );
+    /// }
+    /// ```
+    pub fn accept_review_admission(
+        &self,
+        request_event_reference: JournalReference,
+        request_bytes: &[u8],
+        result_event_reference: JournalReference,
+        result_bytes: &[u8],
+    ) -> Result<AcceptedReviewAdmission, ReviewAdmissionAcceptanceError> {
+        let acceptance_token = NEXT_REVIEW_ADMISSION_ACCEPTANCE_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| ReviewAdmissionAcceptanceError::AcceptanceTokenExhausted)?;
+        let operation_start_journal_ref = self.current_head_reference();
+        Ok(AcceptedReviewAdmission {
+            acceptance_token,
+            origin_journal_instance_identity: Arc::clone(&self.live_instance_identity),
+            request_event_reference,
+            request_bytes: request_bytes.to_vec(),
+            result_event_reference,
+            result_bytes: result_bytes.to_vec(),
+            operation_start_journal_ref,
+        })
+    }
+
+    /// Consumes one live `L(A)` binding through §82, mandatory §46 evaluation,
+    /// §83 disposition selection, canonical Record/Event construction, and the
+    /// existing retained-Journal append preflight.
+    ///
+    /// `Hstart(A)` is never refreshed. The terminal Entry index and predecessor
+    /// are derived separately from the then-current Journal head, so intervening
+    /// authoritative appends remain ordered between `Hstart(A)` and publication.
+    pub fn complete_review_admission(
+        &mut self,
+        accepted: AcceptedReviewAdmission,
+        resolver: &impl ExactRecordByteResolver,
+        storage_capability_class_id: RecordId,
+        environment_observation_id: RecordId,
+    ) -> Result<ReviewAdmissionRuntimeOutcome, ReviewAdmissionRuntimeError> {
+        let AcceptedReviewAdmission {
+            acceptance_token,
+            origin_journal_instance_identity,
+            request_event_reference,
+            request_bytes,
+            result_event_reference,
+            result_bytes,
+            operation_start_journal_ref,
+        } = accepted;
+        let _consumed_acceptance_token = acceptance_token;
+        if !Arc::ptr_eq(
+            &origin_journal_instance_identity,
+            &self.live_instance_identity,
+        ) {
+            return Err(ReviewAdmissionRuntimeError::AcceptanceJournalMismatch);
+        }
+
+        let policy_outcome = evaluate_retained_review_admission_policy_46(
+            self,
+            &request_event_reference,
+            &request_bytes,
+            &result_event_reference,
+            &result_bytes,
+            resolver,
+        );
+        let disposition = derive_review_admission_section_83_disposition(&policy_outcome);
+        let (policy_completion, disposition_id) = match (policy_outcome, disposition) {
+            (
+                ReviewAdmissionPolicy46RouteOutcome::Completed(completion),
+                ReviewAdmissionSection83Disposition::ReviewAdmissionAccepted,
+            ) => (completion, 1),
+            (
+                ReviewAdmissionPolicy46RouteOutcome::Completed(completion),
+                ReviewAdmissionSection83Disposition::ReviewAdmissionRejected,
+            ) => (completion, 2),
+            (outcome, ReviewAdmissionSection83Disposition::PreTerminal) => {
+                return Ok(ReviewAdmissionRuntimeOutcome::PreTerminal(outcome));
+            }
+            _ => return Err(ReviewAdmissionRuntimeError::AdmissionRecordConstruction),
+        };
+        let request = ReviewRequestRecord::decode_authoritative(&request_bytes)
+            .map_err(|_| ReviewAdmissionRuntimeError::AdmissionRecordConstruction)?;
+        let admission_record = ReviewAdmissionRecord::new(ReviewAdmissionRecordInput {
+            disposition_id,
+            review_request_ref: request_event_reference,
+            review_result_ref: result_event_reference,
+            policy_authority_ref: request.policy_authority_ref().clone(),
+            // Record Schema defines a required sorted semantic set but no
+            // supplementary token for these §83 mappings. Preserve the exact
+            // empty set rather than inventing an unfrozen reason-code meaning.
+            reason_codes: Vec::new(),
+            operation_start_journal_ref,
+        })
+        .map_err(|_| ReviewAdmissionRuntimeError::AdmissionRecordConstruction)?;
+
+        let publication_head = self.current_head_reference();
+        let entry_index = publication_head
+            .entry_index()
+            .value()
+            .checked_add(1)
+            .and_then(|value| JournalEntryIndex::try_from(value).ok())
+            .ok_or(ReviewAdmissionRuntimeError::RetainedJournal(
+                RetainedJournalError::UnexpectedEntryIndex,
+            ))?;
+        let terminal_entry = ReviewAdmissionJournalEntry::new(ReviewAdmissionJournalEntryInput {
+            registry_id: publication_head.registry_id(),
+            entry_index,
+            previous_entry_hash: publication_head.entry_hash(),
+            admission: admission_record.clone(),
+            storage_capability_class_id,
+            environment_observation_id,
+        })
+        .map_err(|_| ReviewAdmissionRuntimeError::TerminalEntryConstruction)?;
+        let terminal_authority_dependencies = terminal_entry.authority_dependencies().to_vec();
+        self.append_strict_entry(&terminal_entry.authoritative_cbor())
+            .map_err(ReviewAdmissionRuntimeError::RetainedJournal)?;
+        let terminal_reference = self.current_head_reference();
+        Ok(ReviewAdmissionRuntimeOutcome::Published(Box::new(
+            PublishedReviewAdmission {
+                admission_record,
+                terminal_reference,
+                terminal_authority_dependencies,
+                policy_completion,
+            },
+        )))
     }
 }
 
