@@ -34,6 +34,143 @@ pub struct AuthoritativeRegistryStore {
     root: PathBuf,
     retained_journal: RetainedJournal,
     records: Vec<(RecordId, Vec<u8>)>,
+    live_instance_identity: Arc<AuthoritativeRegistryStoreInstanceIdentity>,
+}
+
+#[derive(Debug)]
+struct AuthoritativeRegistryStoreInstanceIdentity {
+    outstanding_review_admissions: AtomicUsize,
+}
+
+static NEXT_AUTHORITATIVE_REVIEW_ADMISSION_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// One bounded, process-local authoritative Review Admission acceptance.
+///
+/// The exact operation-start head is captured from the opened store before any Request, Result,
+/// or Policy decode. The value is non-cloneable and has no public constructor.
+pub struct AcceptedAuthoritativeReviewAdmission {
+    acceptance_token: u64,
+    origin_store_instance_identity: Arc<AuthoritativeRegistryStoreInstanceIdentity>,
+    request_event_reference: JournalReference,
+    request_bytes: Vec<u8>,
+    result_event_reference: JournalReference,
+    result_bytes: Vec<u8>,
+    operation_start_journal_ref: JournalReference,
+}
+
+impl AcceptedAuthoritativeReviewAdmission {
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+}
+
+impl Drop for AcceptedAuthoritativeReviewAdmission {
+    fn drop(&mut self) {
+        let previous = self
+            .origin_store_instance_identity
+            .outstanding_review_admissions
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+/// A fail-closed failure before an authoritative acceptance reaches `L(A)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoritativeReviewAdmissionAcceptanceError {
+    Input(ReviewAdmissionAcceptanceError),
+    Store(AuthoritativeRegistryStoreOpenError),
+    RegistryIdentityChanged,
+}
+
+/// A fail-closed authoritative §82 outcome before Policy evaluator dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoritativeReviewAdmissionSection82Error {
+    AcceptanceStoreMismatch,
+    Store(AuthoritativeRegistryStoreOpenError),
+    RegistryIdentityChanged,
+    RequestPayloadUnavailable,
+    ResultPayloadUnavailable,
+    PresentedRequestMismatch,
+    PresentedResultMismatch,
+    Structural(ReviewAdmissionSection82AuthorityError),
+    OperationStartReference(RetainedJournalError),
+    RequestAuthorityAfterOperationStart,
+    ResultAuthorityAfterOperationStart,
+    FreezeAuthority(AuthoritativeFreezeCommittedBindingError),
+}
+
+/// Every authoritative input established at the successful §82 boundary.
+///
+/// The witness is derived from exact retained store bytes and has no public constructor. It is a
+/// Policy-route input only: it is not a completed §46 result, §83 disposition, Admission Record,
+/// terminal event, or publication effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoritativeReviewAdmissionSection82 {
+    operation_start_journal_ref: JournalReference,
+    request_event_reference: JournalReference,
+    result_event_reference: JournalReference,
+    request: ReviewRequestRecord,
+    result: ReviewResultRecord,
+    policy: ReviewAdmissionPolicyRecord,
+    policy_bytes: Vec<u8>,
+    returned_anchor: JournalAnchor,
+    anchor_comparison: JournalAnchorHistoryComparison,
+    policy_context_prerequisites: ReviewAdmissionPolicyContextPrerequisites,
+    freeze_authority: AuthoritativeFreezeCommittedBinding,
+}
+
+impl AuthoritativeReviewAdmissionSection82 {
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+
+    pub fn request_event_reference(&self) -> &JournalReference {
+        &self.request_event_reference
+    }
+
+    pub fn result_event_reference(&self) -> &JournalReference {
+        &self.result_event_reference
+    }
+
+    pub fn policy_authority_ref(&self) -> &JournalReference {
+        self.request.policy_authority_ref()
+    }
+
+    pub fn common_review_scope_ref(&self) -> RecordId {
+        self.policy_context_prerequisites.common_review_scope_ref()
+    }
+
+    pub fn freeze_authority(&self) -> &AuthoritativeFreezeCommittedBinding {
+        &self.freeze_authority
+    }
+
+    pub fn request(&self) -> &ReviewRequestRecord {
+        &self.request
+    }
+
+    pub fn result(&self) -> &ReviewResultRecord {
+        &self.result
+    }
+
+    pub fn policy(&self) -> &ReviewAdmissionPolicyRecord {
+        &self.policy
+    }
+
+    pub fn policy_bytes(&self) -> &[u8] {
+        &self.policy_bytes
+    }
+
+    pub fn returned_anchor(&self) -> &JournalAnchor {
+        &self.returned_anchor
+    }
+
+    pub fn anchor_comparison(&self) -> JournalAnchorHistoryComparison {
+        self.anchor_comparison
+    }
+
+    pub fn policy_context_prerequisites(&self) -> ReviewAdmissionPolicyContextPrerequisites {
+        self.policy_context_prerequisites
+    }
 }
 
 /// A positive Freeze-authority witness derived only from one opened authoritative Registry store.
@@ -183,6 +320,9 @@ impl AuthoritativeRegistryStore {
             root,
             retained_journal,
             records,
+            live_instance_identity: Arc::new(AuthoritativeRegistryStoreInstanceIdentity {
+                outstanding_review_admissions: AtomicUsize::new(0),
+            }),
         })
     }
 
@@ -244,6 +384,225 @@ impl AuthoritativeRegistryStore {
             subject_id: receipt.input().subject_id,
             policy_record_id: receipt.input().policy_record_id,
         })
+    }
+
+    /// Accepts one bounded opaque Request/Result presentation and binds the exact authoritative
+    /// store head at the same successful acceptance boundary.
+    pub fn accept_authoritative_review_admission(
+        &mut self,
+        request_event_reference: JournalReference,
+        request_bytes: &[u8],
+        result_event_reference: JournalReference,
+        result_bytes: &[u8],
+    ) -> Result<AcceptedAuthoritativeReviewAdmission, AuthoritativeReviewAdmissionAcceptanceError>
+    {
+        if request_bytes
+            .len()
+            .checked_add(result_bytes.len())
+            .is_none_or(|length| length > REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES)
+        {
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::Input(
+                ReviewAdmissionAcceptanceError::InputTooLarge,
+            ));
+        }
+        self.live_instance_identity
+            .outstanding_review_admissions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES).then_some(current + 1)
+            })
+            .map_err(|_| {
+                AuthoritativeReviewAdmissionAcceptanceError::Input(
+                    ReviewAdmissionAcceptanceError::TooManyOutstandingAcceptances,
+                )
+            })?;
+        let acceptance_token = NEXT_AUTHORITATIVE_REVIEW_ADMISSION_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                self.release_authoritative_acceptance_capacity();
+                AuthoritativeReviewAdmissionAcceptanceError::Input(
+                    ReviewAdmissionAcceptanceError::AcceptanceTokenExhausted,
+                )
+            })?;
+
+        let mut owned_request_bytes = Vec::new();
+        if owned_request_bytes
+            .try_reserve_exact(request_bytes.len())
+            .is_err()
+        {
+            self.release_authoritative_acceptance_capacity();
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::Input(
+                ReviewAdmissionAcceptanceError::InputAllocationFailed,
+            ));
+        }
+        owned_request_bytes.extend_from_slice(request_bytes);
+        let mut owned_result_bytes = Vec::new();
+        if owned_result_bytes
+            .try_reserve_exact(result_bytes.len())
+            .is_err()
+        {
+            self.release_authoritative_acceptance_capacity();
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::Input(
+                ReviewAdmissionAcceptanceError::InputAllocationFailed,
+            ));
+        }
+        owned_result_bytes.extend_from_slice(result_bytes);
+
+        if let Err(error) = self.reload_authoritative_namespaces() {
+            self.release_authoritative_acceptance_capacity();
+            return Err(error);
+        }
+        let operation_start_journal_ref = self.retained_journal.current_head_reference();
+        Ok(AcceptedAuthoritativeReviewAdmission {
+            acceptance_token,
+            origin_store_instance_identity: Arc::clone(&self.live_instance_identity),
+            request_event_reference,
+            request_bytes: owned_request_bytes,
+            result_event_reference,
+            result_bytes: owned_result_bytes,
+            operation_start_journal_ref,
+        })
+    }
+
+    /// Consumes one authoritative acceptance through the complete §82 authority boundary.
+    pub fn complete_authoritative_review_admission_section_82(
+        &mut self,
+        accepted: AcceptedAuthoritativeReviewAdmission,
+    ) -> Result<AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error>
+    {
+        if !Arc::ptr_eq(
+            &accepted.origin_store_instance_identity,
+            &self.live_instance_identity,
+        ) {
+            return Err(AuthoritativeReviewAdmissionSection82Error::AcceptanceStoreMismatch);
+        }
+        let _consumed_acceptance_token = accepted.acceptance_token;
+        self.reload_authoritative_namespaces()
+            .map_err(|error| match error {
+                AuthoritativeReviewAdmissionAcceptanceError::Store(error) => {
+                    AuthoritativeReviewAdmissionSection82Error::Store(error)
+                }
+                AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged => {
+                    AuthoritativeReviewAdmissionSection82Error::RegistryIdentityChanged
+                }
+                AuthoritativeReviewAdmissionAcceptanceError::Input(_) => {
+                    unreachable!("namespace reload does not inspect opaque input allocation")
+                }
+            })?;
+
+        let request_record_id = record_id_from_event_reference(&accepted.request_event_reference);
+        let result_record_id = record_id_from_event_reference(&accepted.result_event_reference);
+        let request_bytes = self
+            .resolve(request_record_id)
+            .ok_or(AuthoritativeReviewAdmissionSection82Error::RequestPayloadUnavailable)?
+            .to_vec();
+        let result_bytes = self
+            .resolve(result_record_id)
+            .ok_or(AuthoritativeReviewAdmissionSection82Error::ResultPayloadUnavailable)?
+            .to_vec();
+        if accepted.request_bytes != request_bytes {
+            return Err(AuthoritativeReviewAdmissionSection82Error::PresentedRequestMismatch);
+        }
+        if accepted.result_bytes != result_bytes {
+            return Err(AuthoritativeReviewAdmissionSection82Error::PresentedResultMismatch);
+        }
+
+        validate_review_admission_section_82_structural_inputs(
+            &self.retained_journal,
+            &accepted.request_event_reference,
+            &request_bytes,
+            &accepted.result_event_reference,
+            &result_bytes,
+            self,
+        )
+        .map_err(AuthoritativeReviewAdmissionSection82Error::Structural)?;
+        self.retained_journal
+            .resolve_reference(&accepted.operation_start_journal_ref)
+            .map_err(AuthoritativeReviewAdmissionSection82Error::OperationStartReference)?;
+        if accepted.request_event_reference.entry_index().value()
+            > accepted.operation_start_journal_ref.entry_index().value()
+        {
+            return Err(
+                AuthoritativeReviewAdmissionSection82Error::RequestAuthorityAfterOperationStart,
+            );
+        }
+        if accepted.result_event_reference.entry_index().value()
+            > accepted.operation_start_journal_ref.entry_index().value()
+        {
+            return Err(
+                AuthoritativeReviewAdmissionSection82Error::ResultAuthorityAfterOperationStart,
+            );
+        }
+
+        let request = ReviewRequestRecord::decode_authoritative(&request_bytes)
+            .expect("the structural §82 validator strictly decoded the Request");
+        let result = ReviewResultRecord::decode_authoritative(&result_bytes)
+            .expect("the structural §82 validator strictly decoded the Result");
+        let returned_anchor = resolve_retained_review_package_anchor_input(
+            &self.retained_journal,
+            &accepted.request_event_reference,
+            &request_bytes,
+            &accepted.result_event_reference,
+            &result_bytes,
+        )
+        .expect("the structural §82 validator resolved the returned Anchor");
+        let anchor_comparison =
+            compare_retained_journal_anchor_history(&self.retained_journal, &returned_anchor);
+        let policy_record_id = record_id_from_event_reference(request.policy_authority_ref());
+        let policy_bytes = self
+            .resolve(policy_record_id)
+            .expect("the structural §82 validator resolved the authoritative Policy")
+            .to_vec();
+        let policy = ReviewAdmissionPolicyRecord::decode_authoritative(&policy_bytes)
+            .expect("the structural §82 validator strictly decoded the Policy");
+        let policy_context_prerequisites = validate_review_admission_policy_context_prerequisites(
+            &self.retained_journal,
+            request.policy_authority_ref(),
+            &policy_bytes,
+            &request_bytes,
+            &result_bytes,
+            self,
+        )
+        .expect("the structural §82 validator established Policy context prerequisites");
+        let freeze_authority = self
+            .validate_freeze_committed_authority(request.freeze_authority_ref().clone())
+            .map_err(AuthoritativeReviewAdmissionSection82Error::FreezeAuthority)?;
+
+        Ok(AuthoritativeReviewAdmissionSection82 {
+            operation_start_journal_ref: accepted.operation_start_journal_ref.clone(),
+            request_event_reference: accepted.request_event_reference.clone(),
+            result_event_reference: accepted.result_event_reference.clone(),
+            request,
+            result,
+            policy,
+            policy_bytes,
+            returned_anchor,
+            anchor_comparison,
+            policy_context_prerequisites,
+            freeze_authority,
+        })
+    }
+
+    fn reload_authoritative_namespaces(
+        &mut self,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError> {
+        let reloaded =
+            Self::open(&self.root).map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
+        if reloaded.retained_journal.registry_id != self.retained_journal.registry_id {
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged);
+        }
+        self.retained_journal = reloaded.retained_journal;
+        self.records = reloaded.records;
+        Ok(())
+    }
+
+    fn release_authoritative_acceptance_capacity(&self) {
+        let previous = self
+            .live_instance_identity
+            .outstanding_review_admissions
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
     }
 }
 
@@ -366,4 +725,9 @@ fn parse_record_filename(name: &str) -> Option<RecordId> {
         *slot = u8::from_str_radix(&hex[offset..offset + 2], 16).ok()?;
     }
     RecordId::try_from(bytes.as_slice()).ok()
+}
+
+fn record_id_from_event_reference(reference: &JournalReference) -> RecordId {
+    RecordId::try_from(reference.event_record_id().as_bytes().as_slice())
+        .expect("EventRecordId has RecordId width")
 }

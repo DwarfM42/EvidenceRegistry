@@ -6,8 +6,9 @@ use evidence_registry::{
     route_review_admission_after_anchor_comparison,
     validate_review_admission_common_request_result_fields,
     validate_review_package_anchor_transport, validate_review_request_recorded_binding,
-    validate_review_result_recorded_binding, EventRecordId, ExactRecordByteResolver,
-    FreezeAttemptId, FreezeAttemptStartRecord, FreezeAttemptStartRecordInput, GenesisJournalEntry,
+    validate_review_result_recorded_binding, AuthoritativeRegistryStore, EventRecordId,
+    ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
+    FreezeAttemptStartRecordInput, GenesisJournalEntry, GenesisRecord, GenesisRecordInput,
     JournalAnchor, JournalAnchorHistoryComparison, JournalEntryHash, JournalEntryIndex,
     JournalReference, RecordId, RegistryId, RetainedJournal, RetainedJournalError,
     RetainedReviewPackageAnchorInputError, ReviewAdmissionAcceptanceError,
@@ -23,15 +24,31 @@ use evidence_registry::{
     REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES,
 };
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn id(first: u8) -> [u8; 32] {
     core::array::from_fn(|index| first.wrapping_add(index as u8))
 }
 
+fn genesis_record() -> GenesisRecord {
+    GenesisRecord::new(GenesisRecordInput {
+        registry_id: RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        journal_format_version: 1,
+        record_identity_profile_id: 1,
+        storage_capability_class_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        environment_observation_id: RecordId::try_from(id(0x60).as_slice()).unwrap(),
+        created_by_tool_version: "review-admission-runtime-test".to_owned(),
+    })
+    .unwrap()
+}
+
 fn genesis() -> GenesisJournalEntry {
+    let record = genesis_record();
     GenesisJournalEntry::new(
         RegistryId::try_from(id(0x00).as_slice()).unwrap(),
-        EventRecordId::try_from(id(0x20).as_slice()).unwrap(),
+        EventRecordId::try_from(record.record_id().as_bytes().as_slice()).unwrap(),
         RecordId::try_from(id(0x40).as_slice()).unwrap(),
         RecordId::try_from(id(0x60).as_slice()).unwrap(),
     )
@@ -617,8 +634,66 @@ impl ExactRecordByteResolver for RecordBytes {
     }
 }
 
+static NEXT_AUTHORITATIVE_REVIEW_STORE_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+struct AuthoritativeReviewStoreFixtureDir {
+    path: PathBuf,
+}
+
+impl AuthoritativeReviewStoreFixtureDir {
+    fn from_fixture(fixture: &AuthoritativeReviewAdmissionFixture) -> Self {
+        let sequence = NEXT_AUTHORITATIVE_REVIEW_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "evidence-registry-authoritative-review-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(path.join("registry")).unwrap();
+        fs::create_dir(path.join("journal")).unwrap();
+        fs::create_dir(path.join("records")).unwrap();
+        fs::write(
+            path.join("registry/genesis.cbor"),
+            &fixture.genesis_record_bytes,
+        )
+        .unwrap();
+        for (index, bytes) in fixture.journal_entry_bytes.iter().enumerate() {
+            fs::write(
+                path.join("journal").join(format!("{index:020}.cbor")),
+                bytes,
+            )
+            .unwrap();
+        }
+        for (record_id, bytes) in &fixture.resolver.0 {
+            fs::write(
+                path.join("records").join(record_filename(*record_id)),
+                bytes,
+            )
+            .unwrap();
+        }
+        Self { path }
+    }
+}
+
+impl Drop for AuthoritativeReviewStoreFixtureDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn record_filename(record_id: RecordId) -> String {
+    let mut name = String::with_capacity(69);
+    for byte in record_id.as_bytes() {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").unwrap();
+    }
+    name.push_str(".cbor");
+    name
+}
+
 struct AuthoritativeReviewAdmissionFixture {
     journal: RetainedJournal,
+    genesis_record_bytes: Vec<u8>,
+    journal_entry_bytes: Vec<Vec<u8>>,
     request_reference: JournalReference,
     request_bytes: Vec<u8>,
     result_reference: JournalReference,
@@ -718,7 +793,7 @@ fn authoritative_review_admission_fixture_with_overrides(
         JournalEntryIndex::try_from(0_u64).unwrap(),
         genesis.entry_hash(),
         evidence_registry::EventTypeId::try_from(1_u64).unwrap(),
-        EventRecordId::try_from(id(0x20).as_slice()).unwrap(),
+        EventRecordId::try_from(genesis_record().record_id().as_bytes().as_slice()).unwrap(),
     );
     let start_record = freeze_attempt_start_record();
     let start_entry = freeze_start_entry(genesis.entry_hash(), &start_record);
@@ -900,6 +975,8 @@ fn authoritative_review_admission_fixture_with_overrides(
         evidence_registry::EventTypeId::try_from(301_u64).unwrap(),
         EventRecordId::try_from(result.record_id().as_bytes().as_slice()).unwrap(),
     );
+    let genesis_entry_bytes = genesis.authoritative_cbor();
+    let genesis_record_bytes = genesis_record().authoritative_cbor();
     let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
     journal.append_strict_entry(&start_entry).unwrap();
     journal.append_strict_entry(&committed_entry).unwrap();
@@ -907,17 +984,29 @@ fn authoritative_review_admission_fixture_with_overrides(
     journal.append_strict_entry(&request_entry).unwrap();
     journal.append_strict_entry(&result_entry).unwrap();
     let mut records = vec![
+        (genesis_record().record_id(), genesis_record_bytes.clone()),
         (start_record.record_id(), start_record.authoritative_cbor()),
         (receipt_id, receipt_bytes),
         (manifest_id, manifest_bytes),
         (gate_scope_id, gate_scope_bytes),
         (policy_id, policy_bytes),
+        (request.record_id(), request_bytes.clone()),
+        (result.record_id(), result_bytes.clone()),
     ];
     if common_scope_id != gate_scope_id {
         records.push((common_scope_id, common_scope_bytes));
     }
     AuthoritativeReviewAdmissionFixture {
         journal,
+        genesis_record_bytes,
+        journal_entry_bytes: vec![
+            genesis_entry_bytes,
+            start_entry,
+            committed_entry,
+            policy_entry,
+            request_entry,
+            result_entry,
+        ],
         request_reference,
         request_bytes,
         result_reference,
@@ -1099,7 +1188,7 @@ fn retained_journal_exposes_the_exact_current_head_for_accept_and_snapshot() {
         JournalEntryIndex::try_from(0_u64).unwrap(),
         genesis.entry_hash(),
         evidence_registry::EventTypeId::try_from(1_u64).unwrap(),
-        EventRecordId::try_from(id(0x20).as_slice()).unwrap(),
+        EventRecordId::try_from(genesis_record().record_id().as_bytes().as_slice()).unwrap(),
     );
     let journal = RetainedJournal::from_genesis(genesis).unwrap();
 
@@ -2283,6 +2372,77 @@ fn structurally_complete_inputs_without_authoritative_store_provenance_remain_pr
         )
     ));
     assert_eq!(fixture.journal.current_head_reference(), opening_head);
+}
+
+#[test]
+fn authoritative_store_derives_complete_section_82_without_caller_record_authority() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    let accepted = store
+        .accept_authoritative_review_admission(
+            fixture.request_reference.clone(),
+            &fixture.request_bytes,
+            fixture.result_reference.clone(),
+            &fixture.result_bytes,
+        )
+        .unwrap();
+    assert_eq!(
+        accepted.operation_start_journal_ref(),
+        &fixture.result_reference
+    );
+
+    let section_82 = store
+        .complete_authoritative_review_admission_section_82(accepted)
+        .unwrap();
+
+    assert_eq!(
+        section_82.operation_start_journal_ref(),
+        &fixture.result_reference
+    );
+    assert_eq!(
+        section_82.request_event_reference(),
+        &fixture.request_reference
+    );
+    assert_eq!(
+        section_82.result_event_reference(),
+        &fixture.result_reference
+    );
+    assert_eq!(
+        section_82.policy_authority_ref(),
+        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
+            .unwrap()
+            .policy_authority_ref()
+    );
+    assert_eq!(
+        section_82.common_review_scope_ref(),
+        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
+            .unwrap()
+            .review_scope_ref()
+    );
+    assert_eq!(
+        section_82.freeze_authority().committed_event_reference(),
+        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
+            .unwrap()
+            .freeze_authority_ref()
+    );
+
+    let mut caller_substitution = fixture.request_bytes.clone();
+    *caller_substitution.last_mut().unwrap() ^= 1;
+    let substituted = store
+        .accept_authoritative_review_admission(
+            fixture.request_reference.clone(),
+            &caller_substitution,
+            fixture.result_reference.clone(),
+            &fixture.result_bytes,
+        )
+        .unwrap();
+    assert_eq!(
+        store.complete_authoritative_review_admission_section_82(substituted),
+        Err(
+            evidence_registry::AuthoritativeReviewAdmissionSection82Error::PresentedRequestMismatch
+        )
+    );
 }
 
 #[test]

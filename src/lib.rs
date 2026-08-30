@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 mod authoritative_store;
 pub use authoritative_store::{
-    AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError,
-    AuthoritativeRegistryStore, AuthoritativeRegistryStoreOpenError,
+    AcceptedAuthoritativeReviewAdmission, AuthoritativeFreezeCommittedBinding,
+    AuthoritativeFreezeCommittedBindingError, AuthoritativeRegistryStore,
+    AuthoritativeRegistryStoreOpenError, AuthoritativeReviewAdmissionAcceptanceError,
+    AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error,
 };
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
