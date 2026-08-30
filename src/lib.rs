@@ -3692,6 +3692,43 @@ impl ScopeRecord {
     }
 }
 
+/// Fail-closed outcomes while resolving the v0.4 profile-1 exact Review
+/// Admission Scope representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionExactScopeProfileError {
+    ScopePayloadUnavailable,
+    ScopeDecode,
+    ScopeIdentityMismatch,
+    UnsupportedProfile,
+}
+
+/// Resolves one exact typed SCOPE Record selected by the frozen v0.4
+/// `REVIEW_ADMISSION_EXACT_REVIEW_SCOPE_BINDING` profile.
+///
+/// This validates profile `(1, 1)` and empty payload only. It does not infer
+/// Scope coverage, authority, Policy satisfaction, Admission, or a terminal
+/// lifecycle result.
+pub fn resolve_review_admission_exact_scope_profile(
+    scope_ref: RecordId,
+    resolver: &impl ExactRecordByteResolver,
+) -> Result<ScopeRecord, ReviewAdmissionExactScopeProfileError> {
+    let scope_bytes = resolver
+        .resolve(scope_ref)
+        .ok_or(ReviewAdmissionExactScopeProfileError::ScopePayloadUnavailable)?;
+    let scope = ScopeRecord::decode_authoritative(scope_bytes)
+        .map_err(|_| ReviewAdmissionExactScopeProfileError::ScopeDecode)?;
+    if scope.record_id() != scope_ref {
+        return Err(ReviewAdmissionExactScopeProfileError::ScopeIdentityMismatch);
+    }
+    if scope.input().scope_profile_id != 1
+        || scope.input().scope_profile_version != 1
+        || !scope.input().scope_payload.is_empty()
+    {
+        return Err(ReviewAdmissionExactScopeProfileError::UnsupportedProfile);
+    }
+    Ok(scope)
+}
+
 /// Immutable registry metadata for a frozen POLICY evaluator.
 ///
 /// This metadata assigns no generic evaluation behavior to any field or Scope.

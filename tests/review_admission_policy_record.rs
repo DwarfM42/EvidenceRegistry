@@ -1,8 +1,9 @@
 use evidence_registry::{
+    resolve_review_admission_exact_scope_profile,
     validate_review_admission_policy_recorded_binding, EventRecordId, EventTypeId,
-    GenesisJournalEntry, JournalEntryHash, JournalEntryIndex, JournalReference,
-    PolicyEvaluationContext, RecordId, RegistryId, RetainedJournal, ReviewAdmissionPolicyRecord,
-    StrictRecordFrame,
+    ExactRecordByteResolver, GenesisJournalEntry, JournalEntryHash, JournalEntryIndex,
+    JournalReference, PolicyEvaluationContext, RecordId, RegistryId, RetainedJournal,
+    ReviewAdmissionPolicyRecord, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -88,6 +89,27 @@ fn policy_recorded_entry(
     bytes
 }
 
+fn independently_construct_exact_review_admission_scope() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[
+        0x14, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x14, 0x10, 0x01, 0x11, 0x01, 0x12, 0x40,
+    ]);
+    bytes
+}
+
+struct RecordBytes(Vec<(RecordId, Vec<u8>)>);
+
+impl ExactRecordByteResolver for RecordBytes {
+    fn resolve(&self, record_id: RecordId) -> Option<&[u8]> {
+        self.0
+            .iter()
+            .find(|(candidate, _)| *candidate == record_id)
+            .map(|(_, bytes)| bytes.as_slice())
+    }
+}
+
 #[test]
 fn review_admission_policy_decodes_all_applicable_frozen_requirements() {
     let start_genesis = genesis();
@@ -138,4 +160,18 @@ fn review_admission_policy_requires_exact_retained_policy_recording_and_prior_op
 
     assert_eq!(binding.policy_record_id(), policy_record_id);
     assert_eq!(binding.operation_start_reference().entry_index().value(), 0);
+}
+
+#[test]
+fn review_admission_exact_scope_profile_requires_exact_typed_empty_profile_payload() {
+    let scope_bytes = independently_construct_exact_review_admission_scope();
+    let scope_id = RecordId::try_from(Sha256::digest(&scope_bytes).as_slice()).unwrap();
+    let resolver = RecordBytes(vec![(scope_id, scope_bytes)]);
+
+    let scope = resolve_review_admission_exact_scope_profile(scope_id, &resolver).unwrap();
+
+    assert_eq!(scope.record_id(), scope_id);
+    assert_eq!(scope.input().scope_profile_id, 1);
+    assert_eq!(scope.input().scope_profile_version, 1);
+    assert!(scope.input().scope_payload.is_empty());
 }
