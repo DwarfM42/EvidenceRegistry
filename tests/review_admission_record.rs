@@ -1,6 +1,6 @@
 use evidence_registry::{
     EventRecordId, EventTypeId, JournalEntryHash, JournalEntryIndex, JournalReference, RecordId,
-    RegistryId, ReviewAdmissionRecord,
+    RegistryId, ReviewAdmissionRecord, ReviewAdmissionRecordInput,
 };
 
 fn id(first: u8) -> [u8; 32] {
@@ -111,5 +111,28 @@ fn rejected_review_admission_preserves_successfully_resolved_authority_reference
     assert_eq!(
         admission.policy_authority_ref(),
         Some(&reference(3, 400, 0x60))
+    );
+}
+
+#[test]
+fn accepted_review_admission_serializes_canonical_record_bytes_from_exact_typed_references() {
+    let input = ReviewAdmissionRecordInput {
+        disposition_id: 1,
+        review_request_ref: reference(1, 300, 0x20),
+        review_result_ref: reference(2, 301, 0x40),
+        policy_authority_ref: reference(3, 400, 0x60),
+        reason_codes: vec!["SAT".to_owned()],
+        operation_start_journal_ref: reference(0, 1, 0x10),
+    };
+
+    let admission = ReviewAdmissionRecord::new(input).unwrap();
+
+    assert_eq!(
+        admission.authoritative_cbor(),
+        independently_construct_accepted_review_admission(),
+    );
+    assert_eq!(
+        ReviewAdmissionRecord::decode_authoritative(&admission.authoritative_cbor()).unwrap(),
+        admission,
     );
 }

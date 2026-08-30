@@ -4984,6 +4984,20 @@ impl ReviewResultRecord {
 /// Result, and Policy authority references all resolved. It establishes neither
 /// the §82/§46 facts that select a disposition nor a Journal publication effect.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionRecordInput {
+    pub disposition_id: u64,
+    pub review_request_ref: JournalReference,
+    pub review_result_ref: JournalReference,
+    pub policy_authority_ref: JournalReference,
+    pub reason_codes: Vec<String>,
+    pub operation_start_journal_ref: JournalReference,
+}
+
+/// A rejected local terminal REVIEW_ADMISSION Record construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionRecordError;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewAdmissionRecord {
     record_id: RecordId,
     disposition_id: u64,
@@ -4995,6 +5009,65 @@ pub struct ReviewAdmissionRecord {
 }
 
 impl ReviewAdmissionRecord {
+    /// Constructs one terminal Review Admission Record from exact typed,
+    /// already-resolved references. This local constructor does not establish
+    /// that the selected disposition is lawful or publish an event.
+    pub fn new(input: ReviewAdmissionRecordInput) -> Result<Self, ReviewAdmissionRecordError> {
+        if !matches!(input.disposition_id, 1 | 2)
+            || input.review_request_ref.event_type_id().value() != 300
+            || input.review_result_ref.event_type_id().value() != 301
+            || input.policy_authority_ref.event_type_id().value() != 400
+            || input
+                .reason_codes
+                .windows(2)
+                .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        {
+            return Err(ReviewAdmissionRecordError);
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0_u8; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            disposition_id: input.disposition_id,
+            review_request_ref: input.review_request_ref,
+            review_result_ref: input.review_result_ref,
+            policy_authority_ref: input.policy_authority_ref,
+            reason_codes: input.reason_codes,
+            operation_start_journal_ref: input.operation_start_journal_ref,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact canonical terminal REVIEW_ADMISSION Record bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        encode_uint(&mut bytes, 32);
+        bytes.push(1);
+        bytes.push(0xa8);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_uint(&mut bytes, 32);
+        encode_uint(&mut bytes, 16);
+        encode_uint(&mut bytes, self.disposition_id);
+        encode_uint(&mut bytes, 17);
+        bytes.extend_from_slice(&self.review_request_ref.authoritative_cbor());
+        encode_uint(&mut bytes, 18);
+        bytes.extend_from_slice(&self.review_result_ref.authoritative_cbor());
+        encode_uint(&mut bytes, 19);
+        bytes.extend_from_slice(&self.policy_authority_ref.authoritative_cbor());
+        encode_uint(&mut bytes, 22);
+        encode_array_length(&mut bytes, self.reason_codes.len());
+        for reason_code in &self.reason_codes {
+            encode_text(&mut bytes, reason_code);
+        }
+        encode_uint(&mut bytes, 23);
+        bytes.extend_from_slice(&self.operation_start_journal_ref.authoritative_cbor());
+        bytes
+    }
+
     /// Strictly decodes the exact local terminal REVIEW_ADMISSION Record shape
     /// when all three authority references were successfully resolved.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
