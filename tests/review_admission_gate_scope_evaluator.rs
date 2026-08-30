@@ -1,11 +1,14 @@
 use evidence_registry::{
     compose_review_admission_policy_46, derive_review_admission_lifecycle_outcome,
     evaluate_review_admission_gate_scope_1015, policy_evaluator_1015_field_mapping,
-    policy_evaluator_registry, Evaluator1015Result, ExactRecordByteResolver,
-    PolicyCompositionResult, PolicyEvaluationContext, RecordId, ReviewAdmissionGateScopeEvaluation,
+    policy_evaluator_registry, route_review_admission_after_anchor_comparison, Evaluator1015Result,
+    ExactRecordByteResolver, JournalAnchorHistoryComparison, PolicyCompositionResult,
+    PolicyEvaluationContext, RecordId, ReviewAdmissionGateScopeEvaluation,
     ReviewAdmissionGateScopePolicy, ReviewAdmissionLifecycleOutcome, ReviewAdmissionPreCompletion,
-    ReviewAdmissionPrerequisiteFailure, StrictRecordFrame,
+    ReviewAdmissionPrerequisiteFailure, ReviewAdmissionSection82PrerequisiteFailure,
+    ReviewAdmissionSection82RoutingOutcome, StrictRecordFrame,
 };
+use std::cell::Cell;
 
 const SCOPE_PROFILE_1_EMPTY_HEX: &str =
     "84781a45766964656e636552656769737472792e5265636f72642e76311401a500010114100111011240";
@@ -170,6 +173,29 @@ fn e1015_section_82_scope_mismatch_short_circuits_before_evaluator_or_policy_res
         derive_review_admission_lifecycle_outcome(PolicyCompositionResult::PreCompletion),
         ReviewAdmissionLifecycleOutcome::NoEvent
     );
+}
+
+#[test]
+fn returned_anchor_divergence_is_preterminal_and_does_not_invoke_policy_evaluation() {
+    let policy_evaluation_calls = Cell::new(0_u8);
+
+    let outcome = route_review_admission_after_anchor_comparison(
+        JournalAnchorHistoryComparison::JournalDivergence,
+        || {
+            policy_evaluation_calls.set(policy_evaluation_calls.get() + 1);
+            unreachable!("a returned-anchor §82 prerequisite failure must not evaluate Policy")
+        },
+    );
+
+    assert_eq!(
+        outcome,
+        ReviewAdmissionSection82RoutingOutcome::PreTerminal(
+            ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(
+                JournalAnchorHistoryComparison::JournalDivergence
+            )
+        )
+    );
+    assert_eq!(policy_evaluation_calls.get(), 0);
 }
 
 #[test]

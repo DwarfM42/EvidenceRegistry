@@ -1208,6 +1208,19 @@ pub enum RetainedJournalError {
     UnsupportedEntry,
 }
 
+/// A failure to derive exactly one Journal Anchor from retained Journal prefixes.
+///
+/// This is a retained-history result only. A successful resolution does not by
+/// itself establish Review Package authority, §82 completion, Policy
+/// satisfaction, Admission, or terminal publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedJournalAnchorResolutionError {
+    /// No retained prefix derives the supplied typed Journal Anchor identity.
+    Missing,
+    /// More than one retained prefix derives the supplied typed Journal Anchor identity.
+    Ambiguous,
+}
+
 /// Exact retained-history facts resolved from one JournalReference.
 ///
 /// This is a resolution result, not an authority or admission verdict. It
@@ -1466,6 +1479,33 @@ impl RetainedJournal {
         GenesisJournalEntry::decode_authoritative(input)
             .map_err(|_| RetainedJournalError::DecodeError)
             .and_then(Self::from_genesis)
+    }
+
+    /// Resolves a version-1 Journal Anchor identity solely by reconstructing
+    /// canonical Anchors from retained Journal prefixes.
+    ///
+    /// No caller-supplied Anchor body, cache, helper-provided head, or raw
+    /// digest substitute participates in the candidate set. The result remains
+    /// retained-history structural evidence; callers must establish every
+    /// separate lifecycle and authority precondition before treating it as a
+    /// Review Admission input.
+    pub fn resolve_journal_anchor_id(
+        &self,
+        anchor_id: JournalAnchorId,
+    ) -> Result<JournalAnchor, RetainedJournalAnchorResolutionError> {
+        let mut resolved = None;
+        for entry in &self.entries {
+            let candidate =
+                JournalAnchor::new(self.registry_id, entry.entry_index(), entry.entry_hash(), 1)
+                    .expect("Journal format version 1 is within the EvidenceRegistry UInt range");
+            if candidate.anchor_id() != anchor_id {
+                continue;
+            }
+            if resolved.replace(candidate).is_some() {
+                return Err(RetainedJournalAnchorResolutionError::Ambiguous);
+            }
+        }
+        resolved.ok_or(RetainedJournalAnchorResolutionError::Missing)
     }
 
     /// Appends GENESIS only at the single initial Journal slot.
@@ -2075,6 +2115,58 @@ fn absent_state_for_kind(kind: LifecycleObjectKind) -> LifecycleObjectState {
             LifecycleObjectState::ArtifactEviction(ArtifactEvictionState::Absent)
         }
         _ => LifecycleObjectState::OneShot(OneShotRecordedState::Absent),
+    }
+}
+
+/// The exact bounded current-history relation of a canonical Journal Anchor.
+///
+/// This is a retained-history comparison only. It does not decide whether a
+/// Review Request or Result is authoritative, whether §82 has completed, any
+/// Policy outcome, Admission, or terminal Journal publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalAnchorHistoryComparison {
+    AnchorEqualsCurrentHead,
+    AnchorIsValidAncestor,
+    JournalDivergence,
+    JournalHistoryBehindAnchor,
+    AnchorFromDifferentRegistry,
+    AnchorInvalid,
+}
+
+/// Compares a canonical Journal Anchor against the contiguous retained Journal.
+///
+/// The comparison implements Lifecycle v0.10.2 §116 for the in-memory retained
+/// Journal: same-head identity, matching prior prefix, divergence at an
+/// existing index, history behind the Anchor, and cross-Registry rejection.
+pub fn compare_retained_journal_anchor_history(
+    retained_journal: &RetainedJournal,
+    anchor: &JournalAnchor,
+) -> JournalAnchorHistoryComparison {
+    if anchor.registry_id != retained_journal.registry_id {
+        return JournalAnchorHistoryComparison::AnchorFromDifferentRegistry;
+    }
+    if anchor.journal_format_version != 1 {
+        return JournalAnchorHistoryComparison::AnchorInvalid;
+    }
+    let Some(current_head) = retained_journal.entries.last() else {
+        return JournalAnchorHistoryComparison::AnchorInvalid;
+    };
+    if anchor.journal_head_index > current_head.entry_index() {
+        return JournalAnchorHistoryComparison::JournalHistoryBehindAnchor;
+    }
+    let anchored_entry = usize::try_from(anchor.journal_head_index.value())
+        .ok()
+        .and_then(|index| retained_journal.entries.get(index));
+    let Some(anchored_entry) = anchored_entry else {
+        return JournalAnchorHistoryComparison::AnchorInvalid;
+    };
+    if anchored_entry.entry_hash() != anchor.journal_head_hash {
+        return JournalAnchorHistoryComparison::JournalDivergence;
+    }
+    if anchored_entry.entry_index() == current_head.entry_index() {
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead
+    } else {
+        JournalAnchorHistoryComparison::AnchorIsValidAncestor
     }
 }
 
@@ -3494,6 +3586,90 @@ pub enum OtherPolicyEvaluatorResult {
     Indeterminate,
 }
 
+/// A §82 returned-Anchor comparison that prevents Policy evaluation from starting.
+///
+/// This is deliberately outside evaluator 1015 and §46's completed-result grammar.
+/// It establishes no Review Request/Result authority, Admission result, terminal
+/// event, Journal publication, or generic Policy semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionSection82PrerequisiteFailure {
+    /// Strict Request/Result-to-retained-Anchor recovery did not establish a
+    /// §82 returned-Anchor input. This is not an evaluator or Policy result.
+    RetainedAnchorInput(RetainedReviewPackageAnchorInputError),
+    ReturnedAnchorComparison(JournalAnchorHistoryComparison),
+}
+
+/// The routing boundary between successful §82 returned-Anchor comparison and
+/// subsequent Policy evaluation.
+///
+/// `PreTerminal` is not an accepted or rejected Admission disposition and must
+/// not produce event 302 or 303. `PolicyEvaluation` returns only the existing
+/// direction derived by the caller's separately established Policy path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionSection82RoutingOutcome {
+    PreTerminal(ReviewAdmissionSection82PrerequisiteFailure),
+    PolicyEvaluation(ReviewAdmissionLifecycleOutcome),
+}
+
+/// Routes a completed retained-Journal Anchor comparison before Policy work.
+///
+/// Lifecycle v0.10.2 §117 admits only an equal current head or valid ancestor
+/// to the subsequent Policy path. All other §116 classes fail closed at this
+/// §82 boundary without invoking Policy evaluation, evaluator 1015, §46
+/// composition, or terminal-event publication.
+pub fn route_review_admission_after_anchor_comparison(
+    comparison: JournalAnchorHistoryComparison,
+    evaluate_policy: impl FnOnce() -> PolicyCompositionResult,
+) -> ReviewAdmissionSection82RoutingOutcome {
+    match comparison {
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead
+        | JournalAnchorHistoryComparison::AnchorIsValidAncestor => {
+            ReviewAdmissionSection82RoutingOutcome::PolicyEvaluation(
+                derive_review_admission_lifecycle_outcome(evaluate_policy()),
+            )
+        }
+        failure => ReviewAdmissionSection82RoutingOutcome::PreTerminal(
+            ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(failure),
+        ),
+    }
+}
+
+/// Routes exact retained Review Request/Result inputs through the pre-§82
+/// retained-Anchor boundary before any Policy work.
+///
+/// A strict input/binding/recovery failure is a pre-terminal §82 prerequisite
+/// failure. Only after retained-only Anchor recovery and an acceptable §116
+/// comparison may the separately established Policy path be invoked. This does
+/// not establish authority, Policy completion, Admission, terminal Record
+/// construction, or Journal publication.
+pub fn route_retained_review_admission_section_82(
+    retained_journal: &RetainedJournal,
+    request_event_reference: &JournalReference,
+    request_bytes: &[u8],
+    result_event_reference: &JournalReference,
+    result_bytes: &[u8],
+    evaluate_policy: impl FnOnce() -> PolicyCompositionResult,
+) -> ReviewAdmissionSection82RoutingOutcome {
+    let anchor = match resolve_retained_review_package_anchor_input(
+        retained_journal,
+        request_event_reference,
+        request_bytes,
+        result_event_reference,
+        result_bytes,
+    ) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            return ReviewAdmissionSection82RoutingOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::RetainedAnchorInput(error),
+            );
+        }
+    };
+    route_review_admission_after_anchor_comparison(
+        compare_retained_journal_anchor_history(retained_journal, &anchor),
+        evaluate_policy,
+    )
+}
+
 /// The bounded §46 composition outcome needed for REVIEW_ADMISSION dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyCompositionResult {
@@ -3701,6 +3877,542 @@ pub fn validate_policy_recorded_structural_binding(
         policy_event_reference: policy_event_reference.clone(),
         operation_start_reference: policy.operation_start_journal_ref().clone(),
     })
+}
+
+/// The exact version-1 Review Package Anchor transport fields and predecessor
+/// Review Request fields decoded from a prospective REVIEW_REQUEST Record.
+///
+/// Strict decoding establishes only the local Record grammar and self-hash
+/// identity. It does not establish Request authority, package authority,
+/// retained-Journal Anchor resolution, §82 completion, Policy satisfaction, or
+/// Admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRequestRecord {
+    record_id: RecordId,
+    freeze_authority_ref: JournalReference,
+    manifest_id: RecordId,
+    review_role_id: u64,
+    required_checks_ref: RecordId,
+    policy_authority_ref: JournalReference,
+    review_scope_ref: RecordId,
+    review_method_ref: RecordId,
+    review_package_anchor_id: JournalAnchorId,
+    operation_start_journal_ref: JournalReference,
+    review_package_anchor_binding_version: u64,
+}
+
+impl ReviewRequestRecord {
+    /// Strictly decodes the prospective Record Schema v0.5 version-1
+    /// REVIEW_REQUEST local grammar without normalizing bytes.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(30).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 30
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(12).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 30 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let freeze_authority_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let manifest_id =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let review_role_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(19).map_err(|_| RecordDecodeError)?;
+        let required_checks_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(20).map_err(|_| RecordDecodeError)?;
+        let policy_authority_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(21).map_err(|_| RecordDecodeError)?;
+        let review_scope_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(22).map_err(|_| RecordDecodeError)?;
+        let review_method_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(23).map_err(|_| RecordDecodeError)?;
+        let review_package_anchor_id =
+            JournalAnchorId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(24).map_err(|_| RecordDecodeError)?;
+        let operation_start_journal_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(25).map_err(|_| RecordDecodeError)?;
+        let review_package_anchor_binding_version = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if review_package_anchor_binding_version != 1 || !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            freeze_authority_ref,
+            manifest_id,
+            review_role_id,
+            required_checks_ref,
+            policy_authority_ref,
+            review_scope_ref,
+            review_method_ref,
+            review_package_anchor_id,
+            operation_start_journal_ref,
+            review_package_anchor_binding_version,
+        })
+    }
+
+    /// The self-hash identity of these exact strictly decoded Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The exact version-1 Review Package Anchor carrier decoded in its named domain.
+    pub fn review_package_anchor_id(&self) -> JournalAnchorId {
+        self.review_package_anchor_id
+    }
+
+    /// The required prospective carrier binding version, which is exactly one.
+    pub fn review_package_anchor_binding_version(&self) -> u64 {
+        self.review_package_anchor_binding_version
+    }
+}
+
+/// The exact version-1 Review Package Anchor transport fields and predecessor
+/// Review Result fields decoded from a prospective REVIEW_RESULT Record.
+///
+/// Strict decoding establishes only the local Record grammar and self-hash
+/// identity. It does not establish Result authority, Request authority,
+/// retained-Journal Anchor resolution, §82 completion, Policy satisfaction, or
+/// Admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultRecord {
+    record_id: RecordId,
+    review_request_authority_ref: JournalReference,
+    freeze_authority_ref: JournalReference,
+    manifest_id: RecordId,
+    review_role_id: u64,
+    review_scope_ref: RecordId,
+    review_method_ref: RecordId,
+    method_status: u64,
+    finding_state: u64,
+    reason_codes: Vec<String>,
+    findings: Vec<RecordId>,
+    reviewer_metadata: Option<String>,
+    review_package_anchor_id: JournalAnchorId,
+    operation_start_journal_ref: JournalReference,
+    review_package_anchor_binding_version: u64,
+}
+
+impl ReviewResultRecord {
+    /// Strictly decodes the prospective Record Schema v0.5 version-1
+    /// REVIEW_RESULT local grammar without normalizing bytes.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(31).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 31
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(field_count, 15 | 16) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 31 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let review_request_authority_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let freeze_authority_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(18).map_err(|_| RecordDecodeError)?;
+        let manifest_id =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(19).map_err(|_| RecordDecodeError)?;
+        let review_role_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(20).map_err(|_| RecordDecodeError)?;
+        let review_scope_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(21).map_err(|_| RecordDecodeError)?;
+        let review_method_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(22).map_err(|_| RecordDecodeError)?;
+        let method_status = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(23).map_err(|_| RecordDecodeError)?;
+        let finding_state = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(24).map_err(|_| RecordDecodeError)?;
+        let reason_code_count = cursor.array().map_err(|_| RecordDecodeError)?;
+        if reason_code_count > cursor.remaining() {
+            return Err(RecordDecodeError);
+        }
+        let mut reason_codes = Vec::with_capacity(reason_code_count);
+        let mut previous_reason_code: Option<String> = None;
+        for _ in 0..reason_code_count {
+            let reason_code = cursor.text().map_err(|_| RecordDecodeError)?;
+            if previous_reason_code
+                .as_ref()
+                .is_some_and(|previous| previous.as_bytes() >= reason_code.as_bytes())
+            {
+                return Err(RecordDecodeError);
+            }
+            previous_reason_code = Some(reason_code.clone());
+            reason_codes.push(reason_code);
+        }
+        cursor.key(25).map_err(|_| RecordDecodeError)?;
+        let finding_count = cursor.array().map_err(|_| RecordDecodeError)?;
+        if finding_count > cursor.remaining() / 34 {
+            return Err(RecordDecodeError);
+        }
+        let mut findings = Vec::with_capacity(finding_count);
+        for _ in 0..finding_count {
+            findings.push(
+                RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                    .map_err(|_| RecordDecodeError)?,
+            );
+        }
+        let reviewer_metadata = if field_count == 16 {
+            cursor.key(26).map_err(|_| RecordDecodeError)?;
+            Some(cursor.text().map_err(|_| RecordDecodeError)?)
+        } else {
+            None
+        };
+        cursor.key(27).map_err(|_| RecordDecodeError)?;
+        let review_package_anchor_id =
+            JournalAnchorId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(28).map_err(|_| RecordDecodeError)?;
+        let operation_start_journal_ref =
+            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(29).map_err(|_| RecordDecodeError)?;
+        let review_package_anchor_binding_version = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if review_package_anchor_binding_version != 1 || !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            review_request_authority_ref,
+            freeze_authority_ref,
+            manifest_id,
+            review_role_id,
+            review_scope_ref,
+            review_method_ref,
+            method_status,
+            finding_state,
+            reason_codes,
+            findings,
+            reviewer_metadata,
+            review_package_anchor_id,
+            operation_start_journal_ref,
+            review_package_anchor_binding_version,
+        })
+    }
+
+    /// The self-hash identity of these exact strictly decoded Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The exact version-1 Review Package Anchor carrier decoded in its named domain.
+    pub fn review_package_anchor_id(&self) -> JournalAnchorId {
+        self.review_package_anchor_id
+    }
+
+    /// The required prospective carrier binding version, which is exactly one.
+    pub fn review_package_anchor_binding_version(&self) -> u64 {
+        self.review_package_anchor_binding_version
+    }
+}
+
+/// A local failure while checking version-1 Review Package Anchor transport.
+///
+/// These outcomes do not classify an evaluator result or any Admission result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewPackageAnchorTransportError {
+    /// The supplied Request bytes fail the strict prospective local schema.
+    RequestDecode,
+    /// The supplied Result bytes fail the strict prospective local schema.
+    ResultDecode,
+    /// The version-1 Result carrier differs from the version-1 Request carrier.
+    AnchorCarrierMismatch,
+}
+
+/// Validates only the exact version-1 Request/Result Anchor-carrier transport relation.
+///
+/// This strict local check proves transport integrity only. It does not establish
+/// either Record's authority, authoritative Request recovery, retained-Journal
+/// Anchor resolution, canonical Anchor validation, §82 completion, Policy
+/// satisfaction, evaluator completion, or Admission.
+pub fn validate_review_package_anchor_transport(
+    request_bytes: &[u8],
+    result_bytes: &[u8],
+) -> Result<(), ReviewPackageAnchorTransportError> {
+    let request = ReviewRequestRecord::decode_authoritative(request_bytes)
+        .map_err(|_| ReviewPackageAnchorTransportError::RequestDecode)?;
+    let result = ReviewResultRecord::decode_authoritative(result_bytes)
+        .map_err(|_| ReviewPackageAnchorTransportError::ResultDecode)?;
+    if request.review_package_anchor_binding_version()
+        != result.review_package_anchor_binding_version()
+        || request.review_package_anchor_id() != result.review_package_anchor_id()
+    {
+        return Err(ReviewPackageAnchorTransportError::AnchorCarrierMismatch);
+    }
+    Ok(())
+}
+
+/// Exact retained-history facts binding a prospective version-1 REVIEW_REQUEST
+/// Record to its required REVIEW_REQUEST_RECORDED Entry.
+///
+/// This is an identity and retained-event binding only. It does not establish
+/// Review Package authority, authority of the referenced Request inputs,
+/// successful Review Request creation, §82 completion, Policy satisfaction, or
+/// Admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRequestRecordedBinding {
+    record_id: RecordId,
+    event_reference: JournalReference,
+}
+
+impl ReviewRequestRecordedBinding {
+    /// The exact self-hash identity of the strictly decoded REVIEW_REQUEST.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The exact retained REVIEW_REQUEST_RECORDED Entry bound to that identity.
+    pub fn event_reference(&self) -> &JournalReference {
+        &self.event_reference
+    }
+}
+
+/// A failure while binding exact REVIEW_REQUEST bytes to retained history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewRequestRecordedBindingError {
+    /// The supplied Request bytes fail the strict prospective local schema.
+    RequestDecode,
+    /// The supplied Request event reference is absent or differs from retained bytes.
+    RequestEventReference(RetainedJournalError),
+    /// The retained Entry is not the Record-backed REVIEW_REQUEST_RECORDED event shape.
+    RequestEventMismatch,
+    /// The strict Request self-hash differs from the retained Entry Record identity.
+    RequestEventRecordIdentityMismatch,
+}
+
+/// Validates only the exact prospective REVIEW_REQUEST Record-to-retained-event
+/// binding required before later Review Package and Review Admission processing.
+pub fn validate_review_request_recorded_binding(
+    retained_journal: &RetainedJournal,
+    request_event_reference: &JournalReference,
+    request_bytes: &[u8],
+) -> Result<ReviewRequestRecordedBinding, ReviewRequestRecordedBindingError> {
+    let request = ReviewRequestRecord::decode_authoritative(request_bytes)
+        .map_err(|_| ReviewRequestRecordedBindingError::RequestDecode)?;
+    let request_event = retained_journal
+        .resolve_reference(request_event_reference)
+        .map_err(ReviewRequestRecordedBindingError::RequestEventReference)?;
+    if request_event.event_type_id().value() != 300
+        || request_event.event_type_id().required_record_type_id()
+            != RecordTypeId::try_from(30).expect("REVIEW_REQUEST is assigned in Record Schema v0.3")
+        || request_event.lifecycle_object_kind() != LifecycleObjectKind::ReviewRequest
+        || request_event.lifecycle_object_id() != *request_event.event_record_id().as_bytes()
+    {
+        return Err(ReviewRequestRecordedBindingError::RequestEventMismatch);
+    }
+    if request_event.event_record_id().as_bytes() != request.record_id().as_bytes() {
+        return Err(ReviewRequestRecordedBindingError::RequestEventRecordIdentityMismatch);
+    }
+    Ok(ReviewRequestRecordedBinding {
+        record_id: request.record_id(),
+        event_reference: request_event_reference.clone(),
+    })
+}
+
+/// Exact retained-history facts binding a prospective version-1 REVIEW_RESULT
+/// Record to its required REVIEW_RESULT_RECORDED Entry.
+///
+/// This is an identity and retained-event binding only. It does not establish
+/// Result authority, Request authority, Review Package authority, §82
+/// completion, Policy satisfaction, or Admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultRecordedBinding {
+    record_id: RecordId,
+    event_reference: JournalReference,
+}
+
+impl ReviewResultRecordedBinding {
+    /// The exact self-hash identity of the strictly decoded REVIEW_RESULT.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The exact retained REVIEW_RESULT_RECORDED Entry bound to that identity.
+    pub fn event_reference(&self) -> &JournalReference {
+        &self.event_reference
+    }
+}
+
+/// A failure while binding exact REVIEW_RESULT bytes to retained history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewResultRecordedBindingError {
+    /// The supplied Result bytes fail the strict prospective local schema.
+    ResultDecode,
+    /// The supplied Result event reference is absent or differs from retained bytes.
+    ResultEventReference(RetainedJournalError),
+    /// The retained Entry is not the Record-backed REVIEW_RESULT_RECORDED event shape.
+    ResultEventMismatch,
+    /// The strict Result self-hash differs from the retained Entry Record identity.
+    ResultEventRecordIdentityMismatch,
+}
+
+/// Validates only the exact prospective REVIEW_RESULT Record-to-retained-event
+/// binding required before later Review Admission processing.
+pub fn validate_review_result_recorded_binding(
+    retained_journal: &RetainedJournal,
+    result_event_reference: &JournalReference,
+    result_bytes: &[u8],
+) -> Result<ReviewResultRecordedBinding, ReviewResultRecordedBindingError> {
+    let result = ReviewResultRecord::decode_authoritative(result_bytes)
+        .map_err(|_| ReviewResultRecordedBindingError::ResultDecode)?;
+    let result_event = retained_journal
+        .resolve_reference(result_event_reference)
+        .map_err(ReviewResultRecordedBindingError::ResultEventReference)?;
+    if result_event.event_type_id().value() != 301
+        || result_event.event_type_id().required_record_type_id()
+            != RecordTypeId::try_from(31).expect("REVIEW_RESULT is assigned in Record Schema v0.3")
+        || result_event.lifecycle_object_kind() != LifecycleObjectKind::ReviewResult
+        || result_event.lifecycle_object_id() != *result_event.event_record_id().as_bytes()
+    {
+        return Err(ReviewResultRecordedBindingError::ResultEventMismatch);
+    }
+    if result_event.event_record_id().as_bytes() != result.record_id().as_bytes() {
+        return Err(ReviewResultRecordedBindingError::ResultEventRecordIdentityMismatch);
+    }
+    Ok(ReviewResultRecordedBinding {
+        record_id: result.record_id(),
+        event_reference: result_event_reference.clone(),
+    })
+}
+
+/// A fail-closed outcome while deriving the retained Review Package Anchor input.
+///
+/// None of these outcomes is a completed Policy, evaluator, lifecycle, or
+/// Admission result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedReviewPackageAnchorInputError {
+    /// The Request does not have the required exact retained recorded-event binding.
+    RequestBinding(ReviewRequestRecordedBindingError),
+    /// The Result does not have the required exact retained recorded-event binding.
+    ResultBinding(ReviewResultRecordedBindingError),
+    /// The Result's embedded Request authority reference differs from the exact Request event.
+    ResultRequestAuthorityReferenceMismatch,
+    /// The retained Result event omits its exact direct dependency on the Request event.
+    ResultEventRequestAuthorityDependencyMissing,
+    /// The strict version-1 Request/Result transport relation is not preserved.
+    AnchorTransport(ReviewPackageAnchorTransportError),
+    /// The retained-Journal-only Anchor candidate set is missing or ambiguous.
+    AnchorResolution(RetainedJournalAnchorResolutionError),
+    /// The canonical retained Anchor's rederived identity differs from the carried identity.
+    AnchorIdentityMismatch,
+}
+
+/// Resolves the version-1 Review Package Anchor from exact retained Request and
+/// Result event bindings plus the retained Journal alone.
+///
+/// This establishes only the bounded pre-§82 structural input path: exact
+/// Record/event binding, exact Result-to-Request reference/dependency binding,
+/// preserved version-1 carrier, and canonical retained-prefix resolution. It
+/// does not establish Request or Result authority, a current-history outcome,
+/// §82 completion, Policy satisfaction, evaluator completion, Admission, or
+/// terminal publication.
+pub fn resolve_retained_review_package_anchor_input(
+    retained_journal: &RetainedJournal,
+    request_event_reference: &JournalReference,
+    request_bytes: &[u8],
+    result_event_reference: &JournalReference,
+    result_bytes: &[u8],
+) -> Result<JournalAnchor, RetainedReviewPackageAnchorInputError> {
+    let request_binding = validate_review_request_recorded_binding(
+        retained_journal,
+        request_event_reference,
+        request_bytes,
+    )
+    .map_err(RetainedReviewPackageAnchorInputError::RequestBinding)?;
+    let result_binding = validate_review_result_recorded_binding(
+        retained_journal,
+        result_event_reference,
+        result_bytes,
+    )
+    .map_err(RetainedReviewPackageAnchorInputError::ResultBinding)?;
+    let result = ReviewResultRecord::decode_authoritative(result_bytes).map_err(|_| {
+        RetainedReviewPackageAnchorInputError::ResultBinding(
+            ReviewResultRecordedBindingError::ResultDecode,
+        )
+    })?;
+    if result.review_request_authority_ref != *request_binding.event_reference() {
+        return Err(RetainedReviewPackageAnchorInputError::ResultRequestAuthorityReferenceMismatch);
+    }
+    let result_entry = usize::try_from(result_binding.event_reference().entry_index().value())
+        .ok()
+        .and_then(|index| retained_journal.entries.get(index))
+        .ok_or(
+            RetainedReviewPackageAnchorInputError::ResultEventRequestAuthorityDependencyMissing,
+        )?;
+    if !result_entry
+        .authority_dependencies()
+        .contains(request_binding.event_reference())
+    {
+        return Err(
+            RetainedReviewPackageAnchorInputError::ResultEventRequestAuthorityDependencyMissing,
+        );
+    }
+    validate_review_package_anchor_transport(request_bytes, result_bytes)
+        .map_err(RetainedReviewPackageAnchorInputError::AnchorTransport)?;
+    let request = ReviewRequestRecord::decode_authoritative(request_bytes).map_err(|_| {
+        RetainedReviewPackageAnchorInputError::RequestBinding(
+            ReviewRequestRecordedBindingError::RequestDecode,
+        )
+    })?;
+    let resolved = retained_journal
+        .resolve_journal_anchor_id(request.review_package_anchor_id())
+        .map_err(RetainedReviewPackageAnchorInputError::AnchorResolution)?;
+    if resolved.anchor_id() != request.review_package_anchor_id() {
+        return Err(RetainedReviewPackageAnchorInputError::AnchorIdentityMismatch);
+    }
+    Ok(resolved)
 }
 
 /// Typed, Record-local fields for the frozen FREEZE_ATTEMPT_START Record schema.
