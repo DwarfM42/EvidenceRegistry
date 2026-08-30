@@ -3729,6 +3729,96 @@ pub fn resolve_review_admission_exact_scope_profile(
     Ok(scope)
 }
 
+/// Exact structural facts established before the v0.4 profile-specific
+/// Review Admission gate-Scope evaluator may be considered.
+///
+/// These facts are deliberately pre-evaluator only. They do not establish
+/// Policy authority, completion under §46, Policy satisfaction, Admission, a
+/// terminal disposition, or Journal publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionPolicyContextPrerequisites {
+    policy_record_id: RecordId,
+    gate_scope_ref: RecordId,
+    common_review_scope_ref: RecordId,
+}
+
+impl ReviewAdmissionPolicyContextPrerequisites {
+    /// The exact strictly decoded Policy identity bound to retained history.
+    pub fn policy_record_id(&self) -> RecordId {
+        self.policy_record_id
+    }
+
+    /// The exact Policy-declared profile-1 gate Scope identity.
+    pub fn gate_scope_ref(&self) -> RecordId {
+        self.gate_scope_ref
+    }
+
+    /// The exact common Request/Result profile-1 Review Scope identity.
+    pub fn common_review_scope_ref(&self) -> RecordId {
+        self.common_review_scope_ref
+    }
+}
+
+/// Fail-closed outcomes while establishing the v0.4 profile-specific
+/// Review Admission Policy context prerequisites.
+///
+/// None of these variants is an evaluator result or a completed Policy result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionPolicyContextPrerequisitesError {
+    /// Exact Policy bytes did not bind to the retained `POLICY_RECORDED` event.
+    PolicyBinding(ReviewAdmissionPolicyRecordedBindingError),
+    /// The common Request/Result §82 identity prerequisite did not hold.
+    CommonRequestResult(ReviewAdmissionCommonRequestResultError),
+    /// The Policy-declared gate Scope was unavailable, malformed, mismatched, or unsupported.
+    GateScope(ReviewAdmissionExactScopeProfileError),
+    /// The common Request/Result Review Scope was unavailable, malformed, mismatched, or unsupported.
+    CommonReviewScope(ReviewAdmissionExactScopeProfileError),
+}
+
+/// Establishes only the frozen v0.4 profile-specific structural prerequisites
+/// for a later Review Admission Policy evaluator.
+///
+/// This function first binds the exact Review Admission Policy to retained
+/// history, then requires the exact common Request/Result §82 identity facts,
+/// and finally resolves both named Scope identities as typed profile-1 empty
+/// payload SCOPE Records. It deliberately performs no evaluator dispatch, §46
+/// composition, Admission disposition selection, event construction, or
+/// Journal publication.
+pub fn validate_review_admission_policy_context_prerequisites(
+    retained_journal: &RetainedJournal,
+    policy_event_reference: &JournalReference,
+    policy_bytes: &[u8],
+    request_bytes: &[u8],
+    result_bytes: &[u8],
+    resolver: &impl ExactRecordByteResolver,
+) -> Result<ReviewAdmissionPolicyContextPrerequisites, ReviewAdmissionPolicyContextPrerequisitesError>
+{
+    let policy_binding = validate_review_admission_policy_recorded_binding(
+        retained_journal,
+        policy_event_reference,
+        policy_bytes,
+    )
+    .map_err(ReviewAdmissionPolicyContextPrerequisitesError::PolicyBinding)?;
+    let common_review_scope_ref =
+        validate_review_admission_common_request_result_fields(request_bytes, result_bytes)
+            .map_err(ReviewAdmissionPolicyContextPrerequisitesError::CommonRequestResult)?;
+    let policy = ReviewAdmissionPolicyRecord::decode_authoritative(policy_bytes).map_err(|_| {
+        ReviewAdmissionPolicyContextPrerequisitesError::PolicyBinding(
+            ReviewAdmissionPolicyRecordedBindingError::PolicyDecode,
+        )
+    })?;
+    let gate_scope_ref = policy.gate_scope_ref();
+    resolve_review_admission_exact_scope_profile(gate_scope_ref, resolver)
+        .map_err(ReviewAdmissionPolicyContextPrerequisitesError::GateScope)?;
+    resolve_review_admission_exact_scope_profile(common_review_scope_ref, resolver)
+        .map_err(ReviewAdmissionPolicyContextPrerequisitesError::CommonReviewScope)?;
+    Ok(ReviewAdmissionPolicyContextPrerequisites {
+        policy_record_id: policy_binding.policy_record_id(),
+        gate_scope_ref,
+        common_review_scope_ref,
+    })
+}
+
 /// Immutable registry metadata for a frozen POLICY evaluator.
 ///
 /// This metadata assigns no generic evaluation behavior to any field or Scope.

@@ -1,8 +1,10 @@
 use evidence_registry::{
     resolve_review_admission_exact_scope_profile,
+    validate_review_admission_policy_context_prerequisites,
     validate_review_admission_policy_recorded_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, GenesisJournalEntry, JournalEntryHash, JournalEntryIndex,
     JournalReference, PolicyEvaluationContext, RecordId, RegistryId, RetainedJournal,
+    ReviewAdmissionCommonRequestResultError, ReviewAdmissionPolicyContextPrerequisitesError,
     ReviewAdmissionPolicyRecord, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
@@ -29,14 +31,17 @@ fn append_journal_reference(output: &mut Vec<u8>, reference: &JournalReference) 
     append_bstr_32(output, *reference.event_record_id().as_bytes());
 }
 
-fn independently_construct_review_admission_policy(operation_start: &JournalReference) -> Vec<u8> {
+fn independently_construct_review_admission_policy(
+    operation_start: &JournalReference,
+    scope_ref: RecordId,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
     bytes.extend_from_slice(&[0x18, 40, 0x01, 0xa9, 0x00, 0x01, 0x01, 0x18, 40, 0x10]);
-    append_bstr_32(&mut bytes, id(0xc0));
+    append_bstr_32(&mut bytes, *scope_ref.as_bytes());
     bytes.extend_from_slice(&[0x11, 0x81, 0xa5, 0x00, 0x07, 0x01]);
-    append_bstr_32(&mut bytes, id(0xc0));
+    append_bstr_32(&mut bytes, *scope_ref.as_bytes());
     bytes.push(0x02);
     append_bstr_32(&mut bytes, id(0xe0));
     bytes.push(0x03);
@@ -99,6 +104,64 @@ fn independently_construct_exact_review_admission_scope() -> Vec<u8> {
     bytes
 }
 
+fn synthetic_reference(index: u64, event_type_id: u16, record_first: u8) -> JournalReference {
+    JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(index).unwrap(),
+        JournalEntryHash::try_from(id(0x80 + index as u8).as_slice()).unwrap(),
+        EventTypeId::try_from(u64::from(event_type_id)).unwrap(),
+        EventRecordId::try_from(id(record_first).as_slice()).unwrap(),
+    )
+}
+
+fn independently_construct_review_request_with_scope(scope_ref: RecordId) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[0x18, 30, 0x01, 0xac, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
+    append_journal_reference(&mut bytes, &synthetic_reference(0, 101, 0x20));
+    bytes.push(0x11);
+    append_bstr_32(&mut bytes, id(0x80));
+    bytes.extend_from_slice(&[0x12, 0x07, 0x13]);
+    append_bstr_32(&mut bytes, id(0xa0));
+    bytes.push(0x14);
+    append_journal_reference(&mut bytes, &synthetic_reference(1, 400, 0x40));
+    bytes.push(0x15);
+    append_bstr_32(&mut bytes, *scope_ref.as_bytes());
+    bytes.push(0x16);
+    append_bstr_32(&mut bytes, id(0xe0));
+    bytes.push(0x17);
+    append_bstr_32(&mut bytes, id(0x10));
+    bytes.extend_from_slice(&[0x18, 0x18]);
+    append_journal_reference(&mut bytes, &synthetic_reference(2, 300, 0x60));
+    bytes.extend_from_slice(&[0x18, 0x19, 0x01]);
+    bytes
+}
+
+fn independently_construct_review_result_with_scope(scope_ref: RecordId) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[0x18, 31, 0x01, 0xaf, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
+    append_journal_reference(&mut bytes, &synthetic_reference(1, 300, 0x20));
+    bytes.push(0x11);
+    append_journal_reference(&mut bytes, &synthetic_reference(0, 101, 0x20));
+    bytes.push(0x12);
+    append_bstr_32(&mut bytes, id(0x80));
+    bytes.extend_from_slice(&[0x13, 0x07, 0x14]);
+    append_bstr_32(&mut bytes, *scope_ref.as_bytes());
+    bytes.push(0x15);
+    append_bstr_32(&mut bytes, id(0xe0));
+    bytes.extend_from_slice(&[0x16, 0x01, 0x17, 0x01, 0x18, 0x18, 0x81, 0x62]);
+    bytes.extend_from_slice(b"OK");
+    bytes.extend_from_slice(&[0x18, 0x19, 0x80, 0x18, 0x1b]);
+    append_bstr_32(&mut bytes, id(0x10));
+    bytes.extend_from_slice(&[0x18, 0x1c]);
+    append_journal_reference(&mut bytes, &synthetic_reference(2, 300, 0x60));
+    bytes.extend_from_slice(&[0x18, 0x1d, 0x01]);
+    bytes
+}
+
 struct RecordBytes(Vec<(RecordId, Vec<u8>)>);
 
 impl ExactRecordByteResolver for RecordBytes {
@@ -113,7 +176,10 @@ impl ExactRecordByteResolver for RecordBytes {
 #[test]
 fn review_admission_policy_decodes_all_applicable_frozen_requirements() {
     let start_genesis = genesis();
-    let bytes = independently_construct_review_admission_policy(&genesis_reference(&start_genesis));
+    let bytes = independently_construct_review_admission_policy(
+        &genesis_reference(&start_genesis),
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
     assert!(StrictRecordFrame::decode_authoritative(&bytes).is_ok());
 
     let policy = ReviewAdmissionPolicyRecord::decode_authoritative(&bytes).unwrap();
@@ -136,8 +202,10 @@ fn review_admission_policy_decodes_all_applicable_frozen_requirements() {
 #[test]
 fn review_admission_policy_requires_exact_retained_policy_recording_and_prior_operation_start() {
     let genesis = genesis();
-    let policy_bytes =
-        independently_construct_review_admission_policy(&genesis_reference(&genesis));
+    let policy_bytes = independently_construct_review_admission_policy(
+        &genesis_reference(&genesis),
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
     let policy_record_id = RecordId::try_from(Sha256::digest(&policy_bytes).as_slice()).unwrap();
     let policy_entry = policy_recorded_entry(genesis.entry_hash(), policy_record_id);
     let policy_entry_hash: [u8; 32] = Sha256::digest(&policy_entry).into();
@@ -174,4 +242,79 @@ fn review_admission_exact_scope_profile_requires_exact_typed_empty_profile_paylo
     assert_eq!(scope.input().scope_profile_id, 1);
     assert_eq!(scope.input().scope_profile_version, 1);
     assert!(scope.input().scope_payload.is_empty());
+}
+
+#[test]
+fn review_admission_policy_context_prerequisites_stop_at_common_request_result_failure() {
+    let genesis = genesis();
+    let policy_bytes = independently_construct_review_admission_policy(
+        &genesis_reference(&genesis),
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
+    let policy_record_id = RecordId::try_from(Sha256::digest(&policy_bytes).as_slice()).unwrap();
+    let policy_entry = policy_recorded_entry(genesis.entry_hash(), policy_record_id);
+    let policy_entry_hash: [u8; 32] = Sha256::digest(&policy_entry).into();
+    let policy_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(policy_entry_hash.as_slice()).unwrap(),
+        EventTypeId::try_from(400_u64).unwrap(),
+        EventRecordId::try_from(policy_record_id.as_bytes().as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&policy_entry).unwrap();
+
+    assert_eq!(
+        validate_review_admission_policy_context_prerequisites(
+            &journal,
+            &policy_reference,
+            &policy_bytes,
+            &[0xff],
+            &[0xff],
+            &RecordBytes(vec![]),
+        ),
+        Err(
+            ReviewAdmissionPolicyContextPrerequisitesError::CommonRequestResult(
+                ReviewAdmissionCommonRequestResultError::RequestDecode
+            )
+        )
+    );
+}
+
+#[test]
+fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes() {
+    let genesis = genesis();
+    let scope_bytes = independently_construct_exact_review_admission_scope();
+    let scope_id = RecordId::try_from(Sha256::digest(&scope_bytes).as_slice()).unwrap();
+    let policy_bytes =
+        independently_construct_review_admission_policy(&genesis_reference(&genesis), scope_id);
+    let policy_record_id = RecordId::try_from(Sha256::digest(&policy_bytes).as_slice()).unwrap();
+    let policy_entry = policy_recorded_entry(genesis.entry_hash(), policy_record_id);
+    let policy_entry_hash: [u8; 32] = Sha256::digest(&policy_entry).into();
+    let policy_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(policy_entry_hash.as_slice()).unwrap(),
+        EventTypeId::try_from(400_u64).unwrap(),
+        EventRecordId::try_from(policy_record_id.as_bytes().as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&policy_entry).unwrap();
+    let request_bytes = independently_construct_review_request_with_scope(scope_id);
+    let result_bytes = independently_construct_review_result_with_scope(scope_id);
+    let resolver = RecordBytes(vec![(scope_id, scope_bytes)]);
+
+    let prerequisites = validate_review_admission_policy_context_prerequisites(
+        &journal,
+        &policy_reference,
+        &policy_bytes,
+        &request_bytes,
+        &result_bytes,
+        &resolver,
+    )
+    .unwrap();
+
+    assert_eq!(prerequisites.policy_record_id(), policy_record_id);
+    assert_eq!(prerequisites.gate_scope_ref(), scope_id);
+    assert_eq!(prerequisites.common_review_scope_ref(), scope_id);
 }
