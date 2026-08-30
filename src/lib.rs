@@ -3535,16 +3535,13 @@ pub enum ReviewAdmissionPolicyContextDeclaration {
     PolicyContextUnsupported,
 }
 
-/// Checks only whether the exact authoritative Policy declares the frozen
-/// REVIEW_ADMISSION context. This occurs before §46 requirement evaluation and
+/// Requires the sole exact context declaration of the frozen profile-1
+/// REVIEW_ADMISSION Policy. This occurs before §46 requirement evaluation and
 /// is not a completed Policy, evaluator, or Admission result.
 pub fn check_review_admission_policy_context(
     policy: &ReviewAdmissionPolicyRecord,
 ) -> ReviewAdmissionPolicyContextDeclaration {
-    if policy
-        .supported_context_ids()
-        .contains(&PolicyEvaluationContext::ReviewAdmission.id())
-    {
+    if policy.supported_context_ids() == [PolicyEvaluationContext::ReviewAdmission.id()] {
         ReviewAdmissionPolicyContextDeclaration::Declared
     } else {
         ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported

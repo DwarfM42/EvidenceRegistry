@@ -348,6 +348,27 @@ fn review_admission_policy_preserves_context_unsupported_before_requirement_eval
 }
 
 #[test]
+fn review_admission_policy_requires_the_exact_single_review_admission_context_for_profile_1015() {
+    let genesis = genesis();
+    let mut policy_bytes = independently_construct_review_admission_policy(
+        &genesis_reference(&genesis),
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
+    let context_offset = policy_bytes
+        .windows(3)
+        .position(|window| window == [0x18, 0x1e, 0x81])
+        .unwrap()
+        + 2;
+    policy_bytes.splice(context_offset..context_offset + 2, [0x82, 0x01, 0x02]);
+    let policy = ReviewAdmissionPolicyRecord::decode_authoritative(&policy_bytes).unwrap();
+
+    assert_eq!(
+        check_review_admission_policy_context(&policy),
+        ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported,
+    );
+}
+
+#[test]
 fn evaluator_1015_is_exactly_registered_and_returns_only_its_individual_scope_result() {
     let genesis = genesis();
     let common_scope_bytes = independently_construct_exact_review_admission_scope();
