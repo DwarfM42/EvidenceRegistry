@@ -1489,6 +1489,26 @@ impl RetainedJournal {
             .and_then(Self::from_genesis)
     }
 
+    /// Returns the exact current retained Journal head reference.
+    ///
+    /// A retained Journal is created only from GENESIS and never removes an
+    /// Entry, so this is always the final retained prefix. Reading this value
+    /// alone does not provide the serializable accept-and-snapshot operation
+    /// required for REVIEW_ADMISSION operation-start provenance.
+    pub fn current_head_reference(&self) -> JournalReference {
+        let entry = self
+            .entries
+            .last()
+            .expect("RetainedJournal is initialized from one GENESIS Entry");
+        JournalReference::new(
+            self.registry_id,
+            entry.entry_index(),
+            entry.entry_hash(),
+            entry.event_type_id(),
+            entry.event_record_id(),
+        )
+    }
+
     /// Resolves a version-1 Journal Anchor identity solely by reconstructing
     /// canonical Anchors from retained Journal prefixes.
     ///

@@ -411,6 +411,21 @@ fn retained_journal_resolves_a_version_1_anchor_only_from_its_retained_prefixes(
 }
 
 #[test]
+fn retained_journal_exposes_the_exact_current_head_for_accept_and_snapshot() {
+    let genesis = genesis();
+    let expected = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(0_u64).unwrap(),
+        genesis.entry_hash(),
+        evidence_registry::EventTypeId::try_from(1_u64).unwrap(),
+        EventRecordId::try_from(id(0x20).as_slice()).unwrap(),
+    );
+    let journal = RetainedJournal::from_genesis(genesis).unwrap();
+
+    assert_eq!(journal.current_head_reference(), expected);
+}
+
+#[test]
 fn policy_registry_binds_the_frozen_evaluator_1015_identity() {
     assert!(policy_evaluator_registry().iter().any(|registration| {
         registration.id == 1015
