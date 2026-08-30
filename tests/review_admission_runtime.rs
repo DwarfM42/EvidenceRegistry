@@ -1,13 +1,14 @@
 use evidence_registry::{
-    compare_retained_journal_anchor_history, resolve_retained_review_package_anchor_input,
-    route_retained_review_admission_section_82, route_review_admission_after_anchor_comparison,
-    validate_review_package_anchor_transport, validate_review_request_recorded_binding,
-    validate_review_result_recorded_binding, EventRecordId, GenesisJournalEntry, JournalAnchor,
-    JournalAnchorHistoryComparison, JournalEntryHash, JournalEntryIndex, JournalReference,
-    RecordId, RegistryId, RetainedJournal, RetainedReviewPackageAnchorInputError,
-    ReviewAdmissionSection82PrerequisiteFailure, ReviewAdmissionSection82RoutingOutcome,
-    ReviewPackageAnchorTransportError, ReviewRequestRecord, ReviewRequestRecordedBindingError,
-    ReviewResultRecord, ReviewResultRecordedBindingError, StrictRecordFrame,
+    compare_retained_journal_anchor_history, policy_evaluator_registry,
+    resolve_retained_review_package_anchor_input, route_retained_review_admission_section_82,
+    route_review_admission_after_anchor_comparison, validate_review_package_anchor_transport,
+    validate_review_request_recorded_binding, validate_review_result_recorded_binding,
+    EventRecordId, GenesisJournalEntry, JournalAnchor, JournalAnchorHistoryComparison,
+    JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
+    RetainedReviewPackageAnchorInputError, ReviewAdmissionSection82PrerequisiteFailure,
+    ReviewAdmissionSection82RoutingOutcome, ReviewPackageAnchorTransportError, ReviewRequestRecord,
+    ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
+    StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -240,6 +241,16 @@ fn retained_journal_resolves_a_version_1_anchor_only_from_its_retained_prefixes(
         .unwrap();
 
     assert_eq!(resolved.authoritative_cbor(), expected.authoritative_cbor());
+}
+
+#[test]
+fn retained_anchor_routing_exposes_no_evaluator_1015_registration() {
+    assert!(
+        policy_evaluator_registry()
+            .iter()
+            .all(|registration| registration.id != 1015),
+        "the retained-anchor routing boundary must not expose evaluator 1015 metadata",
+    );
 }
 
 #[test]

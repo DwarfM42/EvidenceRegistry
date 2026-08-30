@@ -3345,7 +3345,7 @@ pub struct PolicyEvaluatorRegistration {
     pub name: &'static str,
 }
 
-const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 15] = [
+const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 14] = [
     PolicyEvaluatorRegistration {
         id: 1001,
         name: "POLICY_REVIEW_REQUIREMENT_MATCH",
@@ -3402,56 +3402,11 @@ const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 15] = [
         id: 1014,
         name: "POLICY_SUPPORTED_CONTEXT",
     },
-    PolicyEvaluatorRegistration {
-        id: 1015,
-        name: "REVIEW_ADMISSION_EXACT_REVIEW_SCOPE_BINDING",
-    },
 ];
 
-/// The frozen evaluator registry as declared by Record Schema v0.4 §41.
+/// Registry metadata retained outside the unavailable Review Admission evaluator lane.
 pub fn policy_evaluator_registry() -> &'static [PolicyEvaluatorRegistration] {
     &POLICY_EVALUATOR_REGISTRY
-}
-
-/// The one Policy field/context pair evaluated by evaluator 1015.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PolicyFieldEvaluatorMapping {
-    pub evaluator_id: u16,
-    pub field_name: &'static str,
-    pub context: PolicyEvaluationContext,
-}
-
-const EVALUATOR_1015_FIELD_MAPPING: PolicyFieldEvaluatorMapping = PolicyFieldEvaluatorMapping {
-    evaluator_id: 1015,
-    field_name: "gate_scope_ref",
-    context: PolicyEvaluationContext::ReviewAdmission,
-};
-
-/// Returns the sole field applicability mapping introduced by evaluator 1015.
-pub fn policy_evaluator_1015_field_mapping() -> PolicyFieldEvaluatorMapping {
-    EVALUATOR_1015_FIELD_MAPPING
-}
-
-/// The only SCOPE profile understood by evaluator 1015.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReviewAdmissionScopeProfileRegistration {
-    pub profile_id: u64,
-    pub profile_version: u64,
-    pub requires_empty_payload: bool,
-    pub context: PolicyEvaluationContext,
-}
-
-const EVALUATOR_1015_SCOPE_PROFILE: ReviewAdmissionScopeProfileRegistration =
-    ReviewAdmissionScopeProfileRegistration {
-        profile_id: 1,
-        profile_version: 1,
-        requires_empty_payload: true,
-        context: PolicyEvaluationContext::ReviewAdmission,
-    };
-
-/// Returns evaluator 1015's narrow, non-generic Scope profile registration.
-pub fn review_admission_scope_profile_1_v1() -> ReviewAdmissionScopeProfileRegistration {
-    EVALUATOR_1015_SCOPE_PROFILE
 }
 
 /// A §82 returned-Anchor comparison that prevents Policy evaluation from starting.
@@ -3512,14 +3467,43 @@ pub fn route_review_admission_after_anchor_comparison(
 /// Admission, terminal Record construction, or Journal publication.
 ///
 /// ```compile_fail
-/// use evidence_registry::{
-///     compose_review_admission_policy_46,
-///     derive_review_admission_lifecycle_outcome,
-///     evaluate_review_admission_gate_scope_1015,
-///     PolicyCompositionResult,
-///     ReviewAdmissionGateScopePolicy,
-///     ReviewAdmissionLifecycleOutcome,
-/// };
+/// use evidence_registry::compose_review_admission_policy_46;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::derive_review_admission_lifecycle_outcome;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::evaluate_review_admission_gate_scope_1015;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::PolicyCompositionResult;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::ReviewAdmissionGateScopePolicy;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::ReviewAdmissionLifecycleOutcome;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::PolicyFieldEvaluatorMapping;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::policy_evaluator_1015_field_mapping;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::ReviewAdmissionScopeProfileRegistration;
+/// ```
+///
+/// ```compile_fail
+/// use evidence_registry::review_admission_scope_profile_1_v1;
 /// ```
 ///
 /// The generic retained-history route intentionally exposes none of those
