@@ -6,7 +6,8 @@ use evidence_registry::{
     JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
     RetainedReviewPackageAnchorInputError, ReviewAdmissionSection82PrerequisiteFailure,
     ReviewAdmissionSection82RoutingOutcome, ReviewPackageAnchorTransportError, ReviewRequestRecord,
-    ReviewRequestRecordedBindingError, ReviewResultRecord, StrictRecordFrame,
+    ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
+    StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -87,6 +88,7 @@ fn independently_construct_version_1_review_request_with_anchor_id(
 fn review_request_recorded_entry(
     previous_entry_hash: JournalEntryHash,
     review_request_record_id: RecordId,
+    review_package_anchor_id: Option<[u8; 32]>,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
@@ -97,7 +99,14 @@ fn review_request_recorded_entry(
     bytes.extend_from_slice(previous_entry_hash.as_bytes());
     bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x2c, 0x05]);
     append_bstr_32(&mut bytes, *review_request_record_id.as_bytes());
-    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x04, 0x09]);
+    bytes.push(0x06);
+    if let Some(review_package_anchor_id) = review_package_anchor_id {
+        bytes.extend_from_slice(&[0x81, 0x82, 0x02]);
+        append_bstr_32(&mut bytes, review_package_anchor_id);
+    } else {
+        bytes.push(0x80);
+    }
+    bytes.extend_from_slice(&[0x07, 0x80, 0x08, 0x04, 0x09]);
     append_bstr_32(&mut bytes, *review_request_record_id.as_bytes());
     bytes.extend_from_slice(&[0x0a]);
     append_bstr_32(&mut bytes, id(0x40));
@@ -146,6 +155,7 @@ fn review_result_recorded_entry(
     entry_index: u8,
     previous_entry_hash: JournalEntryHash,
     review_result_record_id: RecordId,
+    review_package_anchor_id: Option<[u8; 32]>,
     request_authority_dependency: Option<&JournalReference>,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -157,7 +167,14 @@ fn review_result_recorded_entry(
     bytes.extend_from_slice(previous_entry_hash.as_bytes());
     bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x2d, 0x05]);
     append_bstr_32(&mut bytes, *review_result_record_id.as_bytes());
-    bytes.extend_from_slice(&[0x06, 0x80, 0x07]);
+    bytes.push(0x06);
+    if let Some(review_package_anchor_id) = review_package_anchor_id {
+        bytes.extend_from_slice(&[0x81, 0x82, 0x02]);
+        append_bstr_32(&mut bytes, review_package_anchor_id);
+    } else {
+        bytes.push(0x80);
+    }
+    bytes.push(0x07);
     if let Some(request_authority_dependency) = request_authority_dependency {
         bytes.push(0x81);
         append_journal_reference(&mut bytes, request_authority_dependency);
@@ -193,6 +210,88 @@ fn retained_journal_resolves_a_version_1_anchor_only_from_its_retained_prefixes(
 }
 
 #[test]
+fn retained_anchor_history_comparator_classifies_every_section_116_relation() {
+    let genesis = genesis();
+    let genesis_anchor = JournalAnchor::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(0_u64).unwrap(),
+        genesis.entry_hash(),
+        1,
+    )
+    .unwrap();
+    let request_bytes = independently_construct_version_1_review_request();
+    let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
+    let entry = review_request_recorded_entry(
+        genesis.entry_hash(),
+        request.record_id(),
+        Some(*request.review_package_anchor_id().as_bytes()),
+    );
+    let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&entry).unwrap();
+    let current_anchor = JournalAnchor::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let diverged_anchor = JournalAnchor::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(0_u64).unwrap(),
+        JournalEntryHash::try_from(id(0xd0).as_slice()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let behind_anchor = JournalAnchor::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(2_u64).unwrap(),
+        JournalEntryHash::try_from(id(0xd0).as_slice()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let foreign_anchor = JournalAnchor::new(
+        RegistryId::try_from(id(0x01).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(0_u64).unwrap(),
+        JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let invalid_anchor = JournalAnchor::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(0_u64).unwrap(),
+        JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(
+        compare_retained_journal_anchor_history(&journal, &current_anchor),
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead
+    );
+    assert_eq!(
+        compare_retained_journal_anchor_history(&journal, &genesis_anchor),
+        JournalAnchorHistoryComparison::AnchorIsValidAncestor
+    );
+    assert_eq!(
+        compare_retained_journal_anchor_history(&journal, &diverged_anchor),
+        JournalAnchorHistoryComparison::JournalDivergence
+    );
+    assert_eq!(
+        compare_retained_journal_anchor_history(&journal, &behind_anchor),
+        JournalAnchorHistoryComparison::JournalHistoryBehindAnchor
+    );
+    assert_eq!(
+        compare_retained_journal_anchor_history(&journal, &foreign_anchor),
+        JournalAnchorHistoryComparison::AnchorFromDifferentRegistry
+    );
+    assert_eq!(
+        compare_retained_journal_anchor_history(&journal, &invalid_anchor),
+        JournalAnchorHistoryComparison::AnchorInvalid
+    );
+}
+
+#[test]
 fn version_1_review_request_strictly_decodes_its_anchor_transport_fields() {
     let bytes = independently_construct_version_1_review_request();
     assert!(
@@ -219,7 +318,11 @@ fn version_1_review_request_requires_its_exact_retained_recorded_event() {
     let genesis = genesis();
     let request_bytes = independently_construct_version_1_review_request();
     let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
-    let entry = review_request_recorded_entry(genesis.entry_hash(), request.record_id());
+    let entry = review_request_recorded_entry(
+        genesis.entry_hash(),
+        request.record_id(),
+        Some(*request.review_package_anchor_id().as_bytes()),
+    );
     let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
     let recorded_reference = JournalReference::new(
         RegistryId::try_from(id(0x00).as_slice()).unwrap(),
@@ -239,11 +342,85 @@ fn version_1_review_request_requires_its_exact_retained_recorded_event() {
 }
 
 #[test]
+fn version_1_review_request_recorded_event_requires_its_matching_anchor_identity_commitment() {
+    let genesis = genesis();
+    let request_bytes = independently_construct_version_1_review_request();
+    let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
+    // This retained event deliberately has no identity dependencies. A v1
+    // REVIEW_REQUEST_RECORDED event must not bind without its exact typed
+    // JOURNAL_ANCHOR_ID commitment.
+    let entry = review_request_recorded_entry(genesis.entry_hash(), request.record_id(), None);
+    let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+    let recorded_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
+        EventRecordId::try_from(request.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&entry).unwrap();
+
+    assert_eq!(
+        validate_review_request_recorded_binding(&journal, &recorded_reference, &request_bytes),
+        Err(ReviewRequestRecordedBindingError::RequestEventAnchorIdentityDependencyMismatch),
+        "a v1 REVIEW_REQUEST_RECORDED event without JOURNAL_ANCHOR_ID must fail closed",
+    );
+}
+
+#[test]
+fn version_1_review_request_recorded_event_rejects_substituted_or_wrong_kind_anchor_commitments() {
+    let genesis = genesis();
+    let request_bytes = independently_construct_version_1_review_request();
+    let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
+
+    for (identity_anchor, wrong_kind) in [
+        (id(0x11), false),
+        (*request.review_package_anchor_id().as_bytes(), true),
+    ] {
+        let mut entry = review_request_recorded_entry(
+            genesis.entry_hash(),
+            request.record_id(),
+            Some(identity_anchor),
+        );
+        if wrong_kind {
+            let kind_offset = entry
+                .windows(5)
+                .position(|window| window == [0x81, 0x82, 0x02, 0x58, 0x20])
+                .unwrap()
+                + 2;
+            entry[kind_offset] = 0x01;
+        }
+        let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+        let recorded_reference = JournalReference::new(
+            RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+            JournalEntryIndex::try_from(1_u64).unwrap(),
+            JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+            evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
+            EventRecordId::try_from(request.record_id().as_bytes().as_slice()).unwrap(),
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis.clone()).unwrap();
+        journal.append_strict_entry(&entry).unwrap();
+
+        assert_eq!(
+            validate_review_request_recorded_binding(&journal, &recorded_reference, &request_bytes),
+            Err(ReviewRequestRecordedBindingError::RequestEventAnchorIdentityDependencyMismatch)
+        );
+    }
+}
+
+#[test]
 fn version_1_review_result_requires_its_exact_retained_recorded_event() {
     let genesis = genesis();
     let result_bytes = independently_construct_version_1_review_result();
     let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
-    let entry = review_result_recorded_entry(1, genesis.entry_hash(), result.record_id(), None);
+    let entry = review_result_recorded_entry(
+        1,
+        genesis.entry_hash(),
+        result.record_id(),
+        Some(*result.review_package_anchor_id().as_bytes()),
+        None,
+    );
     let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
     let recorded_reference = JournalReference::new(
         RegistryId::try_from(id(0x00).as_slice()).unwrap(),
@@ -260,6 +437,59 @@ fn version_1_review_result_requires_its_exact_retained_recorded_event() {
             .unwrap();
 
     assert_eq!(binding.record_id(), result.record_id());
+}
+
+#[test]
+fn version_1_review_result_recorded_event_requires_its_matching_anchor_identity_commitment() {
+    let genesis = genesis();
+    let result_bytes = independently_construct_version_1_review_result();
+    let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
+    let entry =
+        review_result_recorded_entry(1, genesis.entry_hash(), result.record_id(), None, None);
+    let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+    let recorded_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(301_u64).unwrap(),
+        EventRecordId::try_from(result.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&entry).unwrap();
+
+    assert_eq!(
+        validate_review_result_recorded_binding(&journal, &recorded_reference, &result_bytes),
+        Err(ReviewResultRecordedBindingError::ResultEventAnchorIdentityDependencyMismatch),
+    );
+}
+
+#[test]
+fn version_1_review_result_recorded_event_rejects_a_substituted_anchor_identity_commitment() {
+    let genesis = genesis();
+    let result_bytes = independently_construct_version_1_review_result();
+    let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
+    let entry = review_result_recorded_entry(
+        1,
+        genesis.entry_hash(),
+        result.record_id(),
+        Some(id(0x11)),
+        None,
+    );
+    let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+    let recorded_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(301_u64).unwrap(),
+        EventRecordId::try_from(result.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&entry).unwrap();
+
+    assert_eq!(
+        validate_review_result_recorded_binding(&journal, &recorded_reference, &result_bytes),
+        Err(ReviewResultRecordedBindingError::ResultEventAnchorIdentityDependencyMismatch),
+    );
 }
 
 #[test]
@@ -295,7 +525,11 @@ fn retained_review_package_anchor_input_uses_exact_request_result_transport_and_
         *expected_anchor.anchor_id().as_bytes(),
     );
     let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
-    let request_entry = review_request_recorded_entry(genesis.entry_hash(), request.record_id());
+    let request_entry = review_request_recorded_entry(
+        genesis.entry_hash(),
+        request.record_id(),
+        Some(*request.review_package_anchor_id().as_bytes()),
+    );
     let request_entry_hash: [u8; 32] = Sha256::digest(&request_entry).into();
     let request_reference = JournalReference::new(
         RegistryId::try_from(id(0x00).as_slice()).unwrap(),
@@ -313,6 +547,7 @@ fn retained_review_package_anchor_input_uses_exact_request_result_transport_and_
         2,
         JournalEntryHash::try_from(request_entry_hash.as_slice()).unwrap(),
         result.record_id(),
+        Some(*result.review_package_anchor_id().as_bytes()),
         Some(&request_reference),
     );
     let result_entry_hash: [u8; 32] = Sha256::digest(&result_entry).into();
@@ -369,6 +604,49 @@ fn retained_review_package_input_failure_is_preterminal_and_does_not_invoke_poli
             ReviewAdmissionSection82PrerequisiteFailure::RetainedAnchorInput(
                 RetainedReviewPackageAnchorInputError::RequestBinding(
                     ReviewRequestRecordedBindingError::RequestDecode
+                )
+            )
+        )
+    );
+    assert_eq!(policy_evaluation_calls.get(), 0);
+}
+
+#[test]
+fn retained_request_anchor_identity_failure_is_preterminal_and_does_not_invoke_policy_evaluation() {
+    let genesis = genesis();
+    let request_bytes = independently_construct_version_1_review_request();
+    let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
+    let entry = review_request_recorded_entry(genesis.entry_hash(), request.record_id(), None);
+    let entry_hash: [u8; 32] = Sha256::digest(&entry).into();
+    let request_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(entry_hash.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
+        EventRecordId::try_from(request.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&entry).unwrap();
+    let policy_evaluation_calls = std::cell::Cell::new(0_u8);
+
+    let outcome = route_retained_review_admission_section_82(
+        &journal,
+        &request_reference,
+        &request_bytes,
+        &reference(2, 301, 0x40),
+        &[0xff],
+        || {
+            policy_evaluation_calls.set(policy_evaluation_calls.get() + 1);
+            unreachable!("a retained Request anchor-identity failure must not evaluate Policy")
+        },
+    );
+
+    assert_eq!(
+        outcome,
+        ReviewAdmissionSection82RoutingOutcome::PreTerminal(
+            ReviewAdmissionSection82PrerequisiteFailure::RetainedAnchorInput(
+                RetainedReviewPackageAnchorInputError::RequestBinding(
+                    ReviewRequestRecordedBindingError::RequestEventAnchorIdentityDependencyMismatch
                 )
             )
         )

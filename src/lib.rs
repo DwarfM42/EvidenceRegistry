@@ -1092,6 +1092,7 @@ struct CommonRetainedJournalEntry {
     lifecycle_object_kind: LifecycleObjectKind,
     lifecycle_object_id: [u8; ID_LENGTH],
     freeze_attempt_intended_root_id: Option<IntendedRootId>,
+    identity_dependencies: IdentityDependencyCollection,
     authority_dependencies: AuthorityDependencyCollection,
     authoritative_bytes: Vec<u8>,
 }
@@ -1183,6 +1184,13 @@ impl RetainedJournalEntry {
         match self {
             Self::Genesis(_) => &[],
             Self::Common(entry) => &entry.authority_dependencies.elements,
+        }
+    }
+
+    fn identity_dependencies(&self) -> &[IdentityDependency] {
+        match self {
+            Self::Genesis(_) => &[],
+            Self::Common(entry) => &entry.identity_dependencies.elements,
         }
     }
 }
@@ -1656,6 +1664,7 @@ impl RetainedJournal {
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
             freeze_attempt_intended_root_id: None,
+            identity_dependencies: common.identity_dependencies,
             authority_dependencies: common.authority_dependencies,
             authoritative_bytes: input.to_vec(),
         }))
@@ -1703,6 +1712,7 @@ impl RetainedJournal {
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
             freeze_attempt_intended_root_id: Some(intended_root_id),
+            identity_dependencies: common.identity_dependencies,
             authority_dependencies: common.authority_dependencies,
             authoritative_bytes: input.to_vec(),
         }))
@@ -1761,6 +1771,7 @@ impl RetainedJournal {
             lifecycle_object_kind: common.lifecycle_object_kind,
             lifecycle_object_id: common.lifecycle_object_id,
             freeze_attempt_intended_root_id: None,
+            identity_dependencies: common.identity_dependencies,
             authority_dependencies: common.authority_dependencies,
             authoritative_bytes: input.to_vec(),
         }))
@@ -2094,6 +2105,19 @@ impl RetainedJournal {
         }
         self.entries.push(entry);
         Ok(())
+    }
+
+    fn identity_dependencies_for_reference(
+        &self,
+        reference: &JournalReference,
+    ) -> Result<&[IdentityDependency], RetainedJournalError> {
+        self.resolve_reference(reference)?;
+        let entry_index = usize::try_from(reference.entry_index().value())
+            .map_err(|_| RetainedJournalError::MissingReference)?;
+        self.entries
+            .get(entry_index)
+            .map(RetainedJournalEntry::identity_dependencies)
+            .ok_or(RetainedJournalError::MissingReference)
     }
 }
 
@@ -3603,12 +3627,13 @@ pub enum ReviewAdmissionSection82PrerequisiteFailure {
 /// subsequent Policy evaluation.
 ///
 /// `PreTerminal` is not an accepted or rejected Admission disposition and must
-/// not produce event 302 or 303. `PolicyEvaluation` returns only the existing
-/// direction derived by the caller's separately established Policy path.
+/// not produce event 302 or 303. `PolicyRouteEligible` is only a retained
+/// structural handoff point; it neither evaluates Policy nor represents §46,
+/// Admission, a terminal event, or Journal publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewAdmissionSection82RoutingOutcome {
     PreTerminal(ReviewAdmissionSection82PrerequisiteFailure),
-    PolicyEvaluation(ReviewAdmissionLifecycleOutcome),
+    PolicyRouteEligible,
 }
 
 /// Routes a completed retained-Journal Anchor comparison before Policy work.
@@ -3619,14 +3644,13 @@ pub enum ReviewAdmissionSection82RoutingOutcome {
 /// composition, or terminal-event publication.
 pub fn route_review_admission_after_anchor_comparison(
     comparison: JournalAnchorHistoryComparison,
-    evaluate_policy: impl FnOnce() -> PolicyCompositionResult,
+    on_policy_route_eligible: impl FnOnce(),
 ) -> ReviewAdmissionSection82RoutingOutcome {
     match comparison {
         JournalAnchorHistoryComparison::AnchorEqualsCurrentHead
         | JournalAnchorHistoryComparison::AnchorIsValidAncestor => {
-            ReviewAdmissionSection82RoutingOutcome::PolicyEvaluation(
-                derive_review_admission_lifecycle_outcome(evaluate_policy()),
-            )
+            on_policy_route_eligible();
+            ReviewAdmissionSection82RoutingOutcome::PolicyRouteEligible
         }
         failure => ReviewAdmissionSection82RoutingOutcome::PreTerminal(
             ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(failure),
@@ -3639,16 +3663,16 @@ pub fn route_review_admission_after_anchor_comparison(
 ///
 /// A strict input/binding/recovery failure is a pre-terminal §82 prerequisite
 /// failure. Only after retained-only Anchor recovery and an acceptable §116
-/// comparison may the separately established Policy path be invoked. This does
-/// not establish authority, Policy completion, Admission, terminal Record
-/// construction, or Journal publication.
+/// comparison may a separately established Policy process be notified of an
+/// eligible route. This function does not receive or return Policy completion,
+/// Admission, terminal Record construction, or Journal publication.
 pub fn route_retained_review_admission_section_82(
     retained_journal: &RetainedJournal,
     request_event_reference: &JournalReference,
     request_bytes: &[u8],
     result_event_reference: &JournalReference,
     result_bytes: &[u8],
-    evaluate_policy: impl FnOnce() -> PolicyCompositionResult,
+    on_policy_route_eligible: impl FnOnce(),
 ) -> ReviewAdmissionSection82RoutingOutcome {
     let anchor = match resolve_retained_review_package_anchor_input(
         retained_journal,
@@ -3666,7 +3690,7 @@ pub fn route_retained_review_admission_section_82(
     };
     route_review_admission_after_anchor_comparison(
         compare_retained_journal_anchor_history(retained_journal, &anchor),
-        evaluate_policy,
+        on_policy_route_eligible,
     )
 }
 
@@ -4230,6 +4254,21 @@ pub enum ReviewRequestRecordedBindingError {
     RequestEventMismatch,
     /// The strict Request self-hash differs from the retained Entry Record identity.
     RequestEventRecordIdentityMismatch,
+    /// The retained event lacks exactly one matching `JOURNAL_ANCHOR_ID` commitment.
+    RequestEventAnchorIdentityDependencyMismatch,
+}
+
+fn has_exact_journal_anchor_identity_dependency(
+    dependencies: &[IdentityDependency],
+    expected: JournalAnchorId,
+) -> bool {
+    let mut anchors = dependencies
+        .iter()
+        .filter_map(|dependency| match dependency {
+            IdentityDependency::JournalAnchorId(anchor_id) => Some(*anchor_id),
+            IdentityDependency::RecordId(_) => None,
+        });
+    matches!((anchors.next(), anchors.next()), (Some(actual), None) if actual == expected)
 }
 
 /// Validates only the exact prospective REVIEW_REQUEST Record-to-retained-event
@@ -4254,6 +4293,17 @@ pub fn validate_review_request_recorded_binding(
     }
     if request_event.event_record_id().as_bytes() != request.record_id().as_bytes() {
         return Err(ReviewRequestRecordedBindingError::RequestEventRecordIdentityMismatch);
+    }
+    let identity_dependencies = retained_journal
+        .identity_dependencies_for_reference(request_event_reference)
+        .map_err(ReviewRequestRecordedBindingError::RequestEventReference)?;
+    if !has_exact_journal_anchor_identity_dependency(
+        identity_dependencies,
+        request.review_package_anchor_id(),
+    ) {
+        return Err(
+            ReviewRequestRecordedBindingError::RequestEventAnchorIdentityDependencyMismatch,
+        );
     }
     Ok(ReviewRequestRecordedBinding {
         record_id: request.record_id(),
@@ -4296,6 +4346,8 @@ pub enum ReviewResultRecordedBindingError {
     ResultEventMismatch,
     /// The strict Result self-hash differs from the retained Entry Record identity.
     ResultEventRecordIdentityMismatch,
+    /// The retained event lacks exactly one matching `JOURNAL_ANCHOR_ID` commitment.
+    ResultEventAnchorIdentityDependencyMismatch,
 }
 
 /// Validates only the exact prospective REVIEW_RESULT Record-to-retained-event
@@ -4320,6 +4372,15 @@ pub fn validate_review_result_recorded_binding(
     }
     if result_event.event_record_id().as_bytes() != result.record_id().as_bytes() {
         return Err(ReviewResultRecordedBindingError::ResultEventRecordIdentityMismatch);
+    }
+    let identity_dependencies = retained_journal
+        .identity_dependencies_for_reference(result_event_reference)
+        .map_err(ReviewResultRecordedBindingError::ResultEventReference)?;
+    if !has_exact_journal_anchor_identity_dependency(
+        identity_dependencies,
+        result.review_package_anchor_id(),
+    ) {
+        return Err(ReviewResultRecordedBindingError::ResultEventAnchorIdentityDependencyMismatch);
     }
     Ok(ReviewResultRecordedBinding {
         record_id: result.record_id(),

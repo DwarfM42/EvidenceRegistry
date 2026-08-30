@@ -176,26 +176,48 @@ fn e1015_section_82_scope_mismatch_short_circuits_before_evaluator_or_policy_res
 }
 
 #[test]
-fn returned_anchor_divergence_is_preterminal_and_does_not_invoke_policy_evaluation() {
-    let policy_evaluation_calls = Cell::new(0_u8);
-
-    let outcome = route_review_admission_after_anchor_comparison(
+fn returned_anchor_failures_are_preterminal_and_do_not_invoke_policy_evaluation() {
+    for comparison in [
         JournalAnchorHistoryComparison::JournalDivergence,
-        || {
+        JournalAnchorHistoryComparison::JournalHistoryBehindAnchor,
+        JournalAnchorHistoryComparison::AnchorFromDifferentRegistry,
+        JournalAnchorHistoryComparison::AnchorInvalid,
+    ] {
+        let policy_evaluation_calls = Cell::new(0_u8);
+
+        let outcome = route_review_admission_after_anchor_comparison(comparison, || {
             policy_evaluation_calls.set(policy_evaluation_calls.get() + 1);
             unreachable!("a returned-anchor §82 prerequisite failure must not evaluate Policy")
-        },
-    );
+        });
 
-    assert_eq!(
-        outcome,
-        ReviewAdmissionSection82RoutingOutcome::PreTerminal(
-            ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(
-                JournalAnchorHistoryComparison::JournalDivergence
+        assert_eq!(
+            outcome,
+            ReviewAdmissionSection82RoutingOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(comparison)
             )
-        )
-    );
-    assert_eq!(policy_evaluation_calls.get(), 0);
+        );
+        assert_eq!(policy_evaluation_calls.get(), 0);
+    }
+}
+
+#[test]
+fn acceptable_anchor_hands_off_without_fabricating_a_policy_or_terminal_result() {
+    for comparison in [
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead,
+        JournalAnchorHistoryComparison::AnchorIsValidAncestor,
+    ] {
+        let policy_handoff_calls = Cell::new(0_u8);
+
+        let outcome = route_review_admission_after_anchor_comparison(comparison, || {
+            policy_handoff_calls.set(policy_handoff_calls.get() + 1)
+        });
+
+        assert_eq!(
+            outcome,
+            ReviewAdmissionSection82RoutingOutcome::PolicyRouteEligible
+        );
+        assert_eq!(policy_handoff_calls.get(), 1);
+    }
 }
 
 #[test]
