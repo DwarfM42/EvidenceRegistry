@@ -4019,6 +4019,113 @@ pub fn route_retained_review_admission_section_82(
     )
 }
 
+/// The bounded post-Anchor route into authoritative Review Admission Policy
+/// context prerequisites.
+///
+/// `PolicyContextReady` establishes only the retained Request-selected Policy
+/// identity and its v0.4 structural context prerequisites. It is not §46
+/// completion, Policy satisfaction, Admission, a terminal disposition, or
+/// Journal publication. Every other variant is pre-terminal and must not be
+/// relabeled as a completed Policy result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionPolicyContextRouteOutcome {
+    PreTerminal(ReviewAdmissionSection82PrerequisiteFailure),
+    PolicyContextPrecondition(ReviewAdmissionPolicyContextRouteError),
+    PolicyContextReady(ReviewAdmissionPolicyContextPrerequisites),
+}
+
+/// Fail-closed outcomes after a retained Review Package Anchor has reached an
+/// acceptable §116 relationship but before §46 evaluation can begin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionPolicyContextRouteError {
+    RequestDecode,
+    PolicyPayloadUnavailable,
+    PolicyContextPrerequisites(ReviewAdmissionPolicyContextPrerequisitesError),
+}
+
+/// Resolves the sole authoritative Review Admission Policy from the exact
+/// retained Review Request after, and only after, the retained-Journal Anchor
+/// prerequisite succeeds.
+///
+/// The caller supplies no Policy reference or Policy bytes: both are derived
+/// from the strictly decoded Request's `policy_authority_ref`, retained Journal
+/// binding, and exact Record-id keyed byte resolver. This function deliberately
+/// stops before evaluator dispatch, §46 composition, Admission construction,
+/// terminal events, or publication.
+pub fn route_retained_review_admission_policy_context(
+    retained_journal: &RetainedJournal,
+    request_event_reference: &JournalReference,
+    request_bytes: &[u8],
+    result_event_reference: &JournalReference,
+    result_bytes: &[u8],
+    resolver: &impl ExactRecordByteResolver,
+) -> ReviewAdmissionPolicyContextRouteOutcome {
+    let anchor = match resolve_retained_review_package_anchor_input(
+        retained_journal,
+        request_event_reference,
+        request_bytes,
+        result_event_reference,
+        result_bytes,
+    ) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            return ReviewAdmissionPolicyContextRouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::RetainedAnchorInput(error),
+            );
+        }
+    };
+    match compare_retained_journal_anchor_history(retained_journal, &anchor) {
+        JournalAnchorHistoryComparison::AnchorEqualsCurrentHead
+        | JournalAnchorHistoryComparison::AnchorIsValidAncestor => {}
+        failure => {
+            return ReviewAdmissionPolicyContextRouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::ReturnedAnchorComparison(failure),
+            );
+        }
+    }
+    let request = match ReviewRequestRecord::decode_authoritative(request_bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            return ReviewAdmissionPolicyContextRouteOutcome::PolicyContextPrecondition(
+                ReviewAdmissionPolicyContextRouteError::RequestDecode,
+            );
+        }
+    };
+    let policy_event_reference = request.policy_authority_ref();
+    let policy_record_id = match RecordId::try_from(
+        policy_event_reference
+            .event_record_id()
+            .as_bytes()
+            .as_slice(),
+    ) {
+        Ok(record_id) => record_id,
+        Err(_) => unreachable!("EventRecordId has RecordId width"),
+    };
+    let policy_bytes = match resolver.resolve(policy_record_id) {
+        Some(bytes) => bytes,
+        None => {
+            return ReviewAdmissionPolicyContextRouteOutcome::PolicyContextPrecondition(
+                ReviewAdmissionPolicyContextRouteError::PolicyPayloadUnavailable,
+            );
+        }
+    };
+    match validate_review_admission_policy_context_prerequisites(
+        retained_journal,
+        policy_event_reference,
+        policy_bytes,
+        request_bytes,
+        result_bytes,
+        resolver,
+    ) {
+        Ok(prerequisites) => {
+            ReviewAdmissionPolicyContextRouteOutcome::PolicyContextReady(prerequisites)
+        }
+        Err(error) => ReviewAdmissionPolicyContextRouteOutcome::PolicyContextPrecondition(
+            ReviewAdmissionPolicyContextRouteError::PolicyContextPrerequisites(error),
+        ),
+    }
+}
+
 /// Exact structural facts obtained by resolving a minimal POLICY's declared gate Scope.
 ///
 /// This result establishes only strict local decoding and exact self-hash identity binding.
