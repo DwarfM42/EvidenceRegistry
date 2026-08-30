@@ -4034,6 +4034,8 @@ pub enum ReviewAdmissionSection82AuthorityError {
     PolicyPayloadUnavailable,
     PolicyDecode,
     PolicyIdentityMismatch,
+    /// The exact retained Policy chronology, context declaration, or named Scope inputs failed.
+    PolicyContextPrerequisites(ReviewAdmissionPolicyContextPrerequisitesError),
     RequestOperationStartReference(RetainedJournalError),
     RequestOperationStartNotStrictlyPrior,
     ResultOperationStartReference(RetainedJournalError),
@@ -4055,9 +4057,10 @@ pub enum ReviewAdmissionSection82AuthorityError {
 /// exact Request and Result events, their chronology, the returned Anchor, and
 /// the retained FREEZE_COMMITTED Receipt/START/MANIFEST topology. The current
 /// inputs cannot prove authoritative Journal/store provenance or an authoritative
-/// Record namespace, so even a structurally complete chain ends with
+/// Record namespace. A successful return establishes only that every available
+/// structural prerequisite was checked; callers must still stop preterminally at
 /// `FreezeAuthorityEvidenceUnavailable` before Policy evaluation.
-fn check_review_admission_section_82_authority_inputs(
+fn validate_review_admission_section_82_structural_inputs(
     retained_journal: &RetainedJournal,
     request_event_reference: &JournalReference,
     request_bytes: &[u8],
@@ -4145,7 +4148,6 @@ fn check_review_admission_section_82_authority_inputs(
     if policy.record_id() != policy_record_id {
         return Err(ReviewAdmissionSection82AuthorityError::PolicyIdentityMismatch);
     }
-
     let request_operation_start = retained_journal
         .resolve_reference(request.operation_start_journal_ref())
         .map_err(ReviewAdmissionSection82AuthorityError::RequestOperationStartReference)?;
@@ -4161,6 +4163,15 @@ fn check_review_admission_section_82_authority_inputs(
     {
         return Err(ReviewAdmissionSection82AuthorityError::ResultOperationStartNotStrictlyPrior);
     }
+    validate_review_admission_policy_context_prerequisites(
+        retained_journal,
+        request.policy_authority_ref(),
+        policy_bytes,
+        request_bytes,
+        result_bytes,
+        resolver,
+    )
+    .map_err(ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites)?;
 
     match validate_resolved_freeze_committed_binding(
         retained_journal,
@@ -4191,7 +4202,7 @@ fn check_review_admission_section_82_authority_inputs(
         return Err(ReviewAdmissionSection82AuthorityError::FreezeManifestMismatch);
     }
 
-    Err(ReviewAdmissionSection82AuthorityError::FreezeAuthorityEvidenceUnavailable)
+    Ok(())
 }
 
 /// A §82 returned-Anchor comparison that prevents Policy evaluation from starting.
@@ -4542,7 +4553,7 @@ pub fn evaluate_retained_review_admission_policy_46(
     result_bytes: &[u8],
     resolver: &impl ExactRecordByteResolver,
 ) -> ReviewAdmissionPolicy46RouteOutcome {
-    let authority_error = match check_review_admission_section_82_authority_inputs(
+    let authority_error = match validate_review_admission_section_82_structural_inputs(
         retained_journal,
         request_event_reference,
         request_bytes,
@@ -5620,6 +5631,21 @@ impl RetainedJournal {
         ) {
             return Err(ReviewAdmissionRuntimeError::AcceptanceJournalMismatch);
         }
+        let _consumed_acceptance_token = accepted.acceptance_token;
+        if let Err(authority_error) = validate_review_admission_section_82_structural_inputs(
+            self,
+            &accepted.request_event_reference,
+            &accepted.request_bytes,
+            &accepted.result_event_reference,
+            &accepted.result_bytes,
+            resolver,
+        ) {
+            return Ok(ReviewAdmissionRuntimeOutcome::PreTerminal(
+                ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                    ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(authority_error),
+                ),
+            ));
+        }
         if accepted.request_event_reference.entry_index().value()
             > accepted.operation_start_journal_ref.entry_index().value()
         {
@@ -5638,21 +5664,11 @@ impl RetainedJournal {
                 ),
             ));
         }
-        let _consumed_acceptance_token = accepted.acceptance_token;
-        let authority_error = match check_review_admission_section_82_authority_inputs(
-            self,
-            &accepted.request_event_reference,
-            &accepted.request_bytes,
-            &accepted.result_event_reference,
-            &accepted.result_bytes,
-            resolver,
-        ) {
-            Err(error) => error,
-            Ok(()) => ReviewAdmissionSection82AuthorityError::FreezeAuthorityEvidenceUnavailable,
-        };
         Ok(ReviewAdmissionRuntimeOutcome::PreTerminal(
             ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
-                ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(authority_error),
+                ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(
+                    ReviewAdmissionSection82AuthorityError::FreezeAuthorityEvidenceUnavailable,
+                ),
             ),
         ))
     }

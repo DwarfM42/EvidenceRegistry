@@ -9,15 +9,18 @@ use evidence_registry::{
     validate_review_result_recorded_binding, EventRecordId, ExactRecordByteResolver,
     FreezeAttemptId, FreezeAttemptStartRecord, FreezeAttemptStartRecordInput, GenesisJournalEntry,
     JournalAnchor, JournalAnchorHistoryComparison, JournalEntryHash, JournalEntryIndex,
-    JournalReference, RecordId, RegistryId, RetainedJournal, RetainedReviewPackageAnchorInputError,
-    ReviewAdmissionAcceptanceError, ReviewAdmissionCommonRequestResultError,
-    ReviewAdmissionPolicy46RouteOutcome, ReviewAdmissionPolicyContextRouteOutcome,
-    ReviewAdmissionRuntimeError, ReviewAdmissionRuntimeOutcome,
-    ReviewAdmissionSection82AuthorityError, ReviewAdmissionSection82PrerequisiteFailure,
-    ReviewAdmissionSection82RoutingOutcome, ReviewAdmissionSection83Disposition,
-    ReviewPackageAnchorTransportError, ReviewRequestRecord, ReviewRequestRecordedBindingError,
-    ReviewResultRecord, ReviewResultRecordedBindingError, StrictRecordFrame,
-    REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES, REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES,
+    JournalReference, RecordId, RegistryId, RetainedJournal, RetainedJournalError,
+    RetainedReviewPackageAnchorInputError, ReviewAdmissionAcceptanceError,
+    ReviewAdmissionCommonRequestResultError, ReviewAdmissionExactScopeProfileError,
+    ReviewAdmissionPolicy46RouteOutcome, ReviewAdmissionPolicyContextPrerequisitesError,
+    ReviewAdmissionPolicyContextRouteOutcome, ReviewAdmissionPolicyRecord,
+    ReviewAdmissionPolicyRecordedBindingError, ReviewAdmissionRuntimeError,
+    ReviewAdmissionRuntimeOutcome, ReviewAdmissionSection82AuthorityError,
+    ReviewAdmissionSection82PrerequisiteFailure, ReviewAdmissionSection82RoutingOutcome,
+    ReviewAdmissionSection83Disposition, ReviewPackageAnchorTransportError, ReviewRequestRecord,
+    ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
+    StrictRecordFrame, REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES,
+    REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES,
 };
 use sha2::{Digest, Sha256};
 
@@ -623,6 +626,25 @@ struct AuthoritativeReviewAdmissionFixture {
     resolver: RecordBytes,
 }
 
+#[derive(Default)]
+struct ReviewAdmissionFixtureOverrides {
+    policy_operation_start: Option<JournalReference>,
+    policy_context_id: Option<u8>,
+    gate_scope_bytes: Option<Vec<u8>>,
+    common_scope_bytes: Option<Vec<u8>>,
+    request_operation_start: Option<JournalReference>,
+    result_operation_start: Option<JournalReference>,
+}
+
+struct FutureReviewAdmissionPair {
+    request_entry: Vec<u8>,
+    request_reference: JournalReference,
+    request_bytes: Vec<u8>,
+    result_entry: Vec<u8>,
+    result_reference: JournalReference,
+    result_bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy)]
 enum AuthorityDependencyMode {
     Missing,
@@ -663,6 +685,32 @@ fn authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
     request_authorities: AuthorityDependencyMode,
     result_authorities: AuthorityDependencyMode,
 ) -> AuthoritativeReviewAdmissionFixture {
+    authoritative_review_admission_fixture_with_overrides(
+        evaluator_1015_scope_matches,
+        review_roles,
+        request_identities,
+        request_authorities,
+        result_authorities,
+        ReviewAdmissionFixtureOverrides::default(),
+    )
+}
+
+fn authoritative_review_admission_fixture_with_overrides(
+    evaluator_1015_scope_matches: bool,
+    review_roles: &[u8],
+    request_identities: IdentityDependencyMode,
+    request_authorities: AuthorityDependencyMode,
+    result_authorities: AuthorityDependencyMode,
+    overrides: ReviewAdmissionFixtureOverrides,
+) -> AuthoritativeReviewAdmissionFixture {
+    let ReviewAdmissionFixtureOverrides {
+        policy_operation_start,
+        policy_context_id,
+        gate_scope_bytes,
+        common_scope_bytes,
+        request_operation_start,
+        result_operation_start,
+    } = overrides;
     let genesis = genesis();
     let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
     let genesis_reference = JournalReference::new(
@@ -699,21 +747,29 @@ fn authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
         evidence_registry::EventTypeId::try_from(101_u64).unwrap(),
         EventRecordId::try_from(receipt_id.as_bytes().as_slice()).unwrap(),
     );
-    let gate_scope_bytes = independently_construct_exact_review_admission_scope();
+    let gate_scope_bytes =
+        gate_scope_bytes.unwrap_or_else(independently_construct_exact_review_admission_scope);
     let gate_scope_id = RecordId::try_from(Sha256::digest(&gate_scope_bytes).as_slice()).unwrap();
-    let common_scope_bytes = if evaluator_1015_scope_matches {
-        gate_scope_bytes.clone()
-    } else {
-        independently_construct_labeled_exact_review_admission_scope("other")
-    };
+    let common_scope_bytes = common_scope_bytes.unwrap_or_else(|| {
+        if evaluator_1015_scope_matches {
+            gate_scope_bytes.clone()
+        } else {
+            independently_construct_labeled_exact_review_admission_scope("other")
+        }
+    });
     let common_scope_id =
         RecordId::try_from(Sha256::digest(&common_scope_bytes).as_slice()).unwrap();
-    let policy_bytes = independently_construct_review_admission_policy_with_requirement_roles(
-        &genesis_reference,
+    let mut policy_bytes = independently_construct_review_admission_policy_with_requirement_roles(
+        policy_operation_start
+            .as_ref()
+            .unwrap_or(&genesis_reference),
         gate_scope_id,
         common_scope_id,
         review_roles,
     );
+    if let Some(policy_context_id) = policy_context_id {
+        *policy_bytes.last_mut().unwrap() = policy_context_id;
+    }
     let policy_id = RecordId::try_from(Sha256::digest(&policy_bytes).as_slice()).unwrap();
     let policy_entry = policy_recorded_entry_at(
         3,
@@ -741,7 +797,9 @@ fn authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
             &policy_reference,
             common_scope_id,
             *package_anchor.anchor_id().as_bytes(),
-            &policy_reference,
+            request_operation_start
+                .as_ref()
+                .unwrap_or(&policy_reference),
             manifest_id,
         );
     let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
@@ -805,7 +863,9 @@ fn authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
         &freeze_authority_reference,
         common_scope_id,
         *package_anchor.anchor_id().as_bytes(),
-        &request_reference,
+        result_operation_start
+            .as_ref()
+            .unwrap_or(&request_reference),
         manifest_id,
     );
     let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
@@ -864,6 +924,152 @@ fn authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
         result_bytes,
         resolver: RecordBytes(records),
     }
+}
+
+fn future_review_admission_pair(
+    fixture: &AuthoritativeReviewAdmissionFixture,
+    operation_start: &JournalReference,
+) -> FutureReviewAdmissionPair {
+    let existing_request =
+        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes).unwrap();
+    let request_bytes =
+        independently_construct_version_1_review_request_with_freeze_policy_scope_anchor_and_start(
+            existing_request.freeze_authority_ref(),
+            existing_request.policy_authority_ref(),
+            existing_request.review_scope_ref(),
+            *existing_request.review_package_anchor_id().as_bytes(),
+            operation_start,
+            existing_request.manifest_id(),
+        );
+    let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
+    let request_index = u8::try_from(operation_start.entry_index().value() + 1).unwrap();
+    let mut request_identity_dependencies = vec![
+        (1, *request.manifest_id().as_bytes()),
+        (1, *request.required_checks_ref().as_bytes()),
+        (1, *request.review_scope_ref().as_bytes()),
+        (1, *request.review_method_ref().as_bytes()),
+        (2, *request.review_package_anchor_id().as_bytes()),
+    ];
+    request_identity_dependencies.sort_unstable();
+    let request_entry = review_request_recorded_entry_at_with_authorities(
+        request_index,
+        operation_start.entry_hash(),
+        request.record_id(),
+        *request.review_package_anchor_id().as_bytes(),
+        &request_identity_dependencies,
+        &[
+            existing_request.freeze_authority_ref(),
+            existing_request.policy_authority_ref(),
+        ],
+    );
+    let request_entry_hash: [u8; 32] = Sha256::digest(&request_entry).into();
+    let request_reference = JournalReference::new(
+        operation_start.registry_id(),
+        JournalEntryIndex::try_from(u64::from(request_index)).unwrap(),
+        JournalEntryHash::try_from(request_entry_hash.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
+        EventRecordId::try_from(request.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let result_bytes = independently_construct_version_1_review_result_with_freeze_scope_and_start(
+        &request_reference,
+        existing_request.freeze_authority_ref(),
+        existing_request.review_scope_ref(),
+        *existing_request.review_package_anchor_id().as_bytes(),
+        operation_start,
+        existing_request.manifest_id(),
+    );
+    let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
+    let result_index = request_index.checked_add(1).unwrap();
+    let result_entry = review_result_recorded_entry(
+        result_index,
+        JournalEntryHash::try_from(request_entry_hash.as_slice()).unwrap(),
+        result.record_id(),
+        Some(*result.review_package_anchor_id().as_bytes()),
+        Some(&request_reference),
+    );
+    let result_entry_hash: [u8; 32] = Sha256::digest(&result_entry).into();
+    let result_reference = JournalReference::new(
+        operation_start.registry_id(),
+        JournalEntryIndex::try_from(u64::from(result_index)).unwrap(),
+        JournalEntryHash::try_from(result_entry_hash.as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(301_u64).unwrap(),
+        EventRecordId::try_from(result.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    FutureReviewAdmissionPair {
+        request_entry,
+        request_reference,
+        request_bytes,
+        result_entry,
+        result_reference,
+        result_bytes,
+    }
+}
+
+fn unsupported_review_admission_scope_profile() -> Vec<u8> {
+    let mut bytes = independently_construct_exact_review_admission_scope();
+    let profile = bytes
+        .windows(6)
+        .position(|window| window == [0x10, 0x01, 0x11, 0x01, 0x12, 0x40])
+        .unwrap();
+    bytes[profile + 1] = 2;
+    bytes
+}
+
+fn fixture_policy_gate_scope_ref(fixture: &AuthoritativeReviewAdmissionFixture) -> RecordId {
+    let request = ReviewRequestRecord::decode_authoritative(&fixture.request_bytes).unwrap();
+    let policy_id = RecordId::try_from(
+        request
+            .policy_authority_ref()
+            .event_record_id()
+            .as_bytes()
+            .as_slice(),
+    )
+    .unwrap();
+    ReviewAdmissionPolicyRecord::decode_authoritative(fixture.resolver.resolve(policy_id).unwrap())
+        .unwrap()
+        .gate_scope_ref()
+}
+
+fn authoritative_review_admission_fixture_with_test_overrides(
+    overrides: ReviewAdmissionFixtureOverrides,
+) -> AuthoritativeReviewAdmissionFixture {
+    authoritative_review_admission_fixture_with_overrides(
+        false,
+        &[7],
+        IdentityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        overrides,
+    )
+}
+
+fn assert_complete_review_admission_authority_error(
+    mut fixture: AuthoritativeReviewAdmissionFixture,
+    expected: ReviewAdmissionSection82AuthorityError,
+) {
+    let retained_head = fixture.journal.current_head_reference();
+    let accepted = fixture
+        .journal
+        .accept_review_admission(
+            fixture.request_reference.clone(),
+            &fixture.request_bytes,
+            fixture.result_reference.clone(),
+            &fixture.result_bytes,
+        )
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .journal
+            .complete_review_admission(accepted, &fixture.resolver)
+            .unwrap(),
+        ReviewAdmissionRuntimeOutcome::PreTerminal(
+            ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(expected),
+            ),
+        )
+    );
+    assert_eq!(fixture.journal.current_head_reference(), retained_head);
 }
 
 #[test]
@@ -1565,7 +1771,264 @@ fn retained_anchor_route_does_not_promote_structural_policy_context_to_authority
 }
 
 #[test]
-fn acceptance_rejects_request_authority_recorded_after_operation_start() {
+fn missing_policy_gate_scope_is_reported_before_generic_authority_unavailability() {
+    let mut fixture = authoritative_review_admission_fixture(true);
+    fixture.resolver.0.retain(|(_, bytes)| {
+        StrictRecordFrame::decode_authoritative(bytes)
+            .map(|frame| frame.record_type_id().value() != 20)
+            .unwrap_or(true)
+    });
+    let accepted = fixture
+        .journal
+        .accept_review_admission(
+            fixture.request_reference.clone(),
+            &fixture.request_bytes,
+            fixture.result_reference.clone(),
+            &fixture.result_bytes,
+        )
+        .unwrap();
+
+    let outcome = fixture
+        .journal
+        .complete_review_admission(accepted, &fixture.resolver)
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ReviewAdmissionRuntimeOutcome::PreTerminal(
+            ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(
+                    ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+                        ReviewAdmissionPolicyContextPrerequisitesError::GateScope(
+                            ReviewAdmissionExactScopeProfileError::ScopePayloadUnavailable
+                        )
+                    )
+                )
+            )
+        )
+    ));
+}
+
+#[test]
+fn policy_registration_chronology_failure_is_integrated_before_generic_authority_unavailability() {
+    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            policy_operation_start: Some(reference(9, 300, 0x91)),
+            ..Default::default()
+        },
+    );
+
+    assert_complete_review_admission_authority_error(
+        fixture,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::PolicyBinding(
+                ReviewAdmissionPolicyRecordedBindingError::OperationStartReference(
+                    RetainedJournalError::MissingReference,
+                ),
+            ),
+        ),
+    );
+}
+
+#[test]
+fn unsupported_policy_context_is_integrated_before_generic_authority_unavailability() {
+    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            policy_context_id: Some(1),
+            ..Default::default()
+        },
+    );
+
+    assert_complete_review_admission_authority_error(
+        fixture,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported,
+        ),
+    );
+}
+
+#[test]
+fn every_gate_scope_failure_is_integrated_before_generic_authority_unavailability() {
+    let mut unavailable = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides::default(),
+    );
+    let unavailable_gate_scope = fixture_policy_gate_scope_ref(&unavailable);
+    unavailable
+        .resolver
+        .0
+        .retain(|(record_id, _)| *record_id != unavailable_gate_scope);
+    assert_complete_review_admission_authority_error(
+        unavailable,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::GateScope(
+                ReviewAdmissionExactScopeProfileError::ScopePayloadUnavailable,
+            ),
+        ),
+    );
+
+    let malformed = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            gate_scope_bytes: Some(vec![0xff]),
+            ..Default::default()
+        },
+    );
+    assert_complete_review_admission_authority_error(
+        malformed,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::GateScope(
+                ReviewAdmissionExactScopeProfileError::ScopeDecode,
+            ),
+        ),
+    );
+
+    let mut mismatched = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides::default(),
+    );
+    let mismatched_gate_scope = fixture_policy_gate_scope_ref(&mismatched);
+    mismatched
+        .resolver
+        .0
+        .iter_mut()
+        .find(|(record_id, _)| *record_id == mismatched_gate_scope)
+        .unwrap()
+        .1 = independently_construct_labeled_exact_review_admission_scope("substituted");
+    assert_complete_review_admission_authority_error(
+        mismatched,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::GateScope(
+                ReviewAdmissionExactScopeProfileError::ScopeIdentityMismatch,
+            ),
+        ),
+    );
+
+    let unsupported = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            gate_scope_bytes: Some(unsupported_review_admission_scope_profile()),
+            ..Default::default()
+        },
+    );
+    assert_complete_review_admission_authority_error(
+        unsupported,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::GateScope(
+                ReviewAdmissionExactScopeProfileError::UnsupportedProfile,
+            ),
+        ),
+    );
+}
+
+#[test]
+fn every_common_review_scope_failure_is_integrated_before_generic_authority_unavailability() {
+    let mut unavailable = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides::default(),
+    );
+    let unavailable_common_scope =
+        ReviewRequestRecord::decode_authoritative(&unavailable.request_bytes)
+            .unwrap()
+            .review_scope_ref();
+    unavailable
+        .resolver
+        .0
+        .retain(|(record_id, _)| *record_id != unavailable_common_scope);
+    assert_complete_review_admission_authority_error(
+        unavailable,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::CommonReviewScope(
+                ReviewAdmissionExactScopeProfileError::ScopePayloadUnavailable,
+            ),
+        ),
+    );
+
+    let malformed = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            common_scope_bytes: Some(vec![0xff]),
+            ..Default::default()
+        },
+    );
+    assert_complete_review_admission_authority_error(
+        malformed,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::CommonReviewScope(
+                ReviewAdmissionExactScopeProfileError::ScopeDecode,
+            ),
+        ),
+    );
+
+    let mut mismatched = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides::default(),
+    );
+    let mismatched_common_scope =
+        ReviewRequestRecord::decode_authoritative(&mismatched.request_bytes)
+            .unwrap()
+            .review_scope_ref();
+    mismatched
+        .resolver
+        .0
+        .iter_mut()
+        .find(|(record_id, _)| *record_id == mismatched_common_scope)
+        .unwrap()
+        .1 = independently_construct_labeled_exact_review_admission_scope("substituted");
+    assert_complete_review_admission_authority_error(
+        mismatched,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::CommonReviewScope(
+                ReviewAdmissionExactScopeProfileError::ScopeIdentityMismatch,
+            ),
+        ),
+    );
+
+    let unsupported = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            common_scope_bytes: Some(unsupported_review_admission_scope_profile()),
+            ..Default::default()
+        },
+    );
+    assert_complete_review_admission_authority_error(
+        unsupported,
+        ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+            ReviewAdmissionPolicyContextPrerequisitesError::CommonReviewScope(
+                ReviewAdmissionExactScopeProfileError::UnsupportedProfile,
+            ),
+        ),
+    );
+}
+
+#[test]
+fn request_operation_start_resolution_precedes_policy_context_and_generic_authority_failures() {
+    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            request_operation_start: Some(reference(9, 300, 0x92)),
+            ..Default::default()
+        },
+    );
+
+    assert_complete_review_admission_authority_error(
+        fixture,
+        ReviewAdmissionSection82AuthorityError::RequestOperationStartReference(
+            RetainedJournalError::MissingReference,
+        ),
+    );
+}
+
+#[test]
+fn result_operation_start_resolution_precedes_policy_context_and_generic_authority_failures() {
+    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            result_operation_start: Some(reference(9, 300, 0x93)),
+            ..Default::default()
+        },
+    );
+
+    assert_complete_review_admission_authority_error(
+        fixture,
+        ReviewAdmissionSection82AuthorityError::ResultOperationStartReference(
+            RetainedJournalError::MissingReference,
+        ),
+    );
+}
+
+#[test]
+fn unresolved_request_reference_is_not_classified_by_caller_entry_index() {
     let mut journal = RetainedJournal::from_genesis(genesis()).unwrap();
     let operation_start = journal.current_head_reference();
     let accepted = journal
@@ -1586,7 +2049,13 @@ fn acceptance_rejects_request_authority_recorded_after_operation_start() {
         outcome,
         ReviewAdmissionRuntimeOutcome::PreTerminal(
             ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
-                ReviewAdmissionSection82PrerequisiteFailure::RequestAuthorityAfterOperationStart
+                ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(
+                    ReviewAdmissionSection82AuthorityError::RetainedAnchorInput(
+                        RetainedReviewPackageAnchorInputError::RequestBinding(
+                            ReviewRequestRecordedBindingError::RequestDecode
+                        )
+                    )
+                )
             )
         )
     ));
@@ -1594,7 +2063,7 @@ fn acceptance_rejects_request_authority_recorded_after_operation_start() {
 }
 
 #[test]
-fn acceptance_rejects_result_authority_recorded_after_operation_start() {
+fn unresolved_result_reference_does_not_mask_request_decode_by_caller_entry_index() {
     let mut journal = RetainedJournal::from_genesis(genesis()).unwrap();
     let operation_start = journal.current_head_reference();
     let accepted = journal
@@ -1614,11 +2083,99 @@ fn acceptance_rejects_result_authority_recorded_after_operation_start() {
         outcome,
         ReviewAdmissionRuntimeOutcome::PreTerminal(
             ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
-                ReviewAdmissionSection82PrerequisiteFailure::ResultAuthorityAfterOperationStart
+                ReviewAdmissionSection82PrerequisiteFailure::AuthorityInput(
+                    ReviewAdmissionSection82AuthorityError::RetainedAnchorInput(
+                        RetainedReviewPackageAnchorInputError::RequestBinding(
+                            ReviewRequestRecordedBindingError::RequestDecode
+                        )
+                    )
+                )
             )
         )
     ));
     assert_eq!(journal.current_head_reference(), operation_start);
+}
+
+#[test]
+fn retained_request_recorded_after_acceptance_is_classified_only_after_structural_resolution() {
+    let mut fixture = authoritative_review_admission_fixture(true);
+    let operation_start = fixture.journal.current_head_reference();
+    let pair = future_review_admission_pair(&fixture, &operation_start);
+    let accepted = fixture
+        .journal
+        .accept_review_admission(
+            pair.request_reference.clone(),
+            &pair.request_bytes,
+            pair.result_reference.clone(),
+            &pair.result_bytes,
+        )
+        .unwrap();
+    fixture
+        .journal
+        .append_strict_entry(&pair.request_entry)
+        .unwrap();
+    fixture
+        .journal
+        .append_strict_entry(&pair.result_entry)
+        .unwrap();
+    let retained_head = fixture.journal.current_head_reference();
+
+    let outcome = fixture
+        .journal
+        .complete_review_admission(accepted, &fixture.resolver)
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ReviewAdmissionRuntimeOutcome::PreTerminal(
+            ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::RequestAuthorityAfterOperationStart
+            )
+        )
+    ));
+    assert_eq!(fixture.journal.current_head_reference(), retained_head);
+}
+
+#[test]
+fn retained_result_recorded_after_acceptance_is_classified_only_after_structural_resolution() {
+    let mut fixture = authoritative_review_admission_fixture(true);
+    let pair_start = fixture.journal.current_head_reference();
+    let pair = future_review_admission_pair(&fixture, &pair_start);
+    fixture
+        .journal
+        .append_strict_entry(&pair.request_entry)
+        .unwrap();
+    let operation_start = fixture.journal.current_head_reference();
+    assert_eq!(operation_start, pair.request_reference);
+    let accepted = fixture
+        .journal
+        .accept_review_admission(
+            pair.request_reference.clone(),
+            &pair.request_bytes,
+            pair.result_reference.clone(),
+            &pair.result_bytes,
+        )
+        .unwrap();
+    fixture
+        .journal
+        .append_strict_entry(&pair.result_entry)
+        .unwrap();
+    let retained_head = fixture.journal.current_head_reference();
+
+    let outcome = fixture
+        .journal
+        .complete_review_admission(accepted, &fixture.resolver)
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ReviewAdmissionRuntimeOutcome::PreTerminal(
+            ReviewAdmissionPolicy46RouteOutcome::PreTerminal(
+                ReviewAdmissionSection82PrerequisiteFailure::ResultAuthorityAfterOperationStart
+            )
+        )
+    ));
+    assert_eq!(fixture.journal.current_head_reference(), retained_head);
 }
 
 #[test]
