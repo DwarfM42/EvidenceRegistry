@@ -3246,6 +3246,279 @@ pub fn check_minimal_policy_context_declaration(
     }
 }
 
+/// One exact Review selector requirement from a POLICY Record evaluated only
+/// in the frozen REVIEW_ADMISSION context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionReviewRequirement {
+    review_role_id: u64,
+    review_scope_ref: RecordId,
+    review_method_ref: RecordId,
+    required_checks_ref: RecordId,
+    required_count: u64,
+}
+
+impl ReviewAdmissionReviewRequirement {
+    /// The exact required Review role identity.
+    pub fn review_role_id(&self) -> u64 {
+        self.review_role_id
+    }
+
+    /// The exact required Review Scope identity.
+    pub fn review_scope_ref(&self) -> RecordId {
+        self.review_scope_ref
+    }
+
+    /// The exact required Review Method identity.
+    pub fn review_method_ref(&self) -> RecordId {
+        self.review_method_ref
+    }
+
+    /// The exact required CheckSet identity.
+    pub fn required_checks_ref(&self) -> RecordId {
+        self.required_checks_ref
+    }
+
+    /// The required Review count. This field is not applicable to REVIEW_ADMISSION.
+    pub fn required_count(&self) -> u64 {
+        self.required_count
+    }
+}
+
+/// The exact local POLICY fields which are applicable to REVIEW_ADMISSION.
+///
+/// This decoder implements the frozen v0.3 Policy body grammar together with
+/// the v0.4 profile-1 prerequisite shape. A successful decode establishes only
+/// local Policy grammar and exact Record identity; it does not establish Policy
+/// authority, §82 completion, evaluator completion, satisfaction, Admission,
+/// or a terminal event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewAdmissionPolicyRecord {
+    record_id: RecordId,
+    gate_scope_ref: RecordId,
+    review_requirements: Vec<ReviewAdmissionReviewRequirement>,
+    required_method_statuses: Option<Vec<u64>>,
+    allowed_finding_states: Option<Vec<u64>>,
+    acceptable_anchor_relation_ids: Option<Vec<u64>>,
+    operation_start_journal_ref: JournalReference,
+}
+
+fn decode_nonempty_sorted_uint_set(
+    cursor: &mut CborCursor<'_>,
+    allowed: impl Fn(u64) -> bool,
+) -> Result<Vec<u64>, RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count == 0 || count > cursor.remaining() {
+        return Err(RecordDecodeError);
+    }
+    let mut values = Vec::with_capacity(count);
+    let mut previous = None;
+    for _ in 0..count {
+        let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !allowed(value) || previous.is_some_and(|prior| value <= prior) {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value);
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn decode_review_admission_review_requirements(
+    cursor: &mut CborCursor<'_>,
+) -> Result<Vec<ReviewAdmissionReviewRequirement>, RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count == 0 || count > cursor.remaining() / 5 {
+        return Err(RecordDecodeError);
+    }
+    let mut requirements = Vec::with_capacity(count);
+    let mut previous: Option<(u64, RecordId, RecordId, RecordId, u64)> = None;
+    for _ in 0..count {
+        cursor.map_exact(5).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        let review_role_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        let review_scope_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(2).map_err(|_| RecordDecodeError)?;
+        let review_method_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(3).map_err(|_| RecordDecodeError)?;
+        let required_checks_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        cursor.key(4).map_err(|_| RecordDecodeError)?;
+        let required_count = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if required_count == 0 {
+            return Err(RecordDecodeError);
+        }
+        let selector = (
+            review_role_id,
+            review_scope_ref,
+            review_method_ref,
+            required_checks_ref,
+            required_count,
+        );
+        if previous.as_ref().is_some_and(|prior| selector <= *prior) {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(selector);
+        requirements.push(ReviewAdmissionReviewRequirement {
+            review_role_id,
+            review_scope_ref,
+            review_method_ref,
+            required_checks_ref,
+            required_count,
+        });
+    }
+    Ok(requirements)
+}
+
+impl ReviewAdmissionPolicyRecord {
+    /// Strictly decodes the complete subset of frozen POLICY requirements that
+    /// is mechanically applicable to the v0.4 profile-1 REVIEW_ADMISSION path.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let frame = StrictRecordFrame::decode_authoritative(input)?;
+        if frame.record_type_id() != RecordTypeId::try_from(40).expect("assigned Record Type") {
+            return Err(RecordDecodeError);
+        }
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 40
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !(6..=9).contains(&field_count) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 40 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let gate_scope_ref =
+            RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                .map_err(|_| RecordDecodeError)?;
+        let mut review_requirements = None;
+        let mut required_method_statuses = None;
+        let mut allowed_finding_states = None;
+        let mut acceptable_anchor_relation_ids = None;
+        let mut operation_start_journal_ref = None;
+        let mut supported_context_ids = None;
+        let mut previous_key = 16;
+        for _ in 3..field_count {
+            let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+            if key <= previous_key {
+                return Err(RecordDecodeError);
+            }
+            previous_key = key;
+            match key {
+                17 if review_requirements.is_none() => {
+                    review_requirements =
+                        Some(decode_review_admission_review_requirements(&mut cursor)?);
+                }
+                18 if required_method_statuses.is_none() => {
+                    required_method_statuses =
+                        Some(decode_nonempty_sorted_uint_set(&mut cursor, |id| {
+                            matches!(id, 1..=3)
+                        })?);
+                }
+                19 if allowed_finding_states.is_none() => {
+                    allowed_finding_states =
+                        Some(decode_nonempty_sorted_uint_set(&mut cursor, |id| {
+                            matches!(id, 1..=3)
+                        })?);
+                }
+                24 if acceptable_anchor_relation_ids.is_none() => {
+                    cursor.map_exact(1).map_err(|_| RecordDecodeError)?;
+                    cursor.key(0).map_err(|_| RecordDecodeError)?;
+                    acceptable_anchor_relation_ids =
+                        Some(decode_nonempty_sorted_uint_set(&mut cursor, |id| {
+                            matches!(id, 1..=6)
+                        })?);
+                }
+                29 if operation_start_journal_ref.is_none() => {
+                    operation_start_journal_ref =
+                        Some(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
+                }
+                30 if supported_context_ids.is_none() => {
+                    supported_context_ids =
+                        Some(decode_nonempty_sorted_uint_set(&mut cursor, |id| {
+                            matches!(id, 1..=5)
+                        })?);
+                }
+                _ => return Err(RecordDecodeError),
+            }
+        }
+        let review_requirements = review_requirements.ok_or(RecordDecodeError)?;
+        let operation_start_journal_ref = operation_start_journal_ref.ok_or(RecordDecodeError)?;
+        if supported_context_ids.as_deref() != Some(&[2]) || !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        Ok(Self {
+            record_id: frame.record_id(),
+            gate_scope_ref,
+            review_requirements,
+            required_method_statuses,
+            allowed_finding_states,
+            acceptable_anchor_relation_ids,
+            operation_start_journal_ref,
+        })
+    }
+
+    /// The exact self-hash identity of the strictly decoded POLICY bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// The exact gate Scope identity declared by POLICY key 16.
+    pub fn gate_scope_ref(&self) -> RecordId {
+        self.gate_scope_ref
+    }
+
+    /// The sole Policy evaluation context permitted by this bounded profile.
+    pub fn supported_context(&self) -> PolicyEvaluationContext {
+        PolicyEvaluationContext::ReviewAdmission
+    }
+
+    /// The exact nonempty Review selector set required for REVIEW_ADMISSION.
+    pub fn review_requirements(&self) -> &[ReviewAdmissionReviewRequirement] {
+        &self.review_requirements
+    }
+
+    /// Optional global Method-status constraint applicable to REVIEW_RESULT.
+    pub fn required_method_statuses(&self) -> &[u64] {
+        self.required_method_statuses.as_deref().unwrap_or(&[])
+    }
+
+    /// Optional global Finding-state constraint applicable to REVIEW_RESULT.
+    pub fn allowed_finding_states(&self) -> &[u64] {
+        self.allowed_finding_states.as_deref().unwrap_or(&[])
+    }
+
+    /// Optional acceptable Journal-Anchor relation set.
+    pub fn acceptable_anchor_relation_ids(&self) -> &[u64] {
+        self.acceptable_anchor_relation_ids
+            .as_deref()
+            .unwrap_or(&[])
+    }
+
+    /// The exact locally decoded Policy-registration chronology reference.
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+}
+
 /// Typed, Record-local fields decoded from a SCOPE Record.
 ///
 /// Profile IDs, versions, payload bytes, and labels are retained exactly as declared.
