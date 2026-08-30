@@ -4259,6 +4259,40 @@ pub enum ReviewAdmissionPolicy46RouteOutcome {
     Completed(ReviewAdmissionPolicy46Completion),
 }
 
+/// The §83 Review Admission disposition selected only from a completed §46
+/// result. This is not an Admission Record, terminal event, Journal append, or
+/// publication effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionSection83Disposition {
+    PreTerminal,
+    ReviewAdmissionAccepted,
+    ReviewAdmissionRejected,
+}
+
+/// Applies Lifecycle v0.10.4 §83 to the completed-result boundary established
+/// by §46. A non-completed result remains pre-terminal; §83 never fabricates a
+/// completed Policy result. Event construction and publication remain a later,
+/// separate boundary.
+pub fn derive_review_admission_section_83_disposition(
+    policy_46_outcome: &ReviewAdmissionPolicy46RouteOutcome,
+) -> ReviewAdmissionSection83Disposition {
+    match policy_46_outcome {
+        ReviewAdmissionPolicy46RouteOutcome::PreTerminal(_)
+        | ReviewAdmissionPolicy46RouteOutcome::PolicyContextPrecondition(_) => {
+            ReviewAdmissionSection83Disposition::PreTerminal
+        }
+        ReviewAdmissionPolicy46RouteOutcome::Completed(completion) => match completion.result() {
+            ReviewAdmissionCompletedPolicyResult::Satisfied => {
+                ReviewAdmissionSection83Disposition::ReviewAdmissionAccepted
+            }
+            ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+            | ReviewAdmissionCompletedPolicyResult::GateIndeterminate => {
+                ReviewAdmissionSection83Disposition::ReviewAdmissionRejected
+            }
+        },
+    }
+}
+
 fn review_admission_anchor_relation_id(comparison: JournalAnchorHistoryComparison) -> Option<u64> {
     match comparison {
         JournalAnchorHistoryComparison::AnchorEqualsCurrentHead => Some(1),

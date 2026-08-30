@@ -1,8 +1,8 @@
 use evidence_registry::{
-    compare_retained_journal_anchor_history, evaluate_retained_review_admission_policy_46,
-    policy_evaluator_registry, resolve_retained_review_package_anchor_input,
-    route_retained_review_admission_policy_context, route_retained_review_admission_section_82,
-    route_review_admission_after_anchor_comparison,
+    compare_retained_journal_anchor_history, derive_review_admission_section_83_disposition,
+    evaluate_retained_review_admission_policy_46, policy_evaluator_registry,
+    resolve_retained_review_package_anchor_input, route_retained_review_admission_policy_context,
+    route_retained_review_admission_section_82, route_review_admission_after_anchor_comparison,
     validate_review_admission_common_request_result_fields,
     validate_review_package_anchor_transport, validate_review_request_recorded_binding,
     validate_review_result_recorded_binding, EventRecordId, ExactRecordByteResolver,
@@ -11,9 +11,9 @@ use evidence_registry::{
     RetainedReviewPackageAnchorInputError, ReviewAdmissionCommonRequestResultError,
     ReviewAdmissionCompletedPolicyResult, ReviewAdmissionPolicy46RouteOutcome,
     ReviewAdmissionPolicyContextRouteOutcome, ReviewAdmissionSection82PrerequisiteFailure,
-    ReviewAdmissionSection82RoutingOutcome, ReviewPackageAnchorTransportError, ReviewRequestRecord,
-    ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
-    StrictRecordFrame,
+    ReviewAdmissionSection82RoutingOutcome, ReviewAdmissionSection83Disposition,
+    ReviewPackageAnchorTransportError, ReviewRequestRecord, ReviewRequestRecordedBindingError,
+    ReviewResultRecord, ReviewResultRecordedBindingError, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -1120,6 +1120,7 @@ fn retained_anchor_route_derives_authoritative_policy_from_the_retained_request(
         &result_bytes,
         &resolver,
     );
+    let section_83_disposition = derive_review_admission_section_83_disposition(&policy_46_outcome);
 
     assert!(matches!(
         outcome,
@@ -1132,4 +1133,8 @@ fn retained_anchor_route_derives_authoritative_policy_from_the_retained_request(
             if completion.result() == ReviewAdmissionCompletedPolicyResult::Satisfied
                 && completion.evaluator_results().iter().any(|result| result.evaluator_id() == 1015)
     ));
+    assert_eq!(
+        section_83_disposition,
+        ReviewAdmissionSection83Disposition::ReviewAdmissionAccepted,
+    );
 }
