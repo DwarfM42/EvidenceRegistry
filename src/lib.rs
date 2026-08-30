@@ -3858,6 +3858,36 @@ pub fn validate_review_admission_policy_context_prerequisites(
     })
 }
 
+/// The individual outcome of frozen evaluator 1015.
+///
+/// This is neither a completed §46 Policy result nor a Lifecycle disposition.
+/// It has no authority to construct an Admission, event 302/303, Journal entry,
+/// or publication result; §46 alone composes this evaluator outcome with every
+/// other applicable requirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewAdmissionGateScope1015Result {
+    Pass,
+    Fail,
+}
+
+/// Evaluates the frozen profile-1 REVIEW_ADMISSION gate-Scope requirement.
+///
+/// The input can be obtained only from the typed context-prerequisite path,
+/// which derives both identities from the exact retained Policy and the common
+/// Request/Result scope; callers cannot feed a scope identity, prior evaluator
+/// result, Policy completion, direction, or validation flag into this evaluator.
+/// The §46 dispatcher is responsible for invoking this only after the full
+/// authoritative §82 route and applicability determination have succeeded.
+pub fn evaluate_review_admission_gate_scope_1015(
+    prerequisites: ReviewAdmissionPolicyContextPrerequisites,
+) -> ReviewAdmissionGateScope1015Result {
+    if prerequisites.gate_scope_ref() == prerequisites.common_review_scope_ref() {
+        ReviewAdmissionGateScope1015Result::Pass
+    } else {
+        ReviewAdmissionGateScope1015Result::Fail
+    }
+}
+
 /// Immutable registry metadata for a frozen POLICY evaluator.
 ///
 /// This metadata assigns no generic evaluation behavior to any field or Scope.
@@ -3867,7 +3897,7 @@ pub struct PolicyEvaluatorRegistration {
     pub name: &'static str,
 }
 
-const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 14] = [
+const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 15] = [
     PolicyEvaluatorRegistration {
         id: 1001,
         name: "POLICY_REVIEW_REQUIREMENT_MATCH",
@@ -3924,9 +3954,13 @@ const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 14] = [
         id: 1014,
         name: "POLICY_SUPPORTED_CONTEXT",
     },
+    PolicyEvaluatorRegistration {
+        id: 1015,
+        name: "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING",
+    },
 ];
 
-/// Registry metadata retained outside the unavailable Review Admission evaluator lane.
+/// Registry metadata for immutable POLICY evaluator assignments.
 pub fn policy_evaluator_registry() -> &'static [PolicyEvaluatorRegistration] {
     &POLICY_EVALUATOR_REGISTRY
 }

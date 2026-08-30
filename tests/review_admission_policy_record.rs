@@ -1,11 +1,13 @@
 use evidence_registry::{
-    check_review_admission_policy_context, resolve_review_admission_exact_scope_profile,
+    check_review_admission_policy_context, evaluate_review_admission_gate_scope_1015,
+    policy_evaluator_registry, resolve_review_admission_exact_scope_profile,
     validate_review_admission_policy_context_prerequisites,
     validate_review_admission_policy_recorded_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, GenesisJournalEntry, JournalEntryHash, JournalEntryIndex,
     JournalReference, PolicyEvaluationContext, RecordId, RegistryId, RetainedJournal,
-    ReviewAdmissionCommonRequestResultError, ReviewAdmissionPolicyContextDeclaration,
-    ReviewAdmissionPolicyContextPrerequisitesError, ReviewAdmissionPolicyRecord, StrictRecordFrame,
+    ReviewAdmissionCommonRequestResultError, ReviewAdmissionGateScope1015Result,
+    ReviewAdmissionPolicyContextDeclaration, ReviewAdmissionPolicyContextPrerequisitesError,
+    ReviewAdmissionPolicyRecord, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -282,7 +284,8 @@ fn review_admission_policy_context_prerequisites_stop_at_common_request_result_f
 }
 
 #[test]
-fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes() {
+fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes_and_evaluator_1015_accepts(
+) {
     let genesis = genesis();
     let scope_bytes = independently_construct_exact_review_admission_scope();
     let scope_id = RecordId::try_from(Sha256::digest(&scope_bytes).as_slice()).unwrap();
@@ -317,6 +320,10 @@ fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes
     assert_eq!(prerequisites.policy_record_id(), policy_record_id);
     assert_eq!(prerequisites.gate_scope_ref(), scope_id);
     assert_eq!(prerequisites.common_review_scope_ref(), scope_id);
+    assert_eq!(
+        evaluate_review_admission_gate_scope_1015(prerequisites),
+        ReviewAdmissionGateScope1015Result::Pass,
+    );
 }
 
 #[test]
@@ -337,5 +344,62 @@ fn review_admission_policy_preserves_context_unsupported_before_requirement_eval
     assert_eq!(
         check_review_admission_policy_context(&policy),
         ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported,
+    );
+}
+
+#[test]
+fn evaluator_1015_is_exactly_registered_and_returns_only_its_individual_scope_result() {
+    let genesis = genesis();
+    let common_scope_bytes = independently_construct_exact_review_admission_scope();
+    let common_scope_id =
+        RecordId::try_from(Sha256::digest(&common_scope_bytes).as_slice()).unwrap();
+    let mut gate_scope_bytes = independently_construct_exact_review_admission_scope();
+    let map_start = gate_scope_bytes
+        .windows(3)
+        .position(|window| window == [0x14, 0x01, 0xa5])
+        .unwrap()
+        + 2;
+    gate_scope_bytes[map_start] = 0xa6;
+    gate_scope_bytes.extend_from_slice(&[0x13, 0x61, b'x']);
+    let gate_scope_id = RecordId::try_from(Sha256::digest(&gate_scope_bytes).as_slice()).unwrap();
+    let policy_bytes = independently_construct_review_admission_policy(
+        &genesis_reference(&genesis),
+        gate_scope_id,
+    );
+    let policy_record_id = RecordId::try_from(Sha256::digest(&policy_bytes).as_slice()).unwrap();
+    let policy_entry = policy_recorded_entry(genesis.entry_hash(), policy_record_id);
+    let policy_entry_hash: [u8; 32] = Sha256::digest(&policy_entry).into();
+    let policy_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(policy_entry_hash.as_slice()).unwrap(),
+        EventTypeId::try_from(400_u64).unwrap(),
+        EventRecordId::try_from(policy_record_id.as_bytes().as_slice()).unwrap(),
+    );
+    let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+    journal.append_strict_entry(&policy_entry).unwrap();
+    let request_bytes = independently_construct_review_request_with_scope(common_scope_id);
+    let result_bytes = independently_construct_review_result_with_scope(common_scope_id);
+    let resolver = RecordBytes(vec![
+        (common_scope_id, common_scope_bytes),
+        (gate_scope_id, gate_scope_bytes),
+    ]);
+    let prerequisites = validate_review_admission_policy_context_prerequisites(
+        &journal,
+        &policy_reference,
+        &policy_bytes,
+        &request_bytes,
+        &result_bytes,
+        &resolver,
+    )
+    .unwrap();
+
+    assert!(policy_evaluator_registry().iter().any(|registration| {
+        registration.id == 1015
+            && registration.name == "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING"
+    }));
+    assert_eq!(
+        evaluate_review_admission_gate_scope_1015(prerequisites),
+        ReviewAdmissionGateScope1015Result::Fail,
     );
 }

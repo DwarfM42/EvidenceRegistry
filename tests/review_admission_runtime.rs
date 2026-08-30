@@ -409,13 +409,11 @@ fn retained_journal_resolves_a_version_1_anchor_only_from_its_retained_prefixes(
 }
 
 #[test]
-fn retained_anchor_routing_exposes_no_evaluator_1015_registration() {
-    assert!(
-        policy_evaluator_registry()
-            .iter()
-            .all(|registration| registration.id != 1015),
-        "the retained-anchor routing boundary must not expose evaluator 1015 metadata",
-    );
+fn policy_registry_binds_the_frozen_evaluator_1015_identity() {
+    assert!(policy_evaluator_registry().iter().any(|registration| {
+        registration.id == 1015
+            && registration.name == "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING"
+    }));
 }
 
 #[test]
