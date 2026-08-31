@@ -5,16 +5,22 @@
 //! FreezeRoot tuple, rather than a generic identity envelope.
 
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 mod authoritative_store;
 pub use authoritative_store::{
-    evaluate_authoritative_review_admission_policy_46, AcceptedAuthoritativeReviewAdmission,
-    AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError,
+    AcceptedAuthoritativeReviewAdmission, AuthoritativeFreezeCommittedBinding,
+    AuthoritativeFreezeCommittedBindingError, AuthoritativePublicationDurability,
     AuthoritativeRegistryStore, AuthoritativeRegistryStoreOpenError,
-    AuthoritativeReviewAdmissionAcceptanceError, AuthoritativeReviewAdmissionSection82,
-    AuthoritativeReviewAdmissionSection82Error,
+    AuthoritativeReviewAdmissionAcceptanceError, AuthoritativeReviewAdmissionPublication,
+    AuthoritativeReviewAdmissionPublicationError,
+    AuthoritativeReviewAdmissionPublishedReceiptUncertain,
+    AuthoritativeReviewAdmissionRuntimeError, AuthoritativeReviewAdmissionRuntimeOutcome,
+    AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error,
+    DurabilityActionState, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
+    AUTHORITATIVE_STORE_MAX_OBJECTS, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
 };
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
@@ -1594,12 +1600,12 @@ impl RetainedJournal {
             return self.append_freeze_terminal(input, event_type_id);
         }
         if event_type_id.value() == 104 {
-            self.validate_freeze_commit_rejected(input, event_type_id)?;
-            return Err(RetainedJournalError::UnsupportedEntry);
+            let common = self.validate_freeze_commit_rejected(input, event_type_id)?;
+            return self.append_decoded_common(common, input);
         }
         if event_type_id.value() == 700 {
-            self.validate_eviction_started(input, event_type_id)?;
-            return Err(RetainedJournalError::UnsupportedEntry);
+            let common = self.validate_eviction_started(input, event_type_id)?;
+            return self.append_decoded_common(common, input);
         }
         if let Some(event_specific_keys) = event_specific_keys(event_type_id.value()) {
             let common = decode_journal_entry_with_event_specific_keys(input, event_specific_keys)
@@ -1641,7 +1647,7 @@ impl RetainedJournal {
                 }
             }
             self.preflight_unsupported_common(&common)?;
-            return Err(RetainedJournalError::UnsupportedEntry);
+            return self.append_decoded_common(common, input);
         }
         if event_type_id.value() == 200 {
             return match decode_common_journal_entry(input) {
@@ -1653,7 +1659,7 @@ impl RetainedJournal {
                         return Err(RetainedJournalError::DecodeError);
                     }
                     self.preflight_unsupported_common(&common)?;
-                    Err(RetainedJournalError::UnsupportedEntry)
+                    self.append_decoded_common(common, input)
                 }
                 Err(_) => {
                     let common = decode_journal_entry_with_event_specific_keys(input, &[20])
@@ -1678,7 +1684,7 @@ impl RetainedJournal {
                     self.resolve_reference(closeout_reference)
                         .map_err(|_| RetainedJournalError::DecodeError)?;
                     self.preflight_unsupported_common(&common)?;
-                    Err(RetainedJournalError::UnsupportedEntry)
+                    self.append_decoded_common(common, input)
                 }
             };
         }
@@ -1830,7 +1836,7 @@ impl RetainedJournal {
         &self,
         input: &[u8],
         expected_event_type_id: EventTypeId,
-    ) -> Result<(), RetainedJournalError> {
+    ) -> Result<DecodedCommonJournalEntry, RetainedJournalError> {
         let common = decode_journal_entry_with_event_specific_keys(input, &[16, 18, 19])
             .map_err(|_| RetainedJournalError::DecodeError)?;
         if common.event_type_id != expected_event_type_id
@@ -1891,14 +1897,14 @@ impl RetainedJournal {
             return Err(RetainedJournalError::DecodeError);
         }
         self.preflight_unsupported_common(&common)?;
-        Ok(())
+        Ok(common)
     }
 
     fn validate_eviction_started(
         &self,
         input: &[u8],
         expected_event_type_id: EventTypeId,
-    ) -> Result<(), RetainedJournalError> {
+    ) -> Result<DecodedCommonJournalEntry, RetainedJournalError> {
         let common = decode_journal_entry_with_event_specific_keys(input, &[21, 22, 23, 24])
             .map_err(|_| RetainedJournalError::DecodeError)?;
         if common.event_type_id != expected_event_type_id
@@ -1947,7 +1953,31 @@ impl RetainedJournal {
             return Err(RetainedJournalError::DecodeError);
         }
         self.preflight_unsupported_common(&common)?;
-        Ok(())
+        Ok(common)
+    }
+
+    fn append_decoded_common(
+        &mut self,
+        common: DecodedCommonJournalEntry,
+        input: &[u8],
+    ) -> Result<(), RetainedJournalError> {
+        self.append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id: common.registry_id,
+            entry_index: common.entry_index,
+            previous_entry_hash: common
+                .previous_entry_hash
+                .ok_or(RetainedJournalError::DecodeError)?,
+            event_type_id: common.event_type_id,
+            event_record_id: common.event_record_id,
+            storage_capability_class_id: common.storage_capability_class_id,
+            environment_observation_id: common.environment_observation_id,
+            lifecycle_object_kind: common.lifecycle_object_kind,
+            lifecycle_object_id: common.lifecycle_object_id,
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: common.identity_dependencies,
+            authority_dependencies: common.authority_dependencies,
+            authoritative_bytes: input.to_vec(),
+        }))
     }
 
     /// Preflights the retained-history conditions shared by an event form this
@@ -3085,6 +3115,7 @@ impl ManifestRecord {
             return Err(RecordDecodeError);
         }
         let mut artifacts = Vec::new();
+        let mut artifact_paths = BTreeSet::new();
         for _ in 0..actual_artifact_count {
             cursor.array_exact(5).map_err(|_| RecordDecodeError)?;
             let artifact_kind_id = cursor.uint().map_err(|_| RecordDecodeError)?;
@@ -3109,6 +3140,9 @@ impl ManifestRecord {
                 return Err(RecordDecodeError);
             }
             let digest_bytes = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            if !artifact_paths.insert(path_components.clone()) {
+                return Err(RecordDecodeError);
+            }
             artifacts.push(ManifestArtifactEntry {
                 artifact_kind_id,
                 path_components,
@@ -3399,6 +3433,9 @@ fn decode_review_admission_review_requirements(
         cursor.map_exact(5).map_err(|_| RecordDecodeError)?;
         cursor.key(0).map_err(|_| RecordDecodeError)?;
         let review_role_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(review_role_id, 1..=5) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(1).map_err(|_| RecordDecodeError)?;
         let review_scope_ref =
             RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
@@ -3413,9 +3450,6 @@ fn decode_review_admission_review_requirements(
                 .map_err(|_| RecordDecodeError)?;
         cursor.key(4).map_err(|_| RecordDecodeError)?;
         let required_count = cursor.uint().map_err(|_| RecordDecodeError)?;
-        if required_count == 0 {
-            return Err(RecordDecodeError);
-        }
         let selector = (
             review_role_id,
             review_scope_ref,
@@ -3423,7 +3457,11 @@ fn decode_review_admission_review_requirements(
             required_checks_ref,
             required_count,
         );
-        if previous.as_ref().is_some_and(|prior| selector <= *prior) {
+        if previous.as_ref().is_some_and(|prior| {
+            selector <= *prior
+                || (selector.0, selector.1, selector.2, selector.3)
+                    == (prior.0, prior.1, prior.2, prior.3)
+        }) {
             return Err(RecordDecodeError);
         }
         previous = Some(selector);
@@ -3446,6 +3484,7 @@ impl ReviewAdmissionPolicyRecord {
         if frame.record_type_id() != RecordTypeId::try_from(40).expect("assigned Record Type") {
             return Err(RecordDecodeError);
         }
+        authoritative_store::validate_policy_record_schema(input)?;
         let mut cursor = CborCursor::new(input);
         cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
         cursor
@@ -3457,7 +3496,7 @@ impl ReviewAdmissionPolicyRecord {
             return Err(RecordDecodeError);
         }
         let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
-        if !(6..=9).contains(&field_count) {
+        if !(6..=17).contains(&field_count) {
             return Err(RecordDecodeError);
         }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
@@ -3510,6 +3549,9 @@ impl ReviewAdmissionPolicyRecord {
                             matches!(id, 1..=6)
                         })?);
                 }
+                20..=23 | 25..=28 => {
+                    cursor.skip_value().map_err(|_| RecordDecodeError)?;
+                }
                 29 if operation_start_journal_ref.is_none() => {
                     operation_start_journal_ref =
                         Some(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
@@ -3551,7 +3593,7 @@ impl ReviewAdmissionPolicyRecord {
         self.gate_scope_ref
     }
 
-    /// The sole Policy evaluation context permitted by this bounded profile.
+    /// The caller-selected Policy evaluation context for this bounded evaluator path.
     pub fn supported_context(&self) -> PolicyEvaluationContext {
         PolicyEvaluationContext::ReviewAdmission
     }
@@ -3597,13 +3639,16 @@ pub enum ReviewAdmissionPolicyContextDeclaration {
     PolicyContextUnsupported,
 }
 
-/// Requires the sole exact context declaration of the frozen profile-1
-/// REVIEW_ADMISSION Policy. This occurs before §46 requirement evaluation and
-/// is not a completed Policy, evaluator, or Admission result.
+/// Requires an explicit REVIEW_ADMISSION declaration before §46 requirement
+/// evaluation. Other explicitly declared contexts remain separate and do not
+/// become hidden gates for this operation.
 pub fn check_review_admission_policy_context(
     policy: &ReviewAdmissionPolicyRecord,
 ) -> ReviewAdmissionPolicyContextDeclaration {
-    if policy.supported_context_ids() == [PolicyEvaluationContext::ReviewAdmission.id()] {
+    if policy
+        .supported_context_ids()
+        .contains(&PolicyEvaluationContext::ReviewAdmission.id())
+    {
         ReviewAdmissionPolicyContextDeclaration::Declared
     } else {
         ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported
@@ -3917,36 +3962,6 @@ pub fn validate_review_admission_policy_context_prerequisites(
     })
 }
 
-/// The individual outcome of frozen evaluator 1015.
-///
-/// This is neither a completed §46 Policy result nor a Lifecycle disposition.
-/// It has no authority to construct an Admission, event 302/303, Journal entry,
-/// or publication result; §46 alone composes this evaluator outcome with every
-/// other applicable requirement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReviewAdmissionGateScope1015Result {
-    Pass,
-    Fail,
-}
-
-/// Evaluates the frozen profile-1 REVIEW_ADMISSION gate-Scope requirement.
-///
-/// The input can be obtained only from the typed context-prerequisite path,
-/// which derives both identities from the exact retained Policy and the common
-/// Request/Result scope; callers cannot feed a scope identity, prior evaluator
-/// result, Policy completion, direction, or validation flag into this evaluator.
-/// The §46 dispatcher is responsible for invoking this only after the full
-/// authoritative §82 route and applicability determination have succeeded.
-pub fn evaluate_review_admission_gate_scope_1015(
-    prerequisites: ReviewAdmissionPolicyContextPrerequisites,
-) -> ReviewAdmissionGateScope1015Result {
-    if prerequisites.gate_scope_ref() == prerequisites.common_review_scope_ref() {
-        ReviewAdmissionGateScope1015Result::Pass
-    } else {
-        ReviewAdmissionGateScope1015Result::Fail
-    }
-}
-
 /// Immutable registry metadata for a frozen POLICY evaluator.
 ///
 /// This metadata assigns no generic evaluation behavior to any field or Scope.
@@ -3956,7 +3971,7 @@ pub struct PolicyEvaluatorRegistration {
     pub name: &'static str,
 }
 
-const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 15] = [
+const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 14] = [
     PolicyEvaluatorRegistration {
         id: 1001,
         name: "POLICY_REVIEW_REQUIREMENT_MATCH",
@@ -4012,10 +4027,6 @@ const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 15] = [
     PolicyEvaluatorRegistration {
         id: 1014,
         name: "POLICY_SUPPORTED_CONTEXT",
-    },
-    PolicyEvaluatorRegistration {
-        id: 1015,
-        name: "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING",
     },
 ];
 
@@ -4216,7 +4227,8 @@ fn validate_review_admission_section_82_structural_inputs(
 
 /// A §82 returned-Anchor comparison that prevents Policy evaluation from starting.
 ///
-/// This is deliberately outside evaluator 1015 and §46's completed-result grammar.
+/// This is deliberately outside unavailable generic gate-Scope evaluation and §46's
+/// completed-result grammar.
 /// It establishes no Review Request/Result authority, Admission result, terminal
 /// event, Journal publication, or generic Policy semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4250,7 +4262,7 @@ pub enum ReviewAdmissionSection82RoutingOutcome {
 ///
 /// Lifecycle v0.10.2 §117 admits only an equal current head or valid ancestor
 /// to the subsequent Policy path. All other §116 classes fail closed at this
-/// §82 boundary without invoking Policy evaluation, evaluator 1015, §46
+/// §82 boundary without invoking generic gate-Scope evaluation, §46
 /// composition, or terminal-event publication.
 pub fn route_review_admission_after_anchor_comparison(
     comparison: JournalAnchorHistoryComparison,
@@ -4756,11 +4768,10 @@ pub struct ReviewRequestRecord {
     review_method_ref: RecordId,
     review_package_anchor_id: JournalAnchorId,
     operation_start_journal_ref: JournalReference,
-    review_package_anchor_binding_version: u64,
 }
 
 impl ReviewRequestRecord {
-    /// Strictly decodes the prospective Record Schema v0.5 version-1
+    /// Strictly decodes the frozen Record Schema v0.3 version-1
     /// REVIEW_REQUEST local grammar without normalizing bytes.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
@@ -4777,7 +4788,7 @@ impl ReviewRequestRecord {
         {
             return Err(RecordDecodeError);
         }
-        cursor.map_exact(12).map_err(|_| RecordDecodeError)?;
+        cursor.map_exact(11).map_err(|_| RecordDecodeError)?;
         cursor.key(0).map_err(|_| RecordDecodeError)?;
         if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
             return Err(RecordDecodeError);
@@ -4795,6 +4806,9 @@ impl ReviewRequestRecord {
                 .map_err(|_| RecordDecodeError)?;
         cursor.key(18).map_err(|_| RecordDecodeError)?;
         let review_role_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(review_role_id, 1..=5) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(19).map_err(|_| RecordDecodeError)?;
         let required_checks_ref =
             RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
@@ -4817,10 +4831,7 @@ impl ReviewRequestRecord {
         cursor.key(24).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
-        cursor.key(25).map_err(|_| RecordDecodeError)?;
-
-        let review_package_anchor_binding_version = cursor.uint().map_err(|_| RecordDecodeError)?;
-        if review_package_anchor_binding_version != 1 || !cursor.finished() {
+        if !cursor.finished() {
             return Err(RecordDecodeError);
         }
         Ok(Self {
@@ -4834,7 +4845,6 @@ impl ReviewRequestRecord {
             review_method_ref,
             review_package_anchor_id,
             operation_start_journal_ref,
-            review_package_anchor_binding_version,
         })
     }
 
@@ -4846,11 +4856,6 @@ impl ReviewRequestRecord {
     /// The exact version-1 Review Package Anchor carrier decoded in its named domain.
     pub fn review_package_anchor_id(&self) -> JournalAnchorId {
         self.review_package_anchor_id
-    }
-
-    /// The required prospective carrier binding version, which is exactly one.
-    pub fn review_package_anchor_binding_version(&self) -> u64 {
-        self.review_package_anchor_binding_version
     }
 
     /// The exact retained Freeze authority reference required for §82 comparison.
@@ -4917,11 +4922,10 @@ pub struct ReviewResultRecord {
     reviewer_metadata: Option<String>,
     review_package_anchor_id: JournalAnchorId,
     operation_start_journal_ref: JournalReference,
-    review_package_anchor_binding_version: u64,
 }
 
 impl ReviewResultRecord {
-    /// Strictly decodes the prospective Record Schema v0.5 version-1
+    /// Strictly decodes the frozen Record Schema v0.3 version-1
     /// REVIEW_RESULT local grammar without normalizing bytes.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
@@ -4939,7 +4943,7 @@ impl ReviewResultRecord {
             return Err(RecordDecodeError);
         }
         let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
-        if !matches!(field_count, 15 | 16) {
+        if !matches!(field_count, 14 | 15) {
             return Err(RecordDecodeError);
         }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
@@ -4962,6 +4966,9 @@ impl ReviewResultRecord {
                 .map_err(|_| RecordDecodeError)?;
         cursor.key(19).map_err(|_| RecordDecodeError)?;
         let review_role_id = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(review_role_id, 1..=5) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(20).map_err(|_| RecordDecodeError)?;
         let review_scope_ref =
             RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
@@ -4972,8 +4979,14 @@ impl ReviewResultRecord {
                 .map_err(|_| RecordDecodeError)?;
         cursor.key(22).map_err(|_| RecordDecodeError)?;
         let method_status = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(method_status, 1..=3) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(23).map_err(|_| RecordDecodeError)?;
         let finding_state = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(finding_state, 1..=3) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(24).map_err(|_| RecordDecodeError)?;
         let reason_code_count = cursor.array().map_err(|_| RecordDecodeError)?;
         if reason_code_count > cursor.remaining() {
@@ -5004,7 +5017,7 @@ impl ReviewResultRecord {
                     .map_err(|_| RecordDecodeError)?,
             );
         }
-        let reviewer_metadata = if field_count == 16 {
+        let reviewer_metadata = if field_count == 15 {
             cursor.key(26).map_err(|_| RecordDecodeError)?;
             Some(cursor.text().map_err(|_| RecordDecodeError)?)
         } else {
@@ -5017,9 +5030,7 @@ impl ReviewResultRecord {
         cursor.key(28).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
-        cursor.key(29).map_err(|_| RecordDecodeError)?;
-        let review_package_anchor_binding_version = cursor.uint().map_err(|_| RecordDecodeError)?;
-        if review_package_anchor_binding_version != 1 || !cursor.finished() {
+        if !cursor.finished() {
             return Err(RecordDecodeError);
         }
         Ok(Self {
@@ -5037,7 +5048,6 @@ impl ReviewResultRecord {
             reviewer_metadata,
             review_package_anchor_id,
             operation_start_journal_ref,
-            review_package_anchor_binding_version,
         })
     }
 
@@ -5049,11 +5059,6 @@ impl ReviewResultRecord {
     /// The exact version-1 Review Package Anchor carrier decoded in its named domain.
     pub fn review_package_anchor_id(&self) -> JournalAnchorId {
         self.review_package_anchor_id
-    }
-
-    /// The required prospective carrier binding version, which is exactly one.
-    pub fn review_package_anchor_binding_version(&self) -> u64 {
-        self.review_package_anchor_binding_version
     }
 
     /// The exact retained Freeze authority reference required for §82 comparison.
@@ -5099,6 +5104,15 @@ impl ReviewResultRecord {
     /// The exact Finding-state registry value carried by the Review Result.
     pub fn finding_state(&self) -> u64 {
         self.finding_state
+    }
+
+    /// The exact canonical Result reason-code set retained for terminal derivation.
+    pub fn reason_codes(&self) -> &[String] {
+        &self.reason_codes
+    }
+
+    pub(crate) fn findings(&self) -> &[RecordId] {
+        &self.findings
     }
 }
 
@@ -5402,6 +5416,26 @@ impl ReviewAdmissionJournalEntry {
     /// The exact Admission Record identity carried as the event Record ID.
     pub fn event_record_id(&self) -> EventRecordId {
         self.event_record_id
+    }
+
+    /// The exact publication-time Journal slot selected by compare-and-append.
+    pub fn entry_index(&self) -> JournalEntryIndex {
+        self.entry_index
+    }
+
+    /// The exact publication-time predecessor hash, distinct from `Hstart(A)`.
+    pub fn previous_entry_hash(&self) -> JournalEntryHash {
+        self.previous_entry_hash
+    }
+
+    /// The storage-capability observation derived from the publication-time head.
+    pub fn storage_capability_class_id(&self) -> RecordId {
+        self.storage_capability_class_id
+    }
+
+    /// The environment observation derived from the publication-time head.
+    pub fn environment_observation_id(&self) -> RecordId {
+        self.environment_observation_id
     }
 
     /// The exact terminal Admission Record carried by this Entry.
@@ -5771,10 +5805,7 @@ pub fn validate_review_package_anchor_transport(
         .map_err(|_| ReviewPackageAnchorTransportError::RequestDecode)?;
     let result = ReviewResultRecord::decode_authoritative(result_bytes)
         .map_err(|_| ReviewPackageAnchorTransportError::ResultDecode)?;
-    if request.review_package_anchor_binding_version()
-        != result.review_package_anchor_binding_version()
-        || request.review_package_anchor_id() != result.review_package_anchor_id()
-    {
+    if request.review_package_anchor_id() != result.review_package_anchor_id() {
         return Err(ReviewPackageAnchorTransportError::AnchorCarrierMismatch);
     }
     Ok(())
@@ -6395,13 +6426,13 @@ pub fn validate_freeze_committed_binding(
         return Err(FreezeCommittedBindingError::ReceiptRecordMismatch);
     }
     let start_reference = &input.freeze_receipt_record.input.attempt_start_journal_ref;
-    if start_reference.entry_index().value() >= committed.entry_index().value() {
-        return Err(FreezeCommittedBindingError::AttemptStartNotPrior);
-    }
     let start = input
         .retained_journal
         .resolve_reference(start_reference)
         .map_err(FreezeCommittedBindingError::RetainedReference)?;
+    if start.entry_index().value() >= committed.entry_index().value() {
+        return Err(FreezeCommittedBindingError::AttemptStartNotPrior);
+    }
     if start.event_type_id().value() != 100
         || start.event_type_id().required_record_type_id().value() != 3
         || start.lifecycle_object_kind() != LifecycleObjectKind::FreezeAttempt

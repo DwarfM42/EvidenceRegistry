@@ -1346,9 +1346,9 @@ fn retained_journal_classifies_eviction_freeze_authority_by_exact_event_type() {
             101,
             id(0x81),
         )),
-        Err(RetainedJournalError::UnsupportedEntry)
+        Ok(())
     );
-    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 4);
 
     assert_eq!(
         journal.append_strict_entry(&eviction_started_bytes(
@@ -1360,7 +1360,7 @@ fn retained_journal_classifies_eviction_freeze_authority_by_exact_event_type() {
         )),
         Err(RetainedJournalError::DecodeError)
     );
-    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 3);
+    assert_eq!(journal.reconstruct_state().unwrap().entry_count(), 4);
 }
 
 #[test]

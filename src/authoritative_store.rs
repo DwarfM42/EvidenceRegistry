@@ -1,6 +1,14 @@
 use super::*;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// Maximum bytes admitted from any single authoritative namespace object.
+pub const AUTHORITATIVE_STORE_MAX_OBJECT_BYTES: usize = 1_048_576;
+/// Maximum regular objects admitted across one authoritative store opening.
+pub const AUTHORITATIVE_STORE_MAX_OBJECTS: usize = 4_096;
+/// Maximum aggregate bytes retained across one authoritative store opening.
+pub const AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES: usize = 64 * 1_048_576;
 
 /// A fail-closed error while opening the authoritative on-disk Registry namespaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,12 +23,21 @@ pub enum AuthoritativeRegistryStoreOpenError {
     RecordFilenameInvalid,
     RecordDecode,
     RecordIdentityMismatch,
+    NamespaceResourceLimit,
     GenesisRecordDecode,
     GenesisRecordIdentityMismatch,
     GenesisRegistryMismatch,
     GenesisProfileMismatch,
     GenesisCapabilityMismatch,
     GenesisEnvironmentMismatch,
+    EventRecordUnavailable,
+    EventRecordBinding(EventRecordStructuralBindingError),
+    EventRecordDecode,
+    /// Frozen-valid structure requires contextual authority semantics not supplied by this runtime.
+    EventSemanticAuthorityUnavailable,
+    /// This platform cannot hold a mandatory immutable-generation lease for positive authority.
+    RetainedGenerationProtectionUnavailable,
+    RetainedGenerationChanged,
     RetainedJournal(RetainedJournalError),
 }
 
@@ -34,7 +51,63 @@ pub struct AuthoritativeRegistryStore {
     root: PathBuf,
     retained_journal: RetainedJournal,
     records: Vec<(RecordId, Vec<u8>)>,
+    namespace_holds: Vec<fs::File>,
+    retained_file_witnesses: Vec<RetainedFileWitness>,
     live_instance_identity: Arc<AuthoritativeRegistryStoreInstanceIdentity>,
+}
+
+#[derive(Debug)]
+struct RetainedFileWitness {
+    path: PathBuf,
+    file: fs::File,
+    expected_length: usize,
+    expected_sha256: [u8; ID_LENGTH],
+}
+
+struct RetainedFileRead {
+    bytes: Vec<u8>,
+    witness: RetainedFileWitness,
+}
+
+type LoadedRecordNamespace = (Vec<(RecordId, Vec<u8>)>, Vec<RetainedFileWitness>);
+
+struct NamespaceBudget {
+    objects: usize,
+    bytes: usize,
+}
+
+impl NamespaceBudget {
+    fn new() -> Self {
+        Self {
+            objects: 0,
+            bytes: 0,
+        }
+    }
+
+    fn reserve(&mut self, length: u64) -> Result<usize, NamespaceReadError> {
+        let length = usize::try_from(length).map_err(|_| NamespaceReadError::ResourceLimit)?;
+        if length > AUTHORITATIVE_STORE_MAX_OBJECT_BYTES {
+            return Err(NamespaceReadError::ResourceLimit);
+        }
+        self.objects = self
+            .objects
+            .checked_add(1)
+            .filter(|count| *count <= AUTHORITATIVE_STORE_MAX_OBJECTS)
+            .ok_or(NamespaceReadError::ResourceLimit)?;
+        self.bytes = self
+            .bytes
+            .checked_add(length)
+            .filter(|bytes| *bytes <= AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES)
+            .ok_or(NamespaceReadError::ResourceLimit)?;
+        Ok(length)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamespaceReadError {
+    Io,
+    Invalid,
+    ResourceLimit,
 }
 
 #[derive(Debug)]
@@ -43,6 +116,9 @@ struct AuthoritativeRegistryStoreInstanceIdentity {
 }
 
 static NEXT_AUTHORITATIVE_REVIEW_ADMISSION_TOKEN: AtomicU64 = AtomicU64::new(1);
+#[cfg(any(windows, test))]
+static NEXT_AUTHORITATIVE_PUBLICATION_TEMP: AtomicU64 = AtomicU64::new(1);
+const MAX_AUTHORITATIVE_PUBLICATION_RETRIES: usize = 8;
 
 /// One bounded, process-local authoritative Review Admission acceptance.
 ///
@@ -97,6 +173,8 @@ pub enum AuthoritativeReviewAdmissionSection82Error {
     RequestAuthorityAfterOperationStart,
     ResultAuthorityAfterOperationStart,
     FreezeAuthority(AuthoritativeFreezeCommittedBindingError),
+    /// Frozen authority does not define the generic Policy gate-Scope relation needed for §46.
+    PolicyScopeApplicabilityUnavailable,
 }
 
 /// Every authoritative input established at the successful §82 boundary.
@@ -173,6 +251,179 @@ impl AuthoritativeReviewAdmissionSection82 {
     }
 }
 
+/// One exact observed durability action for terminal local publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurabilityActionState {
+    Performed,
+    PreviouslyEstablished,
+    Unsupported,
+}
+
+/// Exact publication-time durability facts retained with a successful publication receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthoritativePublicationDurability {
+    record_content_flush: DurabilityActionState,
+    journal_content_flush: DurabilityActionState,
+    record_atomic_publish_no_replace: DurabilityActionState,
+    journal_atomic_publish_no_replace: DurabilityActionState,
+    record_parent_directory_flush: DurabilityActionState,
+    journal_parent_directory_flush: DurabilityActionState,
+    platform_strongest_available: bool,
+}
+
+impl AuthoritativePublicationDurability {
+    pub fn record_content_flush(&self) -> DurabilityActionState {
+        self.record_content_flush
+    }
+
+    pub fn journal_content_flush(&self) -> DurabilityActionState {
+        self.journal_content_flush
+    }
+
+    pub fn record_atomic_publish_no_replace(&self) -> DurabilityActionState {
+        self.record_atomic_publish_no_replace
+    }
+
+    pub fn journal_atomic_publish_no_replace(&self) -> DurabilityActionState {
+        self.journal_atomic_publish_no_replace
+    }
+
+    pub fn record_parent_directory_flush(&self) -> DurabilityActionState {
+        self.record_parent_directory_flush
+    }
+
+    pub fn journal_parent_directory_flush(&self) -> DurabilityActionState {
+        self.journal_parent_directory_flush
+    }
+
+    pub fn platform_strongest_available(&self) -> bool {
+        self.platform_strongest_available
+    }
+}
+
+/// A successful exact terminal Record and Journal publication receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoritativeReviewAdmissionPublication {
+    policy_completion: ReviewAdmissionPolicy46Completion,
+    disposition: ReviewAdmissionSection83Disposition,
+    admission_record: ReviewAdmissionRecord,
+    admission_record_bytes: Vec<u8>,
+    journal_entry: ReviewAdmissionJournalEntry,
+    journal_entry_bytes: Vec<u8>,
+    journal_reference: JournalReference,
+    operation_start_journal_ref: JournalReference,
+    freeze_authority: AuthoritativeFreezeCommittedBinding,
+    durability: AuthoritativePublicationDurability,
+}
+
+impl AuthoritativeReviewAdmissionPublication {
+    pub fn policy_completion(&self) -> &ReviewAdmissionPolicy46Completion {
+        &self.policy_completion
+    }
+
+    pub fn disposition(&self) -> ReviewAdmissionSection83Disposition {
+        self.disposition
+    }
+
+    pub fn admission_record(&self) -> &ReviewAdmissionRecord {
+        &self.admission_record
+    }
+
+    pub fn admission_record_bytes(&self) -> &[u8] {
+        &self.admission_record_bytes
+    }
+
+    pub fn journal_entry(&self) -> &ReviewAdmissionJournalEntry {
+        &self.journal_entry
+    }
+
+    pub fn journal_entry_bytes(&self) -> &[u8] {
+        &self.journal_entry_bytes
+    }
+
+    pub fn journal_reference(&self) -> &JournalReference {
+        &self.journal_reference
+    }
+
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+
+    pub fn freeze_authority(&self) -> &AuthoritativeFreezeCommittedBinding {
+        &self.freeze_authority
+    }
+
+    pub fn durability(&self) -> AuthoritativePublicationDurability {
+        self.durability
+    }
+}
+
+/// A terminal Journal name became or may have become visible, but the runtime could not
+/// authenticate a complete publication receipt. Callers must recover by reopening and replaying
+/// the exact Journal reference and Record bytes; this value is not a durability receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoritativeReviewAdmissionPublishedReceiptUncertain {
+    admission_record_id: RecordId,
+    admission_record_bytes: Vec<u8>,
+    journal_reference: JournalReference,
+    journal_entry_bytes: Vec<u8>,
+    operation_start_journal_ref: JournalReference,
+}
+
+impl AuthoritativeReviewAdmissionPublishedReceiptUncertain {
+    pub fn admission_record_id(&self) -> RecordId {
+        self.admission_record_id
+    }
+
+    pub fn admission_record_bytes(&self) -> &[u8] {
+        &self.admission_record_bytes
+    }
+
+    pub fn journal_reference(&self) -> &JournalReference {
+        &self.journal_reference
+    }
+
+    pub fn journal_entry_bytes(&self) -> &[u8] {
+        &self.journal_entry_bytes
+    }
+
+    pub fn operation_start_journal_ref(&self) -> &JournalReference {
+        &self.operation_start_journal_ref
+    }
+}
+
+/// The production authoritative Review Admission runtime result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthoritativeReviewAdmissionRuntimeOutcome {
+    PreTerminal(AuthoritativeReviewAdmissionSection82Error),
+    Published(Box<AuthoritativeReviewAdmissionPublication>),
+    PublishedReceiptUncertain(Box<AuthoritativeReviewAdmissionPublishedReceiptUncertain>),
+}
+
+/// A failure after a terminal disposition was derived but before a durable publication receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoritativeReviewAdmissionPublicationError {
+    Store(AuthoritativeRegistryStoreOpenError),
+    RegistryIdentityChanged,
+    OperationStartReference(RetainedJournalError),
+    EntryIndexExhausted,
+    AdmissionRecord,
+    JournalEntry,
+    LifecyclePreflight(RetainedJournalError),
+    /// No platform primitive established the required mandatory runtime-publication lock.
+    PublicationLockUnavailable,
+    RetainedGenerationChanged,
+    RecordPublication,
+    JournalPublication,
+    PublicationConflictExhausted,
+    ReplayMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoritativeReviewAdmissionRuntimeError {
+    Publication(AuthoritativeReviewAdmissionPublicationError),
+}
+
 /// A positive Freeze-authority witness derived only from one opened authoritative Registry store.
 ///
 /// This type has no public constructor. Its exact START, Receipt, Manifest, and terminal event
@@ -238,6 +489,10 @@ impl AuthoritativeFreezeCommittedBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthoritativeFreezeCommittedBindingError {
     Structural(ResolvedFreezeCommittedBindingError),
+    RetainedGenerationChanged,
+    /// Frozen authority does not assign the generic gate-Scope and selected Manifest-profile
+    /// semantics needed to promote exact structural bindings into positive Freeze authority.
+    SemanticAuthorityUnavailable,
 }
 
 impl AuthoritativeRegistryStore {
@@ -247,26 +502,61 @@ impl AuthoritativeRegistryStore {
     /// Entry is strictly decoded and replayed. Every Record namespace object must have the exact
     /// lowercase content-addressed filename and strict self-hash identity required by its bytes.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, AuthoritativeRegistryStoreOpenError> {
-        let root = root.as_ref();
-        ensure_real_directory(root)
+        Self::open_with_generation_hook(root.as_ref(), || {})
+    }
+
+    fn open_with_generation_hook<F>(
+        root: &Path,
+        before_generation_guard: F,
+    ) -> Result<Self, AuthoritativeRegistryStoreOpenError>
+    where
+        F: FnOnce(),
+    {
+        let root_hold = open_real_directory_hold(root)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
         let root = fs::canonicalize(root).map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
+        ensure_path_matches_handle(&root, &root_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
         let registry_dir = root.join("registry");
         let journal_dir = root.join("journal");
         let records_dir = root.join("records");
-        ensure_real_directory(&registry_dir)
+        let registry_hold = open_child_directory_hold(&root_hold, &root, "registry")
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid)?;
-        ensure_real_directory(&journal_dir)
+        let journal_hold = open_child_directory_hold(&root_hold, &root, "journal")
             .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid)?;
-        ensure_real_directory(&records_dir)
+        let records_hold = open_child_directory_hold(&root_hold, &root, "records")
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid)?;
-
-        let genesis_record_bytes = read_regular_file(&registry_dir.join("genesis.cbor"))
+        ensure_path_matches_handle(&registry_dir, &registry_hold)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid)?;
+        ensure_path_matches_handle(&journal_dir, &journal_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid)?;
+        ensure_path_matches_handle(&records_dir, &records_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid)?;
+        let registry_contents = namespace_contents_path(&registry_dir, &registry_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid)?;
+        let journal_contents = namespace_contents_path(&journal_dir, &journal_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid)?;
+        let records_contents = namespace_contents_path(&records_dir, &records_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid)?;
+        let mut budget = NamespaceBudget::new();
+
+        let genesis_record_read =
+            read_regular_file(&registry_contents.join("genesis.cbor"), &mut budget).map_err(
+                |error| match error {
+                    NamespaceReadError::ResourceLimit => {
+                        AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit
+                    }
+                    NamespaceReadError::Io | NamespaceReadError::Invalid => {
+                        AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid
+                    }
+                },
+            )?;
+        let genesis_record_bytes = genesis_record_read.bytes;
         let genesis_record = GenesisRecord::decode_authoritative(&genesis_record_bytes)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::GenesisRecordDecode)?;
 
-        let mut records = load_record_namespace(&records_dir)?;
+        let (mut records, mut record_witnesses) =
+            load_record_namespace(&records_contents, &mut budget)?;
         match records
             .iter()
             .find(|(record_id, _)| *record_id == genesis_record.record_id())
@@ -279,7 +569,8 @@ impl AuthoritativeRegistryStore {
         }
         records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
 
-        let journal_slots = load_journal_slots(&journal_dir)?;
+        let (journal_slots, mut journal_witnesses) =
+            load_journal_slots(&journal_contents, &mut budget)?;
         let genesis_entry =
             GenesisJournalEntry::decode_authoritative(&journal_slots[0]).map_err(|_| {
                 AuthoritativeRegistryStoreOpenError::RetainedJournal(
@@ -315,11 +606,54 @@ impl AuthoritativeRegistryStore {
                 .append_strict_entry(entry_bytes)
                 .map_err(AuthoritativeRegistryStoreOpenError::RetainedJournal)?;
         }
+        validate_authoritative_event_records(&retained_journal, &records)?;
+
+        let mut retained_file_witnesses = Vec::with_capacity(
+            1_usize
+                .checked_add(record_witnesses.len())
+                .and_then(|count| count.checked_add(journal_witnesses.len()))
+                .ok_or(AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit)?,
+        );
+        retained_file_witnesses.push(genesis_record_read.witness);
+        retained_file_witnesses.append(&mut record_witnesses);
+        retained_file_witnesses.append(&mut journal_witnesses);
+        before_generation_guard();
+        if !cfg!(windows) {
+            return Err(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationProtectionUnavailable,
+            );
+        }
+
+        let mut retained_generation_guards = Vec::new();
+        retained_generation_guards
+            .try_reserve_exact(retained_file_witnesses.len())
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit)?;
+        for witness in &retained_file_witnesses {
+            retained_generation_guards.push(
+                open_retained_file_guard(witness)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged)?,
+            );
+        }
+
+        ensure_path_matches_handle(&root, &root_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+        ensure_path_matches_handle(&registry_dir, &registry_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid)?;
+        ensure_path_matches_handle(&journal_dir, &journal_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid)?;
+        ensure_path_matches_handle(&records_dir, &records_hold)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid)?;
+        for witness in &mut retained_generation_guards {
+            revalidate_retained_file_witness(witness)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged)?;
+        }
 
         Ok(Self {
             root,
             retained_journal,
             records,
+            namespace_holds: vec![root_hold, registry_hold, journal_hold, records_hold],
+            retained_file_witnesses: retained_generation_guards,
             live_instance_identity: Arc::new(AuthoritativeRegistryStoreInstanceIdentity {
                 outstanding_review_admissions: AtomicUsize::new(0),
             }),
@@ -336,11 +670,14 @@ impl AuthoritativeRegistryStore {
         &self.retained_journal
     }
 
-    /// Establishes positive Freeze authority from this store's exact retained namespaces.
+    /// Validates exact retained Freeze bindings and fails closed before positive authority where
+    /// frozen generic Policy-Scope and selected Manifest-profile semantics remain unavailable.
     pub fn validate_freeze_committed_authority(
         &self,
         committed_event_reference: JournalReference,
     ) -> Result<AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError> {
+        self.revalidate_retained_generation()
+            .map_err(|()| AuthoritativeFreezeCommittedBindingError::RetainedGenerationChanged)?;
         match validate_resolved_freeze_committed_binding(
             &self.retained_journal,
             committed_event_reference.clone(),
@@ -350,40 +687,7 @@ impl AuthoritativeRegistryStore {
         {
             ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable => {}
         }
-
-        let receipt_record_id = RecordId::try_from(
-            committed_event_reference
-                .event_record_id()
-                .as_bytes()
-                .as_slice(),
-        )
-        .expect("EventRecordId has RecordId width");
-        let receipt_bytes = self
-            .resolve(receipt_record_id)
-            .expect("the structural binding resolved the exact Receipt bytes");
-        let receipt = FreezeReceiptRecord::decode_authoritative(receipt_bytes)
-            .expect("the structural binding strictly decoded the Receipt");
-        let start_event_reference = receipt.input().attempt_start_journal_ref.clone();
-        let start_record_id = RecordId::try_from(
-            start_event_reference
-                .event_record_id()
-                .as_bytes()
-                .as_slice(),
-        )
-        .expect("EventRecordId has RecordId width");
-
-        Ok(AuthoritativeFreezeCommittedBinding {
-            registry_id: self.retained_journal.registry_id,
-            committed_event_reference,
-            start_event_reference,
-            receipt_record_id,
-            manifest_record_id: receipt.input().manifest_id,
-            start_record_id,
-            freeze_attempt_id: receipt.input().freeze_attempt_id,
-            freeze_id: receipt.input().freeze_id,
-            subject_id: receipt.input().subject_id,
-            policy_record_id: receipt.input().policy_record_id,
-        })
+        Err(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)
     }
 
     /// Accepts one bounded opaque Request/Result presentation and binds the exact authoritative
@@ -584,6 +888,371 @@ impl AuthoritativeRegistryStore {
         })
     }
 
+    /// Executes authoritative §82, §46, §83, terminal construction, and durable publication.
+    ///
+    /// Terminal publication is enabled only where this implementation can hold a mandatory
+    /// cross-process publication lock among runtime publishers through Record and Journal
+    /// publication, together with retained-object sharing guards. Other platforms return
+    /// `PublicationLockUnavailable` before making any terminal namespace mutation.
+    pub fn complete_authoritative_review_admission(
+        &mut self,
+        accepted: AcceptedAuthoritativeReviewAdmission,
+    ) -> Result<AuthoritativeReviewAdmissionRuntimeOutcome, AuthoritativeReviewAdmissionRuntimeError>
+    {
+        let section_82 = match self.complete_authoritative_review_admission_section_82(accepted) {
+            Ok(section_82) => section_82,
+            Err(error) => {
+                return Ok(AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
+                    error,
+                ));
+            }
+        };
+        if frozen_generic_policy_scope_applicability_unavailable() {
+            return Ok(AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
+                AuthoritativeReviewAdmissionSection82Error::PolicyScopeApplicabilityUnavailable,
+            ));
+        }
+        let policy_completion = evaluate_unfrozen_review_admission_policy_profile(&section_82);
+        let policy_route =
+            ReviewAdmissionPolicy46RouteOutcome::Completed(policy_completion.clone());
+        let disposition = derive_review_admission_section_83_disposition(&policy_route);
+        let disposition_id = match disposition {
+            ReviewAdmissionSection83Disposition::ReviewAdmissionAccepted => 1,
+            ReviewAdmissionSection83Disposition::ReviewAdmissionRejected => 2,
+            ReviewAdmissionSection83Disposition::PreTerminal => {
+                unreachable!("a completed §46 result always selects a terminal §83 disposition")
+            }
+        };
+        let mut reason_codes = section_82.result().reason_codes().to_vec();
+        reason_codes.push(
+            match policy_completion.result() {
+                ReviewAdmissionCompletedPolicyResult::Satisfied => "POLICY_SATISFIED",
+                ReviewAdmissionCompletedPolicyResult::GateUnsatisfied => "POLICY_GATE_UNSATISFIED",
+                ReviewAdmissionCompletedPolicyResult::GateIndeterminate => {
+                    "POLICY_GATE_INDETERMINATE"
+                }
+            }
+            .to_owned(),
+        );
+        reason_codes.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        reason_codes.dedup();
+
+        let admission_record = ReviewAdmissionRecord::new(ReviewAdmissionRecordInput {
+            disposition_id,
+            review_request_ref: section_82.request_event_reference().clone(),
+            review_result_ref: section_82.result_event_reference().clone(),
+            policy_authority_ref: section_82.policy_authority_ref().clone(),
+            reason_codes,
+            operation_start_journal_ref: section_82.operation_start_journal_ref().clone(),
+        })
+        .map_err(|_| {
+            AuthoritativeReviewAdmissionRuntimeError::Publication(
+                AuthoritativeReviewAdmissionPublicationError::AdmissionRecord,
+            )
+        })?;
+        let admission_record_bytes = admission_record.authoritative_cbor();
+        let root_hold = self.namespace_holds.first().ok_or(
+            AuthoritativeReviewAdmissionRuntimeError::Publication(
+                AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+            ),
+        )?;
+        let _publication_lock = acquire_authoritative_publication_lock(&self.root, root_hold)
+            .map_err(|()| {
+                AuthoritativeReviewAdmissionRuntimeError::Publication(
+                    AuthoritativeReviewAdmissionPublicationError::PublicationLockUnavailable,
+                )
+            })?;
+
+        for _ in 0..MAX_AUTHORITATIVE_PUBLICATION_RETRIES {
+            self.reload_authoritative_namespaces()
+                .map_err(map_reload_to_runtime_error)?;
+            self.retained_journal
+                .resolve_reference(section_82.operation_start_journal_ref())
+                .map_err(|error| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::OperationStartReference(
+                            error,
+                        ),
+                    )
+                })?;
+            let current_head = self.retained_journal.current_head_reference();
+            let current_context = self
+                .retained_journal
+                .resolve_reference(&current_head)
+                .expect("the current retained head resolves against its own exact bytes");
+            let next_index = current_head
+                .entry_index()
+                .value()
+                .checked_add(1)
+                .and_then(|value| JournalEntryIndex::try_from(value).ok())
+                .ok_or(AuthoritativeReviewAdmissionRuntimeError::Publication(
+                    AuthoritativeReviewAdmissionPublicationError::EntryIndexExhausted,
+                ))?;
+            let journal_entry =
+                ReviewAdmissionJournalEntry::new(ReviewAdmissionJournalEntryInput {
+                    registry_id: current_head.registry_id(),
+                    entry_index: next_index,
+                    previous_entry_hash: current_head.entry_hash(),
+                    admission: admission_record.clone(),
+                    storage_capability_class_id: current_context.storage_capability_class_id(),
+                    environment_observation_id: current_context.environment_observation_id(),
+                })
+                .map_err(|_| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::JournalEntry,
+                    )
+                })?;
+            let journal_entry_bytes = journal_entry.authoritative_cbor();
+            let mut preflight_store = Self::open(&self.root).map_err(|error| {
+                AuthoritativeReviewAdmissionRuntimeError::Publication(
+                    AuthoritativeReviewAdmissionPublicationError::Store(error),
+                )
+            })?;
+            if preflight_store.retained_journal.current_head_reference() != current_head {
+                continue;
+            }
+            preflight_store
+                .retained_journal
+                .append_strict_entry(&journal_entry_bytes)
+                .map_err(|error| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::LifecyclePreflight(error),
+                    )
+                })?;
+            let mut publication_store = Self::open(&self.root).map_err(|error| {
+                AuthoritativeReviewAdmissionRuntimeError::Publication(
+                    AuthoritativeReviewAdmissionPublicationError::Store(error),
+                )
+            })?;
+            if publication_store.retained_journal.current_head_reference() != current_head {
+                continue;
+            }
+            for witness in &mut publication_store.retained_file_witnesses {
+                revalidate_retained_file_witness(witness).map_err(|()| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                    )
+                })?;
+            }
+            let mut publication = publish_record_bytes(
+                &mut publication_store,
+                admission_record.record_id(),
+                &admission_record_bytes,
+            )
+            .map_err(|_| {
+                AuthoritativeReviewAdmissionRuntimeError::Publication(
+                    AuthoritativeReviewAdmissionPublicationError::RecordPublication,
+                )
+            })?;
+            publication_store
+                .retained_journal
+                .resolve_reference(&current_head)
+                .map_err(|error| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::OperationStartReference(
+                            error,
+                        ),
+                    )
+                })?;
+            let mut retained_generation_guard = publication_store
+                .acquire_retained_generation_guard(Some(&publication.retained_witness))
+                .map_err(|()| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                    )
+                })?;
+            let journal_hold = publication_store
+                .acquire_publication_directory_hold(2, "journal")
+                .map_err(|()| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                    )
+                })?;
+            for witness in &mut retained_generation_guard {
+                revalidate_retained_file_witness(witness).map_err(|()| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                    )
+                })?;
+            }
+            let journal_dir = self.root.join("journal");
+            let journal_name = format!("{:020}.cbor", next_index.value());
+            let entry_hash =
+                JournalEntryHash::try_from(Sha256::digest(&journal_entry_bytes).as_slice())
+                    .expect("SHA-256 has JournalEntryHash width");
+            let journal_reference = JournalReference::new(
+                current_head.registry_id(),
+                next_index,
+                entry_hash,
+                journal_entry.event_type_id(),
+                journal_entry.event_record_id(),
+            );
+            let uncertain_publication = AuthoritativeReviewAdmissionPublishedReceiptUncertain {
+                admission_record_id: admission_record.record_id(),
+                admission_record_bytes: admission_record_bytes.clone(),
+                journal_reference: journal_reference.clone(),
+                journal_entry_bytes: journal_entry_bytes.clone(),
+                operation_start_journal_ref: section_82.operation_start_journal_ref().clone(),
+            };
+            let mut journal_publication = match publish_journal_slot(
+                &journal_dir,
+                &journal_hold,
+                Path::new(&journal_name),
+                &journal_entry_bytes,
+            )
+            .map_err(|_| {
+                AuthoritativeReviewAdmissionRuntimeError::Publication(
+                    AuthoritativeReviewAdmissionPublicationError::JournalPublication,
+                )
+            })? {
+                JournalSlotPublication::Conflict => continue,
+                JournalSlotPublication::Published(publication) => publication,
+                JournalSlotPublication::VisibleReceiptUncertain => {
+                    return Ok(
+                        AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
+                            Box::new(uncertain_publication),
+                        ),
+                    );
+                }
+            };
+            macro_rules! post_visibility_try {
+                ($result:expr) => {
+                    match $result {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Ok(AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
+                                Box::new(uncertain_publication.clone()),
+                            ));
+                        }
+                    }
+                };
+            }
+            post_visibility_try!(revalidate_retained_file_witness(
+                &mut publication.retained_witness
+            ));
+            post_visibility_try!(revalidate_retained_file_witness(
+                &mut journal_publication.retained_witness
+            ));
+            match publication_store
+                .records
+                .binary_search_by(|(stored_id, _)| {
+                    stored_id
+                        .as_bytes()
+                        .cmp(admission_record.record_id().as_bytes())
+                }) {
+                Ok(index) if publication_store.records[index].1 == admission_record_bytes => {}
+                Ok(_) => {
+                    return Ok(
+                        AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
+                            Box::new(uncertain_publication.clone()),
+                        ),
+                    );
+                }
+                Err(index) => publication_store.records.insert(
+                    index,
+                    (admission_record.record_id(), admission_record_bytes.clone()),
+                ),
+            }
+            post_visibility_try!(publication_store
+                .retained_journal
+                .append_strict_entry(&journal_entry_bytes));
+            post_visibility_try!(validate_authoritative_event_records(
+                &publication_store.retained_journal,
+                &publication_store.records,
+            ));
+            if authenticate_published_journal_reference(
+                &publication_store.retained_journal,
+                &journal_reference,
+            )
+            .is_err()
+            {
+                return Ok(
+                    AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
+                        Box::new(uncertain_publication.clone()),
+                    ),
+                );
+            }
+            let journal_witness = post_visibility_try!(downgrade_publication_witness(
+                journal_publication.retained_witness,
+            ));
+            let mut post_publication_guards = Vec::with_capacity(2);
+            if publication.facts.atomic_no_replace == DurabilityActionState::Performed {
+                let record_witness = post_visibility_try!(downgrade_publication_witness(
+                    publication.retained_witness
+                ));
+                post_publication_guards.push(post_visibility_try!(open_retained_file_guard(
+                    &record_witness
+                )));
+                publication_store
+                    .retained_file_witnesses
+                    .push(record_witness);
+            }
+            post_publication_guards.push(post_visibility_try!(open_retained_file_guard(
+                &journal_witness
+            )));
+            publication_store
+                .retained_file_witnesses
+                .push(journal_witness);
+            let replayed = post_visibility_try!(Self::open(&self.root));
+            if replayed.namespace_holds.len() != publication_store.namespace_holds.len()
+                || replayed
+                    .namespace_holds
+                    .iter()
+                    .zip(&publication_store.namespace_holds)
+                    .any(|(replayed, retained)| !handles_identify_same_object(replayed, retained))
+            {
+                return Ok(
+                    AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
+                        Box::new(uncertain_publication.clone()),
+                    ),
+                );
+            }
+            if replayed.retained_journal.current_head_reference() != journal_reference
+                || replayed.resolve(admission_record.record_id())
+                    != Some(admission_record_bytes.as_slice())
+            {
+                return Ok(
+                    AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
+                        Box::new(uncertain_publication),
+                    ),
+                );
+            }
+            *self = replayed;
+            return Ok(AuthoritativeReviewAdmissionRuntimeOutcome::Published(
+                Box::new(AuthoritativeReviewAdmissionPublication {
+                    policy_completion,
+                    disposition,
+                    admission_record,
+                    admission_record_bytes,
+                    journal_entry,
+                    journal_entry_bytes,
+                    journal_reference,
+                    operation_start_journal_ref: section_82.operation_start_journal_ref().clone(),
+                    freeze_authority: section_82.freeze_authority().clone(),
+                    durability: AuthoritativePublicationDurability {
+                        record_content_flush: publication.facts.content_flush,
+                        journal_content_flush: journal_publication.facts.content_flush,
+                        record_atomic_publish_no_replace: publication.facts.atomic_no_replace,
+                        journal_atomic_publish_no_replace: journal_publication
+                            .facts
+                            .atomic_no_replace,
+                        record_parent_directory_flush: publication.facts.parent_directory_flush,
+                        journal_parent_directory_flush: journal_publication
+                            .facts
+                            .parent_directory_flush,
+                        // The exact completed actions above are receipt facts. This runtime has no
+                        // independently authenticated, operation-scoped storage-capability basis
+                        // from which to promote them into a strongest-available platform claim.
+                        platform_strongest_available: false,
+                    },
+                }),
+            ));
+        }
+        Err(AuthoritativeReviewAdmissionRuntimeError::Publication(
+            AuthoritativeReviewAdmissionPublicationError::PublicationConflictExhausted,
+        ))
+    }
+
     fn reload_authoritative_namespaces(
         &mut self,
     ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError> {
@@ -594,7 +1263,49 @@ impl AuthoritativeRegistryStore {
         }
         self.retained_journal = reloaded.retained_journal;
         self.records = reloaded.records;
+        self.namespace_holds = reloaded.namespace_holds;
+        self.retained_file_witnesses = reloaded.retained_file_witnesses;
         Ok(())
+    }
+
+    fn acquire_retained_generation_guard(
+        &self,
+        already_guarded: Option<&RetainedFileWitness>,
+    ) -> Result<Vec<RetainedFileWitness>, ()> {
+        let mut guards = Vec::new();
+        guards
+            .try_reserve_exact(self.retained_file_witnesses.len())
+            .map_err(|_| ())?;
+        for witness in &self.retained_file_witnesses {
+            if already_guarded
+                .is_some_and(|guard| handles_identify_same_object(&witness.file, &guard.file))
+            {
+                continue;
+            }
+            guards.push(open_retained_file_guard(witness)?);
+        }
+        Ok(guards)
+    }
+
+    fn revalidate_retained_generation(&self) -> Result<(), ()> {
+        for witness in &self.retained_file_witnesses {
+            let mut guard = open_retained_file_guard(witness)?;
+            revalidate_retained_file_witness(&mut guard)?;
+        }
+        Ok(())
+    }
+
+    fn acquire_publication_directory_hold(
+        &self,
+        retained_index: usize,
+        name: &str,
+    ) -> Result<fs::File, ()> {
+        open_publication_child_directory_hold(
+            self.namespace_holds.first().ok_or(())?,
+            &self.root,
+            self.namespace_holds.get(retained_index).ok_or(())?,
+            name,
+        )
     }
 
     fn release_authoritative_acceptance_capacity(&self) {
@@ -606,19 +1317,33 @@ impl AuthoritativeRegistryStore {
     }
 }
 
-/// Executes every Policy requirement mechanically applicable to an authoritative §82 witness.
-///
-/// Evaluator 1001 emits exactly one result over the complete Review selector set: any exact
-/// selector match passes Admission compatibility. Evaluator 1015 remains a distinct mandatory
-/// profile-specific result. Individual results are retained and only this §46 composition step
-/// creates a completed Policy result.
-pub fn evaluate_authoritative_review_admission_policy_46(
-    section_82: AuthoritativeReviewAdmissionSection82,
+fn frozen_generic_policy_scope_applicability_unavailable() -> bool {
+    // The governing frozen authorities assign no generic operation/subject-to-Scope predicate.
+    // This fixed gate must remain fail-closed unless a frozen successor supplies that relation.
+    true
+}
+
+/// Retains the previously implemented profile-specific composition behind the fixed frozen-Scope
+/// fail-closed gate. Evaluator 1015 is not assigned by the governing frozen v0.3 authorities, so
+/// this helper is private and cannot authorize §46 completion or terminal publication.
+fn evaluate_unfrozen_review_admission_policy_profile(
+    section_82: &AuthoritativeReviewAdmissionSection82,
 ) -> ReviewAdmissionPolicy46Completion {
-    let policy = section_82.policy();
-    let request = section_82.request();
-    let result = section_82.result();
-    let mut evaluator_results = Vec::with_capacity(5);
+    evaluate_profile_requirements_without_generic_scope(
+        section_82.policy(),
+        section_82.request(),
+        section_82.result(),
+        section_82.anchor_comparison(),
+    )
+}
+
+fn evaluate_profile_requirements_without_generic_scope(
+    policy: &ReviewAdmissionPolicyRecord,
+    request: &ReviewRequestRecord,
+    result: &ReviewResultRecord,
+    anchor_comparison: JournalAnchorHistoryComparison,
+) -> ReviewAdmissionPolicy46Completion {
+    let mut evaluator_results = Vec::with_capacity(4);
 
     let selector_matches = policy.review_requirements().iter().any(|requirement| {
         requirement.review_role_id() == request.review_role_id()
@@ -657,23 +1382,10 @@ pub fn evaluate_authoritative_review_admission_policy_46(
             outcome: pass_or_fail(
                 policy
                     .acceptable_anchor_relation_ids()
-                    .contains(&anchor_relation_id(section_82.anchor_comparison())),
+                    .contains(&anchor_relation_id(anchor_comparison)),
             ),
         });
     }
-    evaluator_results.push(ReviewAdmissionIndividualEvaluatorResult {
-        evaluator_id: 1015,
-        outcome: match evaluate_review_admission_gate_scope_1015(
-            section_82.policy_context_prerequisites(),
-        ) {
-            ReviewAdmissionGateScope1015Result::Pass => {
-                ReviewAdmissionIndividualEvaluatorOutcome::Pass
-            }
-            ReviewAdmissionGateScope1015Result::Fail => {
-                ReviewAdmissionIndividualEvaluatorOutcome::Fail
-            }
-        },
-    });
 
     let result = if evaluator_results
         .iter()
@@ -713,6 +1425,696 @@ fn anchor_relation_id(comparison: JournalAnchorHistoryComparison) -> u64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ImmutablePublicationFacts {
+    content_flush: DurabilityActionState,
+    atomic_no_replace: DurabilityActionState,
+    parent_directory_flush: DurabilityActionState,
+}
+
+struct ImmutablePublication {
+    facts: ImmutablePublicationFacts,
+    retained_witness: RetainedFileWitness,
+}
+
+enum JournalSlotPublication {
+    Published(ImmutablePublication),
+    Conflict,
+    VisibleReceiptUncertain,
+}
+
+enum ImmutablePublicationOutcome {
+    Published(ImmutablePublication),
+    Conflict,
+    VisibleReceiptUncertain,
+}
+
+fn map_reload_to_runtime_error(
+    error: AuthoritativeReviewAdmissionAcceptanceError,
+) -> AuthoritativeReviewAdmissionRuntimeError {
+    AuthoritativeReviewAdmissionRuntimeError::Publication(match error {
+        AuthoritativeReviewAdmissionAcceptanceError::Store(error) => {
+            AuthoritativeReviewAdmissionPublicationError::Store(error)
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged => {
+            AuthoritativeReviewAdmissionPublicationError::RegistryIdentityChanged
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::Input(_) => {
+            unreachable!("namespace reload does not inspect opaque input allocation")
+        }
+    })
+}
+
+fn publish_record_bytes(
+    store: &mut AuthoritativeRegistryStore,
+    record_id: RecordId,
+    bytes: &[u8],
+) -> Result<ImmutablePublication, ()> {
+    for (candidate_id, candidate_bytes) in &store.records {
+        if *candidate_id == record_id {
+            continue;
+        }
+        let frame = StrictRecordFrame::decode_authoritative(candidate_bytes).map_err(|_| ())?;
+        if frame.record_type_id().value() == 32
+            && !store
+                .retained_journal
+                .entries
+                .iter()
+                .any(|entry| entry.event_record_id().as_bytes() == candidate_id.as_bytes())
+        {
+            return Err(());
+        }
+    }
+    let records_dir = store.root.join("records");
+    let records_hold = store.acquire_publication_directory_hold(3, "records")?;
+    ensure_path_matches_handle(&records_dir, &records_hold)?;
+    let records_contents = namespace_contents_path(&records_dir, &records_hold)?;
+    let final_name = record_filename(record_id);
+    let final_path = records_contents.join(&final_name);
+    if final_path.exists() {
+        let mut guard = if let Some(position) = store
+            .retained_file_witnesses
+            .iter()
+            .position(|witness| witness.path == final_path)
+        {
+            open_retained_file_guard(&store.retained_file_witnesses[position])?
+        } else {
+            let read =
+                read_regular_file(&final_path, &mut NamespaceBudget::new()).map_err(|_| ())?;
+            if read.bytes != bytes {
+                return Err(());
+            }
+            store.retained_file_witnesses.push(read.witness);
+            open_retained_file_guard(store.retained_file_witnesses.last().ok_or(())?)?
+        };
+        revalidate_retained_file_witness(&mut guard)?;
+        if guard.expected_length != bytes.len()
+            || guard.expected_sha256 != <[u8; ID_LENGTH]>::from(Sha256::digest(bytes))
+        {
+            return Err(());
+        }
+        return Ok(ImmutablePublication {
+            facts: ImmutablePublicationFacts {
+                // The retained read lease validates and prevents mutation but cannot truthfully
+                // claim a content flush for bytes published by an earlier operation.
+                content_flush: DurabilityActionState::Unsupported,
+                atomic_no_replace: DurabilityActionState::PreviouslyEstablished,
+                parent_directory_flush: sync_retained_directory(&records_dir, &records_hold)?,
+            },
+            retained_witness: guard,
+        });
+    }
+    match publish_new_immutable_file(&records_dir, &records_hold, Path::new(&final_name), bytes)? {
+        ImmutablePublicationOutcome::Published(publication) => Ok(publication),
+        ImmutablePublicationOutcome::Conflict
+        | ImmutablePublicationOutcome::VisibleReceiptUncertain => Err(()),
+    }
+}
+
+fn publish_journal_slot(
+    journal_dir: &Path,
+    journal_hold: &fs::File,
+    final_name: &Path,
+    bytes: &[u8],
+) -> Result<JournalSlotPublication, ()> {
+    match publish_new_immutable_file(journal_dir, journal_hold, final_name, bytes)? {
+        ImmutablePublicationOutcome::Published(publication) => {
+            Ok(JournalSlotPublication::Published(publication))
+        }
+        ImmutablePublicationOutcome::Conflict => Ok(JournalSlotPublication::Conflict),
+        ImmutablePublicationOutcome::VisibleReceiptUncertain => {
+            Ok(JournalSlotPublication::VisibleReceiptUncertain)
+        }
+    }
+}
+
+fn publish_new_immutable_file(
+    parent: &Path,
+    parent_hold: &fs::File,
+    final_name: &Path,
+    bytes: &[u8],
+) -> Result<ImmutablePublicationOutcome, ()> {
+    publish_new_immutable_file_with_hook(parent, parent_hold, final_name, bytes, || {})
+}
+
+fn publish_new_immutable_file_with_hook<F>(
+    parent: &Path,
+    parent_hold: &fs::File,
+    final_name: &Path,
+    bytes: &[u8],
+    before_promotion: F,
+) -> Result<ImmutablePublicationOutcome, ()>
+where
+    F: FnOnce(),
+{
+    publish_new_immutable_file_with_hooks(
+        parent,
+        parent_hold,
+        final_name,
+        bytes,
+        before_promotion,
+        || Ok(()),
+    )
+}
+
+fn publish_new_immutable_file_with_hooks<F, G>(
+    parent: &Path,
+    parent_hold: &fs::File,
+    final_name: &Path,
+    bytes: &[u8],
+    before_promotion: F,
+    after_visibility: G,
+) -> Result<ImmutablePublicationOutcome, ()>
+where
+    F: FnOnce(),
+    G: FnOnce() -> Result<(), ()>,
+{
+    if final_name.parent() != Some(Path::new("")) || final_name.file_name().is_none() {
+        return Err(());
+    }
+    ensure_path_matches_handle(parent, parent_hold)?;
+
+    #[cfg(windows)]
+    {
+        let final_path = parent.join(final_name);
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| ())?;
+        let temp_path = parent.join(format!(
+            ".evidence-registry-publish-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut file = create_owned_publication_temp(&temp_path)?;
+        let write_result = file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all());
+        if write_result.is_err() {
+            cleanup_owned_publication_temp_after_failure(file, &temp_path, parent, parent_hold)?;
+            return Err(());
+        }
+        before_promotion();
+        ensure_path_matches_handle(parent, parent_hold)?;
+        let published = match promote_held_file_no_replace(&file, parent_hold, &final_path) {
+            Ok(HeldFilePromotion::Published) => true,
+            Ok(HeldFilePromotion::Conflict) => false,
+            Ok(HeldFilePromotion::VisibilityUncertain) => {
+                return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain);
+            }
+            Err(_) => {
+                if temp_path.exists() {
+                    cleanup_owned_publication_temp_after_failure(
+                        file,
+                        &temp_path,
+                        parent,
+                        parent_hold,
+                    )?;
+                } else {
+                    drop(file);
+                }
+                return Err(());
+            }
+        };
+        if !published {
+            if !temp_path.exists() {
+                drop(file);
+                return Err(());
+            }
+            remove_owned_publication_temp(file, &temp_path)?;
+            sync_retained_directory(parent, parent_hold)?;
+            return Ok(ImmutablePublicationOutcome::Conflict);
+        }
+        if after_visibility().is_err() || file.sync_all().is_err() || temp_path.exists() {
+            return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain);
+        }
+        let parent_directory_flush = match sync_retained_directory(parent, parent_hold) {
+            Ok(state) => state,
+            Err(()) => return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain),
+        };
+        Ok(ImmutablePublicationOutcome::Published(
+            ImmutablePublication {
+                facts: ImmutablePublicationFacts {
+                    content_flush: DurabilityActionState::Performed,
+                    atomic_no_replace: DurabilityActionState::Performed,
+                    parent_directory_flush,
+                },
+                retained_witness: RetainedFileWitness {
+                    path: final_path,
+                    file,
+                    expected_length: bytes.len(),
+                    expected_sha256: Sha256::digest(bytes).into(),
+                },
+            },
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        unsafe extern "C" {
+            fn openat(directory: i32, path: *const i8, flags: i32, mode: u32) -> i32;
+            fn linkat(
+                old_directory: i32,
+                old_path: *const i8,
+                new_directory: i32,
+                new_path: *const i8,
+                flags: i32,
+            ) -> i32;
+        }
+
+        const O_RDWR: i32 = 0x0000_0002;
+        const O_CLOEXEC: i32 = 0x0008_0000;
+        const O_TMPFILE: i32 = 0x0041_0000;
+        const AT_EMPTY_PATH: i32 = 0x0000_1000;
+        const AT_SYMLINK_FOLLOW: i32 = 0x0000_0400;
+        const AT_FDCWD: i32 = -100;
+        const EEXIST: i32 = 17;
+
+        let dot = c".";
+        let file_descriptor = unsafe {
+            openat(
+                parent_hold.as_raw_fd(),
+                dot.as_ptr(),
+                O_RDWR | O_CLOEXEC | O_TMPFILE,
+                0o600,
+            )
+        };
+        if file_descriptor < 0 {
+            return Err(());
+        }
+        let mut file = unsafe { fs::File::from_raw_fd(file_descriptor) };
+        file.write_all(bytes).map_err(|_| ())?;
+        file.flush().map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())?;
+        before_promotion();
+        ensure_path_matches_handle(parent, parent_hold)?;
+
+        let final_path = parent.join(final_name);
+        let final_name_c = CString::new(final_name.as_os_str().as_bytes()).map_err(|_| ())?;
+        let empty = c"";
+        let mut linked = unsafe {
+            linkat(
+                file.as_raw_fd(),
+                empty.as_ptr(),
+                parent_hold.as_raw_fd(),
+                final_name_c.as_ptr(),
+                AT_EMPTY_PATH,
+            )
+        };
+        if linked != 0 {
+            let source =
+                CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| ())?;
+            linked = unsafe {
+                linkat(
+                    AT_FDCWD,
+                    source.as_ptr(),
+                    parent_hold.as_raw_fd(),
+                    final_name_c.as_ptr(),
+                    AT_SYMLINK_FOLLOW,
+                )
+            };
+        }
+        let published = if linked == 0 {
+            true
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(EEXIST) {
+            false
+        } else {
+            return Err(());
+        };
+        if !published {
+            return Ok(ImmutablePublicationOutcome::Conflict);
+        }
+        if after_visibility().is_err() {
+            return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain);
+        }
+        let parent_directory_flush = match sync_retained_directory(parent, parent_hold) {
+            Ok(state) => state,
+            Err(()) => return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain),
+        };
+        Ok(ImmutablePublicationOutcome::Published(
+            ImmutablePublication {
+                facts: ImmutablePublicationFacts {
+                    content_flush: DurabilityActionState::Performed,
+                    atomic_no_replace: DurabilityActionState::Performed,
+                    parent_directory_flush,
+                },
+                retained_witness: RetainedFileWitness {
+                    path: final_path,
+                    file,
+                    expected_length: bytes.len(),
+                    expected_sha256: Sha256::digest(bytes).into(),
+                },
+            },
+        ))
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    {
+        let _ = (bytes, before_promotion, after_visibility);
+        Err(())
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_owned_publication_temp_after_failure(
+    file: fs::File,
+    temp_path: &Path,
+    parent_path: &Path,
+    parent_hold: &fs::File,
+) -> Result<(), ()> {
+    remove_owned_publication_temp(file, temp_path)?;
+    sync_retained_directory(parent_path, parent_hold)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_owned_publication_temp(file: fs::File, path: &Path) -> Result<(), ()> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_file: u8,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            file: *mut core::ffi::c_void,
+            information_class: u32,
+            information: *const core::ffi::c_void,
+            information_size: u32,
+        ) -> i32;
+    }
+    let disposition = FileDispositionInfo { delete_file: 1 };
+    let result = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            4,
+            (&raw const disposition).cast(),
+            u32::try_from(std::mem::size_of::<FileDispositionInfo>()).map_err(|_| ())?,
+        )
+    };
+    if result == 0 {
+        return Err(());
+    }
+    drop(file);
+    if path.exists() {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_owned_publication_temp(path: &Path) -> Result<fs::File, ()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| ())
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldFilePromotion {
+    Published,
+    Conflict,
+    VisibilityUncertain,
+}
+
+#[cfg(windows)]
+fn promote_held_file_no_replace(
+    file: &fs::File,
+    parent_handle: &fs::File,
+    final_path: &Path,
+) -> Result<HeldFilePromotion, u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(
+            file: *mut core::ffi::c_void,
+            io_status: *mut IoStatusBlock,
+            information: *const core::ffi::c_void,
+            information_size: u32,
+            information_class: u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut core::ffi::c_void, milliseconds: u32) -> u32;
+    }
+
+    const FILE_RENAME_INFORMATION_CLASS: u32 = 10;
+    let layout = file_rename_information_layout(std::mem::size_of::<usize>()).ok_or(87_u32)?;
+    let name: Vec<u16> = final_path
+        .file_name()
+        .ok_or(87_u32)?
+        .encode_wide()
+        .collect();
+    let name_bytes = name.len().checked_mul(2).ok_or(87_u32)?;
+    let information_bytes = layout
+        .file_name_offset
+        .checked_add(name_bytes)
+        .ok_or(87_u32)?;
+    let allocation_bytes = layout
+        .allocation_header_size
+        .checked_add(name_bytes)
+        .ok_or(87_u32)?;
+    let words = allocation_bytes
+        .checked_add(layout.alignment - 1)
+        .ok_or(87_u32)?
+        / layout.alignment;
+    let mut storage = vec![0_usize; words];
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), words * layout.alignment)
+    };
+    bytes[0] = 0;
+    bytes
+        [layout.root_directory_offset..layout.root_directory_offset + std::mem::size_of::<usize>()]
+        .copy_from_slice(&(parent_handle.as_raw_handle() as usize).to_ne_bytes());
+    bytes[layout.file_name_length_offset..layout.file_name_length_offset + 4]
+        .copy_from_slice(&u32::try_from(name_bytes).map_err(|_| 87_u32)?.to_ne_bytes());
+    for (index, unit) in name.iter().enumerate() {
+        let offset = layout.file_name_offset + index * 2;
+        bytes[offset..offset + 2].copy_from_slice(&unit.to_ne_bytes());
+    }
+    let information_size = u32::try_from(information_bytes).map_err(|_| 87_u32)?;
+    let mut io_status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut io_status,
+            storage.as_ptr().cast(),
+            information_size,
+            FILE_RENAME_INFORMATION_CLASS,
+        )
+    };
+    const STATUS_PENDING: i32 = 0x103;
+    const STATUS_OBJECT_NAME_COLLISION: i32 = 0xc000_0035_u32 as i32;
+    const INFINITE: u32 = 0xffff_ffff;
+    if status == STATUS_PENDING {
+        if unsafe { WaitForSingleObject(file.as_raw_handle(), INFINITE) } != 0 {
+            return Ok(HeldFilePromotion::VisibilityUncertain);
+        }
+        status = io_status.status as i32;
+    }
+    if status >= 0 {
+        if ensure_path_matches_handle(final_path, file).is_err() {
+            return Ok(HeldFilePromotion::VisibilityUncertain);
+        }
+        return Ok(HeldFilePromotion::Published);
+    }
+    if status == STATUS_OBJECT_NAME_COLLISION {
+        Ok(HeldFilePromotion::Conflict)
+    } else {
+        Err(u32::from_ne_bytes(status.to_ne_bytes()))
+    }
+}
+
+fn sync_retained_directory(path: &Path, directory: &fs::File) -> Result<DurabilityActionState, ()> {
+    ensure_path_matches_handle(path, directory)?;
+    directory.sync_all().map_err(|_| ())?;
+    ensure_path_matches_handle(path, directory)?;
+    Ok(DurabilityActionState::Performed)
+}
+
+#[cfg(windows)]
+fn acquire_authoritative_publication_lock(
+    root: &Path,
+    root_hold: &fs::File,
+) -> Result<fs::File, ()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    ensure_path_matches_handle(root, root_hold)?;
+    let path = root.join(".evidence-registry-publication.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata_is_reparse(&metadata)
+        || metadata_link_count(&metadata, &file) != Some(1)
+    {
+        return Err(());
+    }
+    ensure_path_matches_handle(root, root_hold)?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn acquire_authoritative_publication_lock(
+    _root: &Path,
+    _root_hold: &fs::File,
+) -> Result<fs::File, ()> {
+    Err(())
+}
+
+#[cfg(all(test, windows))]
+fn open_publication_directory_hold(path: &Path) -> Result<fs::File, ()> {
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|_| ())?
+    };
+    #[cfg(not(windows))]
+    let directory = fs::File::open(path).map_err(|_| ())?;
+    let metadata = directory.metadata().map_err(|_| ())?;
+    if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+        return Err(());
+    }
+    ensure_path_matches_handle(path, &directory)?;
+    Ok(directory)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileRenameInformationLayout {
+    root_directory_offset: usize,
+    file_name_length_offset: usize,
+    file_name_offset: usize,
+    allocation_header_size: usize,
+    alignment: usize,
+}
+
+#[cfg(any(windows, test))]
+fn file_rename_information_layout(pointer_size: usize) -> Option<FileRenameInformationLayout> {
+    if !matches!(pointer_size, 4 | 8) {
+        return None;
+    }
+    let root_directory_offset = pointer_size;
+    let file_name_length_offset = root_directory_offset.checked_add(pointer_size)?;
+    let file_name_offset = file_name_length_offset.checked_add(4)?;
+    let allocation_header_size = file_name_offset
+        .checked_add(2)?
+        .checked_add(pointer_size - 1)?
+        / pointer_size
+        * pointer_size;
+    Some(FileRenameInformationLayout {
+        root_directory_offset,
+        file_name_length_offset,
+        file_name_offset,
+        allocation_header_size,
+        alignment: pointer_size,
+    })
+}
+
+fn authenticate_published_journal_reference(
+    journal: &RetainedJournal,
+    published: &JournalReference,
+) -> Result<(), ()> {
+    journal
+        .resolve_reference(published)
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+fn admit_bounded_publication_temp_residue(
+    path: &Path,
+    budget: &mut NamespaceBudget,
+) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
+    budget
+        .reserve(metadata.len())
+        .map_err(|error| match error {
+            NamespaceReadError::ResourceLimit => {
+                AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit
+            }
+            NamespaceReadError::Io | NamespaceReadError::Invalid => {
+                AuthoritativeRegistryStoreOpenError::Io
+            }
+        })?;
+    if !metadata.is_file() || metadata_is_reparse(&metadata) {
+        return Err(AuthoritativeRegistryStoreOpenError::Io);
+    }
+    Ok(())
+}
+
+fn is_publication_temp_name(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix(".evidence-registry-publish-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((process, sequence)) = body.split_once('-') else {
+        return false;
+    };
+    !process.is_empty()
+        && !sequence.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn record_filename(record_id: RecordId) -> String {
+    let mut name = String::with_capacity(ID_LENGTH * 2 + 5);
+    for byte in record_id.as_bytes() {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    name.push_str(".cbor");
+    name
+}
+
 impl ExactRecordByteResolver for AuthoritativeRegistryStore {
     fn resolve(&self, record_id: RecordId) -> Option<&[u8]> {
         self.records
@@ -722,26 +2124,651 @@ impl ExactRecordByteResolver for AuthoritativeRegistryStore {
     }
 }
 
-fn ensure_real_directory(path: &Path) -> Result<(), ()> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+fn open_real_directory_hold(path: &Path) -> Result<fs::File, ()> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|_| ())?
+    };
+    #[cfg(not(windows))]
+    let file = fs::File::open(path).map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+        return Err(());
+    }
+    ensure_path_matches_handle(path, &file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_windows_child_directory_hold(
+    parent: &fs::File,
+    name: &str,
+    write_access: bool,
+) -> Result<fs::File, ()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':'])
+        || name.ends_with([' ', '.'])
+    {
+        return Err(());
+    }
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: *mut core::ffi::c_void,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        security_quality_of_service: *mut core::ffi::c_void,
+    }
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut *mut core::ffi::c_void,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status: *mut IoStatusBlock,
+            allocation_size: *const i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *const core::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+    }
+
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    let byte_length = wide.len().checked_mul(2).ok_or(())?;
+    let mut unicode = UnicodeString {
+        length: u16::try_from(byte_length).map_err(|_| ())?,
+        maximum_length: u16::try_from(byte_length).map_err(|_| ())?,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: u32::try_from(std::mem::size_of::<ObjectAttributes>()).map_err(|_| ())?,
+        root_directory: parent.as_raw_handle(),
+        object_name: &mut unicode,
+        attributes: 0x0000_0040,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let desired_access = if write_access {
+        0x0010_0183
+    } else {
+        0x0010_0081
+    };
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            desired_access,
+            &mut attributes,
+            &mut io_status,
+            std::ptr::null(),
+            0,
+            0x0000_0001 | 0x0000_0002,
+            1,
+            0x0000_0001 | 0x0000_0020 | 0x0020_0000,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 || raw.is_null() {
+        return Err(());
+    }
+    let file = unsafe { fs::File::from_raw_handle(raw) };
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+        return Err(());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_child_directory_hold(
+    parent: &fs::File,
+    _parent_path: &Path,
+    name: &str,
+) -> Result<fs::File, ()> {
+    open_windows_child_directory_hold(parent, name, false)
+}
+
+#[cfg(windows)]
+fn open_publication_child_directory_hold(
+    parent: &fs::File,
+    parent_path: &Path,
+    retained_child: &fs::File,
+    name: &str,
+) -> Result<fs::File, ()> {
+    let child = open_windows_child_directory_hold(parent, name, true)?;
+    if !handles_identify_same_object(&child, retained_child) {
+        return Err(());
+    }
+    ensure_path_matches_handle(&parent_path.join(name), &child)?;
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn open_child_directory_hold(
+    parent: &fs::File,
+    _parent_path: &Path,
+    name: &str,
+) -> Result<fs::File, ()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    unsafe extern "C" {
+        fn openat(directory: i32, path: *const i8, flags: i32, mode: u32) -> i32;
+    }
+
+    const O_RDONLY: i32 = 0;
+    const O_CLOEXEC: i32 = 0x0008_0000;
+    const O_DIRECTORY: i32 = 0x0001_0000;
+    const O_NOFOLLOW: i32 = 0x0002_0000;
+
+    let name = CString::new(name.as_bytes()).map_err(|_| ())?;
+    let descriptor = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(());
+    }
+    let child = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = child.metadata().map_err(|_| ())?;
+    if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+        return Err(());
+    }
+    Ok(child)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn open_child_directory_hold(
+    _parent: &fs::File,
+    _parent_path: &Path,
+    _name: &str,
+) -> Result<fs::File, ()> {
+    Err(())
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_contents_path(_path: &Path, hold: &fs::File) -> Result<PathBuf, ()> {
+    use std::os::fd::AsRawFd;
+
+    let path = PathBuf::from(format!("/proc/self/fd/{}", hold.as_raw_fd()));
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn namespace_contents_path(path: &Path, hold: &fs::File) -> Result<PathBuf, ()> {
+    ensure_path_matches_handle(path, hold)?;
+    Ok(path.to_path_buf())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn namespace_contents_path(_path: &Path, _hold: &fs::File) -> Result<PathBuf, ()> {
+    Err(())
+}
+
+#[cfg(not(windows))]
+fn open_publication_child_directory_hold(
+    _parent: &fs::File,
+    parent_path: &Path,
+    retained_child: &fs::File,
+    name: &str,
+) -> Result<fs::File, ()> {
+    let child = retained_child.try_clone().map_err(|_| ())?;
+    ensure_path_matches_handle(&parent_path.join(name), &child)?;
+    Ok(child)
+}
+
+#[cfg(windows)]
+fn ensure_path_matches_handle(path: &Path, file: &fs::File) -> Result<(), ()> {
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
+    if path_metadata.file_type().is_symlink() || metadata_is_reparse(&path_metadata) {
+        return Err(());
+    }
+    let comparison = open_windows_identity_handle(path, path_metadata.is_dir())?;
+    if windows_file_identity(file)? != windows_file_identity(&comparison)? {
         return Err(());
     }
     Ok(())
 }
 
-fn read_regular_file(path: &Path) -> Result<Vec<u8>, ()> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+#[cfg(not(windows))]
+fn ensure_path_matches_handle(path: &Path, file: &fs::File) -> Result<(), ()> {
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
+    let handle_metadata = file.metadata().map_err(|_| ())?;
+    if path_metadata.file_type().is_symlink()
+        || metadata_is_reparse(&path_metadata)
+        || !metadata_identity_matches(&path_metadata, &handle_metadata)
+    {
         return Err(());
     }
-    fs::read(path).map_err(|_| ())
+    Ok(())
+}
+
+fn read_regular_file(
+    path: &Path,
+    budget: &mut NamespaceBudget,
+) -> Result<RetainedFileRead, NamespaceReadError> {
+    #[cfg(windows)]
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| NamespaceReadError::Io)?
+    };
+    #[cfg(not(windows))]
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|_| NamespaceReadError::Io)?;
+    let metadata = file.metadata().map_err(|_| NamespaceReadError::Io)?;
+    if !metadata.is_file()
+        || metadata_is_reparse(&metadata)
+        || !metadata_has_admitted_link_count(path, &metadata, &file)
+    {
+        return Err(NamespaceReadError::Invalid);
+    }
+    ensure_path_matches_handle(path, &file).map_err(|_| NamespaceReadError::Invalid)?;
+    let expected_length = budget.reserve(metadata.len())?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_length.saturating_add(1))
+        .map_err(|_| NamespaceReadError::ResourceLimit)?;
+    Read::by_ref(&mut file)
+        .take(u64::try_from(AUTHORITATIVE_STORE_MAX_OBJECT_BYTES).unwrap() + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| NamespaceReadError::Io)?;
+    if bytes.len() != expected_length || bytes.len() > AUTHORITATIVE_STORE_MAX_OBJECT_BYTES {
+        return Err(NamespaceReadError::Invalid);
+    }
+    ensure_path_matches_handle(path, &file).map_err(|_| NamespaceReadError::Invalid)?;
+    let expected_sha256 = Sha256::digest(&bytes).into();
+    Ok(RetainedFileRead {
+        witness: RetainedFileWitness {
+            path: path.to_path_buf(),
+            file,
+            expected_length: bytes.len(),
+            expected_sha256,
+        },
+        bytes,
+    })
+}
+
+fn revalidate_retained_file_witness(witness: &mut RetainedFileWitness) -> Result<(), ()> {
+    let metadata = witness.file.metadata().map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata_is_reparse(&metadata)
+        || !metadata_has_admitted_link_count(&witness.path, &metadata, &witness.file)
+        || usize::try_from(metadata.len()).map_err(|_| ())? != witness.expected_length
+    {
+        return Err(());
+    }
+    ensure_path_matches_handle(&witness.path, &witness.file)?;
+    witness.file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
+    let read_limit = u64::try_from(witness.expected_length)
+        .map_err(|_| ())?
+        .checked_add(1)
+        .ok_or(())?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut witness.file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() != witness.expected_length
+        || <[u8; ID_LENGTH]>::from(Sha256::digest(&bytes)) != witness.expected_sha256
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_retained_file_guard(source: &RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&source.path)
+        .map_err(|_| ())?;
+    if !handles_identify_same_object(&source.file, &file) {
+        return Err(());
+    }
+    let mut guard = RetainedFileWitness {
+        path: source.path.clone(),
+        file,
+        expected_length: source.expected_length,
+        expected_sha256: source.expected_sha256,
+    };
+    revalidate_retained_file_witness(&mut guard)?;
+    Ok(guard)
+}
+
+#[cfg(not(windows))]
+fn open_retained_file_guard(_source: &RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    Err(())
+}
+
+#[cfg(windows)]
+fn downgrade_publication_witness(source: RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let path = source.path.clone();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&source.path)
+        .map_err(|_| ())?;
+    if !handles_identify_same_object(&source.file, &file) {
+        return Err(());
+    }
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata_is_reparse(&metadata)
+        || metadata_link_count(&metadata, &file) != Some(1)
+        || usize::try_from(metadata.len()).map_err(|_| ())? != source.expected_length
+    {
+        return Err(());
+    }
+    let read_limit = u64::try_from(source.expected_length)
+        .map_err(|_| ())?
+        .checked_add(1)
+        .ok_or(())?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() != source.expected_length
+        || <[u8; ID_LENGTH]>::from(Sha256::digest(&bytes)) != source.expected_sha256
+    {
+        return Err(());
+    }
+    drop(source);
+    let retained = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|_| ())?;
+    if !handles_identify_same_object(&file, &retained) {
+        return Err(());
+    }
+    drop(file);
+    let mut witness = RetainedFileWitness {
+        path,
+        file: retained,
+        expected_length: bytes.len(),
+        expected_sha256: Sha256::digest(&bytes).into(),
+    };
+    revalidate_retained_file_witness(&mut witness)?;
+    Ok(witness)
+}
+
+#[cfg(not(windows))]
+fn downgrade_publication_witness(_source: RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    Err(())
+}
+
+fn metadata_has_admitted_link_count(path: &Path, metadata: &fs::Metadata, file: &fs::File) -> bool {
+    let Some(link_count) = metadata_link_count(metadata, file) else {
+        return false;
+    };
+    if link_count == 1 {
+        return true;
+    }
+    if link_count != 2 {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    let mut matching_temps = 0_u8;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        if !is_publication_temp_name(&name) {
+            continue;
+        }
+        let Ok(candidate) = open_identity_handle_for_regular_file(&entry.path()) else {
+            return false;
+        };
+        if handles_identify_same_object(file, &candidate) {
+            matching_temps = match matching_temps.checked_add(1) {
+                Some(count) => count,
+                None => return false,
+            };
+        }
+    }
+    matching_temps == 1
+}
+
+#[cfg(windows)]
+fn metadata_link_count(_metadata: &fs::Metadata, file: &fs::File) -> Option<u64> {
+    windows_file_identity(file)
+        .ok()
+        .map(|identity| u64::from(identity.link_count))
+}
+
+#[cfg(unix)]
+fn metadata_link_count(metadata: &fs::Metadata, _file: &fs::File) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.nlink())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn metadata_link_count(_metadata: &fs::Metadata, _file: &fs::File) -> Option<u64> {
+    None
+}
+
+fn open_identity_handle_for_regular_file(path: &Path) -> Result<fs::File, ()> {
+    #[cfg(windows)]
+    {
+        open_windows_identity_handle(path, false)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path).map_err(|_| ())
+    }
+}
+
+#[cfg(windows)]
+fn handles_identify_same_object(left: &fs::File, right: &fs::File) -> bool {
+    windows_file_identity(left)
+        .ok()
+        .zip(windows_file_identity(right).ok())
+        .is_some_and(|(left, right)| {
+            left.volume_serial_number == right.volume_serial_number
+                && left.file_index == right.file_index
+        })
+}
+
+#[cfg(unix)]
+fn handles_identify_same_object(left: &fs::File, right: &fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.metadata()
+        .ok()
+        .zip(right.metadata().ok())
+        .is_some_and(|(left, right)| left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn handles_identify_same_object(_left: &fs::File, _right: &fs::File) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn open_windows_identity_handle(path: &Path, directory: bool) -> Result<fs::File, ()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                },
+        )
+        .open(path)
+        .map_err(|_| ())
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WindowsFileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+    link_count: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileTime {
+    low_date_time: u32,
+    high_date_time: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: WindowsFileTime,
+    last_access_time: WindowsFileTime,
+    last_write_time: WindowsFileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &fs::File) -> Result<WindowsFileIdentity, ()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetFileInformationByHandle"]
+        fn get_file_information_by_handle(
+            file: *mut c_void,
+            information: *mut WindowsByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = std::mem::MaybeUninit::<WindowsByHandleFileInformation>::uninit();
+    // SAFETY: `file` is a live owned handle and `information` points to writable storage with the
+    // exact Win32 BY_HANDLE_FILE_INFORMATION layout for the duration of the call.
+    let succeeded =
+        unsafe { get_file_information_by_handle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(());
+    }
+    // SAFETY: a nonzero Win32 result initializes the complete output structure.
+    let information = unsafe { information.assume_init() };
+    Ok(WindowsFileIdentity {
+        volume_serial_number: information.volume_serial_number,
+        file_index: (u64::from(information.file_index_high) << 32)
+            | u64::from(information.file_index_low),
+        link_count: information.number_of_links,
+    })
+}
+
+#[cfg(unix)]
+fn metadata_identity_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn metadata_identity_matches(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
 }
 
 fn load_journal_slots(
     journal_dir: &Path,
-) -> Result<Vec<Vec<u8>>, AuthoritativeRegistryStoreOpenError> {
+    budget: &mut NamespaceBudget,
+) -> Result<(Vec<Vec<u8>>, Vec<RetainedFileWitness>), AuthoritativeRegistryStoreOpenError> {
     let mut slots = Vec::new();
+    let mut witnesses = Vec::new();
     for entry in fs::read_dir(journal_dir).map_err(|_| AuthoritativeRegistryStoreOpenError::Io)? {
         let entry = entry.map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
         let file_type = entry
@@ -754,11 +2781,23 @@ fn load_journal_slots(
             .file_name()
             .into_string()
             .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalSlotNameInvalid)?;
+        if is_publication_temp_name(&name) {
+            admit_bounded_publication_temp_residue(&entry.path(), budget)?;
+            continue;
+        }
         let index = parse_journal_slot_name(&name)
             .ok_or(AuthoritativeRegistryStoreOpenError::JournalSlotNameInvalid)?;
-        let bytes = read_regular_file(&entry.path())
-            .map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
-        slots.push((index, bytes));
+        let read = read_regular_file(&entry.path(), budget).map_err(|error| match error {
+            NamespaceReadError::Io => AuthoritativeRegistryStoreOpenError::Io,
+            NamespaceReadError::Invalid => {
+                AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid
+            }
+            NamespaceReadError::ResourceLimit => {
+                AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit
+            }
+        })?;
+        slots.push((index, read.bytes));
+        witnesses.push(read.witness);
     }
     slots.sort_by_key(|(index, _)| *index);
     if slots.is_empty()
@@ -769,7 +2808,10 @@ fn load_journal_slots(
     {
         return Err(AuthoritativeRegistryStoreOpenError::JournalSlotSequenceInvalid);
     }
-    Ok(slots.into_iter().map(|(_, bytes)| bytes).collect())
+    Ok((
+        slots.into_iter().map(|(_, bytes)| bytes).collect(),
+        witnesses,
+    ))
 }
 
 fn parse_journal_slot_name(name: &str) -> Option<u64> {
@@ -782,8 +2824,10 @@ fn parse_journal_slot_name(name: &str) -> Option<u64> {
 
 fn load_record_namespace(
     records_dir: &Path,
-) -> Result<Vec<(RecordId, Vec<u8>)>, AuthoritativeRegistryStoreOpenError> {
+    budget: &mut NamespaceBudget,
+) -> Result<LoadedRecordNamespace, AuthoritativeRegistryStoreOpenError> {
     let mut records = Vec::new();
+    let mut witnesses = Vec::new();
     for entry in fs::read_dir(records_dir).map_err(|_| AuthoritativeRegistryStoreOpenError::Io)? {
         let entry = entry.map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
         let file_type = entry
@@ -796,16 +2840,28 @@ fn load_record_namespace(
             .file_name()
             .into_string()
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordFilenameInvalid)?;
+        if is_publication_temp_name(&name) {
+            admit_bounded_publication_temp_residue(&entry.path(), budget)?;
+            continue;
+        }
         let expected_id = parse_record_filename(&name)
             .ok_or(AuthoritativeRegistryStoreOpenError::RecordFilenameInvalid)?;
-        let bytes = read_regular_file(&entry.path())
-            .map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
-        let frame = StrictRecordFrame::decode_authoritative(&bytes)
+        let read = read_regular_file(&entry.path(), budget).map_err(|error| match error {
+            NamespaceReadError::Io => AuthoritativeRegistryStoreOpenError::Io,
+            NamespaceReadError::Invalid => {
+                AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid
+            }
+            NamespaceReadError::ResourceLimit => {
+                AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit
+            }
+        })?;
+        let frame = StrictRecordFrame::decode_authoritative(&read.bytes)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordDecode)?;
         if frame.record_id() != expected_id {
             return Err(AuthoritativeRegistryStoreOpenError::RecordIdentityMismatch);
         }
-        records.push((expected_id, bytes));
+        records.push((expected_id, read.bytes));
+        witnesses.push(read.witness);
     }
     records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     if records
@@ -814,7 +2870,2463 @@ fn load_record_namespace(
     {
         return Err(AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid);
     }
-    Ok(records)
+    Ok((records, witnesses))
+}
+
+fn decode_event_record_body<'a>(
+    input: &'a [u8],
+    expected_record_type: u16,
+) -> Result<(CborCursor<'a>, usize), RecordDecodeError> {
+    let frame = StrictRecordFrame::decode_authoritative(input)?;
+    if frame.record_type_id().value() != expected_record_type {
+        return Err(RecordDecodeError);
+    }
+    let mut cursor = CborCursor::new(input);
+    cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+    cursor
+        .text_exact(RECORD_DOMAIN)
+        .map_err(|_| RecordDecodeError)?;
+    if cursor.uint().map_err(|_| RecordDecodeError)? != u64::from(expected_record_type)
+        || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+    {
+        return Err(RecordDecodeError);
+    }
+    let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+    if field_count < 2 {
+        return Err(RecordDecodeError);
+    }
+    cursor.key(0).map_err(|_| RecordDecodeError)?;
+    if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+        return Err(RecordDecodeError);
+    }
+    cursor.key(1).map_err(|_| RecordDecodeError)?;
+    if cursor.uint().map_err(|_| RecordDecodeError)? != u64::from(expected_record_type) {
+        return Err(RecordDecodeError);
+    }
+    Ok((cursor, field_count - 2))
+}
+
+fn decode_record_id_value(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+        .map(|_| ())
+        .map_err(|_| RecordDecodeError)
+}
+
+fn decode_journal_reference_value(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    decode_journal_reference(cursor)
+        .map(|_| ())
+        .map_err(|_| RecordDecodeError)
+}
+
+fn decode_sorted_text_set(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() {
+        return Err(RecordDecodeError);
+    }
+    let mut previous: Option<Vec<u8>> = None;
+    for _ in 0..count {
+        let value = cursor.text().map_err(|_| RecordDecodeError)?;
+        if previous
+            .as_ref()
+            .is_some_and(|prior| prior.as_slice() >= value.as_bytes())
+        {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value.into_bytes());
+    }
+    Ok(())
+}
+
+fn decode_sorted_uint_set(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() {
+        return Err(RecordDecodeError);
+    }
+    let mut previous = None;
+    for _ in 0..count {
+        let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if previous.is_some_and(|prior| prior >= value) {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn decode_sorted_event_type_id_set(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() {
+        return Err(RecordDecodeError);
+    }
+    let mut previous = None;
+    for _ in 0..count {
+        let value = EventTypeId::try_from(cursor.uint().map_err(|_| RecordDecodeError)?)
+            .map_err(|_| RecordDecodeError)?;
+        if previous.is_some_and(|prior: EventTypeId| prior.value() >= value.value()) {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn decode_sorted_record_id_set(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() / 34 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous: Option<[u8; ID_LENGTH]> = None;
+    for _ in 0..count {
+        let value = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        if previous.is_some_and(|prior| prior >= value) {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn decode_sorted_journal_reference_set(
+    cursor: &mut CborCursor<'_>,
+) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() / 105 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous: Option<(u64, [u8; ID_LENGTH])> = None;
+    for _ in 0..count {
+        let reference = decode_journal_reference(cursor).map_err(|_| RecordDecodeError)?;
+        let ordering_key = (
+            reference.entry_index().value(),
+            *reference.entry_hash().as_bytes(),
+        );
+        if previous.is_some_and(|prior| prior >= ordering_key) {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(ordering_key);
+    }
+    Ok(())
+}
+
+fn decode_failed_candidate_record_set(
+    cursor: &mut CborCursor<'_>,
+    allowed_roles: std::ops::RangeInclusive<u64>,
+) -> Result<u16, RecordDecodeError> {
+    Ok(decode_failed_candidate_record_set_with_values(cursor, allowed_roles)?.0)
+}
+
+fn decode_failed_candidate_record_set_with_values(
+    cursor: &mut CborCursor<'_>,
+    allowed_roles: std::ops::RangeInclusive<u64>,
+) -> Result<(u16, Vec<(u64, RecordId)>), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count == 0 || count > cursor.remaining() / 39 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous: Option<(u64, [u8; ID_LENGTH], u64)> = None;
+    let mut role_mask = 0_u16;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(count)
+        .map_err(|_| RecordDecodeError)?;
+    for _ in 0..count {
+        cursor.map_exact(3).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        let role = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        let record_id = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+        cursor.key(2).map_err(|_| RecordDecodeError)?;
+        let failure = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let value = (role, record_id, failure);
+        if !allowed_roles.contains(&role)
+            || !(20..=25).contains(&failure)
+            || previous.as_ref().is_some_and(|prior| prior >= &value)
+            || previous
+                .as_ref()
+                .is_some_and(|prior| prior.0 == role && prior.1 == record_id)
+        {
+            return Err(RecordDecodeError);
+        }
+        role_mask |= 1_u16
+            .checked_shl(u32::try_from(role).map_err(|_| RecordDecodeError)?)
+            .ok_or(RecordDecodeError)?;
+        candidates.push((
+            role,
+            RecordId::try_from(record_id.as_slice()).map_err(|_| RecordDecodeError)?,
+        ));
+        previous = Some(value);
+    }
+    Ok((role_mask, candidates))
+}
+
+fn decode_failed_candidate_journal_set(
+    cursor: &mut CborCursor<'_>,
+    allowed_roles: std::ops::RangeInclusive<u64>,
+) -> Result<u16, RecordDecodeError> {
+    Ok(decode_failed_candidate_journal_set_with_values(cursor, allowed_roles)?.0)
+}
+
+fn decode_failed_candidate_journal_set_with_values(
+    cursor: &mut CborCursor<'_>,
+    allowed_roles: std::ops::RangeInclusive<u64>,
+) -> Result<(u16, Vec<(u64, JournalReference)>), RecordDecodeError> {
+    type FailedCandidateJournalSortKey = (
+        u64,
+        [u8; ID_LENGTH],
+        u64,
+        [u8; ID_LENGTH],
+        u16,
+        [u8; ID_LENGTH],
+        u64,
+    );
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count == 0 || count > cursor.remaining() / 110 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous: Option<FailedCandidateJournalSortKey> = None;
+    let mut role_mask = 0_u16;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(count)
+        .map_err(|_| RecordDecodeError)?;
+    for _ in 0..count {
+        cursor.map_exact(3).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        let role = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        let reference = decode_journal_reference(cursor).map_err(|_| RecordDecodeError)?;
+        cursor.key(2).map_err(|_| RecordDecodeError)?;
+        let failure = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let value = (
+            role,
+            *reference.registry_id().as_bytes(),
+            reference.entry_index().value(),
+            *reference.entry_hash().as_bytes(),
+            reference.event_type_id().value(),
+            *reference.event_record_id().as_bytes(),
+            failure,
+        );
+        if !allowed_roles.contains(&role)
+            || !(1..=9).contains(&failure)
+            || previous.as_ref().is_some_and(|prior| prior >= &value)
+            || previous.as_ref().is_some_and(|prior| {
+                prior.0 == value.0
+                    && prior.1 == value.1
+                    && prior.2 == value.2
+                    && prior.3 == value.3
+                    && prior.4 == value.4
+                    && prior.5 == value.5
+            })
+        {
+            return Err(RecordDecodeError);
+        }
+        role_mask |= 1_u16
+            .checked_shl(u32::try_from(role).map_err(|_| RecordDecodeError)?)
+            .ok_or(RecordDecodeError)?;
+        candidates.push((role, reference));
+        previous = Some(value);
+    }
+    Ok((role_mask, candidates))
+}
+
+fn decode_formal_support_binding(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    cursor.map_exact(2).map_err(|_| RecordDecodeError)?;
+    cursor.key(0).map_err(|_| RecordDecodeError)?;
+    decode_sorted_journal_reference_set(cursor)?;
+    cursor.key(1).map_err(|_| RecordDecodeError)?;
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() / 213 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous: Option<Vec<u8>> = None;
+    for _ in 0..count {
+        let fields = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(fields, 2 | 3) {
+            return Err(RecordDecodeError);
+        }
+        let mut value = Vec::new();
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        let definition = decode_journal_reference(cursor).map_err(|_| RecordDecodeError)?;
+        value.extend_from_slice(&definition.authoritative_cbor());
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        let establishment = decode_journal_reference(cursor).map_err(|_| RecordDecodeError)?;
+        value.extend_from_slice(&establishment.authoritative_cbor());
+        if fields == 3 {
+            cursor.key(2).map_err(|_| RecordDecodeError)?;
+            let compatibility = decode_journal_reference(cursor).map_err(|_| RecordDecodeError)?;
+            value.extend_from_slice(&compatibility.authoritative_cbor());
+        }
+        if previous.as_ref().is_some_and(|prior| prior >= &value) {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn decode_diversity_identity_set(cursor: &mut CborCursor<'_>) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() / 3 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous: Option<(u64, Vec<u8>)> = None;
+    for _ in 0..count {
+        cursor.array_exact(2).map_err(|_| RecordDecodeError)?;
+        let dimension = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let identity = cursor.bstr().map_err(|_| RecordDecodeError)?;
+        let value = (dimension, identity);
+        if !matches!(dimension, 1 | 2)
+            || value.1.is_empty()
+            || previous.as_ref().is_some_and(|prior| prior >= &value)
+        {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn validate_remaining_event_record_fields(
+    record_type: u16,
+    event_type: u16,
+    cursor: &mut CborCursor<'_>,
+    field_count: usize,
+) -> Result<(), RecordDecodeError> {
+    let mut present = 0_u64;
+    let mut disposition = None;
+    let mut target_mode = None;
+    let mut terminal_disposition = None;
+    let mut observed_eviction_state_present = false;
+    let mut formal_outcome = None;
+    let mut counterexample_present = false;
+    let mut verification_target = None;
+    let mut source_binding_present = false;
+    let mut failed_candidate_record_roles = 0_u16;
+    let mut failed_candidate_journal_roles = 0_u16;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !(16..=32).contains(&key) {
+            return Err(RecordDecodeError);
+        }
+        present |= 1_u64
+            .checked_shl(u32::try_from(key).map_err(|_| RecordDecodeError)?)
+            .ok_or(RecordDecodeError)?;
+        match (record_type, key) {
+            (5, 16) => {
+                cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            }
+            (5, 17 | 20) => decode_journal_reference_value(cursor)?,
+            (5, 18) => decode_record_id_value(cursor)?,
+            (5, 19) => decode_sorted_text_set(cursor)?,
+
+            (6, 16) => {
+                cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            }
+            (6, 17 | 22) => decode_journal_reference_value(cursor)?,
+            (6, 18) => cursor
+                .text_exact(b"UNKNOWN")
+                .map_err(|_| RecordDecodeError)?,
+            (6, 19..=21) => {
+                cursor.text().map_err(|_| RecordDecodeError)?;
+            }
+
+            (7, 16) => {
+                cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            }
+            (7, 17 | 18) => decode_journal_reference_value(cursor)?,
+            (7, 19) => {
+                cursor.uint().map_err(|_| RecordDecodeError)?;
+            }
+            (7, 20) => cursor
+                .text_exact(b"ATTEMPT_ALREADY_TERMINAL")
+                .map_err(|_| RecordDecodeError)?,
+
+            (12, 16 | 20 | 21 | 29 | 30) => decode_record_id_value(cursor)?,
+            (12, 17) => {
+                let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if !matches!(value, 1 | 2) {
+                    return Err(RecordDecodeError);
+                }
+                verification_target = Some(value);
+            }
+            (12, 18 | 19 | 32) => decode_journal_reference_value(cursor)?,
+            (12, 22) => {
+                cursor.bstr().map_err(|_| RecordDecodeError)?;
+            }
+            (12, 23 | 31) => {
+                cursor.text().map_err(|_| RecordDecodeError)?;
+            }
+            (12, 24) => {
+                cursor.uint().map_err(|_| RecordDecodeError)?;
+            }
+            (12, 25 | 26) => {
+                if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1..=3) {
+                    return Err(RecordDecodeError);
+                }
+            }
+            (12, 27 | 28) => decode_sorted_text_set(cursor)?,
+
+            (50, 16) => {
+                let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if !matches!(value, 1 | 2) {
+                    return Err(RecordDecodeError);
+                }
+                disposition = Some(value);
+            }
+            (50, 17 | 21 | 22 | 31) => decode_journal_reference_value(cursor)?,
+            (50, 18 | 23 | 24) => decode_record_id_value(cursor)?,
+            (50, 19 | 20 | 26 | 27) => decode_sorted_journal_reference_set(cursor)?,
+            (50, 25) => decode_formal_support_binding(cursor)?,
+            (50, 28) => {
+                failed_candidate_record_roles = decode_failed_candidate_record_set(cursor, 5..=14)?;
+            }
+            (50, 29) => {
+                failed_candidate_journal_roles =
+                    decode_failed_candidate_journal_set(cursor, 5..=14)?;
+            }
+            (50, 30) => decode_sorted_text_set(cursor)?,
+
+            (62, 16..=19) => decode_record_id_value(cursor)?,
+            (62, 20 | 21) => decode_sorted_uint_set(cursor)?,
+            (62, 22) => decode_journal_reference_value(cursor)?,
+
+            (71, 16) => {
+                cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            }
+            (71, 17 | 20) => decode_journal_reference_value(cursor)?,
+            (71, 18 | 19) => decode_record_id_value(cursor)?,
+
+            (72, 16) => {
+                cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            }
+            (72, 17) => decode_journal_reference_value(cursor)?,
+            (72, 18) => {
+                let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if !matches!(value, 1..=3) {
+                    return Err(RecordDecodeError);
+                }
+                terminal_disposition = Some(value);
+            }
+            (72, 19) => {
+                if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1..=4) {
+                    return Err(RecordDecodeError);
+                }
+                observed_eviction_state_present = true;
+            }
+            (72, 20) => decode_sorted_text_set(cursor)?,
+
+            (80, 16 | 18) => {
+                cursor.text().map_err(|_| RecordDecodeError)?;
+            }
+            (80, 17) => {
+                cursor.uint().map_err(|_| RecordDecodeError)?;
+            }
+            (80, 19 | 20) => decode_record_id_value(cursor)?,
+            (80, 21) => decode_journal_reference_value(cursor)?,
+
+            (81, 16 | 24 | 28) => decode_journal_reference_value(cursor)?,
+            (81, 17 | 18 | 22 | 23 | 25 | 27) => decode_record_id_value(cursor)?,
+            (81, 19 | 20) => {
+                if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1..=3) {
+                    return Err(RecordDecodeError);
+                }
+            }
+            (81, 21) => decode_sorted_record_id_set(cursor)?,
+            (81, 26) => decode_diversity_identity_set(cursor)?,
+            (81, 29) => decode_sorted_text_set(cursor)?,
+
+            (82 | 85, 16) => {
+                let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if !matches!(value, 1 | 2) {
+                    return Err(RecordDecodeError);
+                }
+                target_mode = Some(value);
+            }
+            (82 | 85, 17) => decode_sorted_journal_reference_set(cursor)?,
+            (82 | 85, 18 | 19) => decode_record_id_value(cursor)?,
+            (82 | 85, 20) => decode_sorted_record_id_set(cursor)?,
+            (82 | 85, 21) => decode_sorted_text_set(cursor)?,
+            (82 | 85, 22) => decode_journal_reference_value(cursor)?,
+
+            (83, 16) => {
+                cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            }
+            (83, 17 | 18 | 19 | 20 | 21 | 23 | 24 | 27) => decode_record_id_value(cursor)?,
+            (83, 22) => {
+                let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if !matches!(value, 1..=7) {
+                    return Err(RecordDecodeError);
+                }
+                formal_outcome = Some(value);
+            }
+            (83, 25) => decode_sorted_journal_reference_set(cursor)?,
+            (83, 26 | 28) => decode_journal_reference_value(cursor)?,
+            (83, 29) => decode_sorted_text_set(cursor)?,
+
+            (84, 16 | 17 | 21) => decode_journal_reference_value(cursor)?,
+            (84, 18 | 19) => decode_record_id_value(cursor)?,
+            (84, 20) => decode_sorted_record_id_set(cursor)?,
+
+            (86, 16) => decode_record_id_value(cursor)?,
+            (86, 17 | 18 | 19 | 20 | 21 | 22 | 24) => decode_sorted_record_id_set(cursor)?,
+            (86, 23) => decode_sorted_text_set(cursor)?,
+            (86, 25 | 26) => decode_journal_reference_value(cursor)?,
+
+            (87, 16) => {
+                let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if !matches!(value, 1 | 2) {
+                    return Err(RecordDecodeError);
+                }
+                target_mode = Some(value);
+            }
+            (87, 17) => decode_sorted_journal_reference_set(cursor)?,
+            (87, 18 | 19) => decode_record_id_value(cursor)?,
+            (87, 20) => decode_sorted_record_id_set(cursor)?,
+            (87, 21 | 22) => decode_sorted_text_set(cursor)?,
+            (87, 23) => decode_journal_reference_value(cursor)?,
+
+            (88, 16 | 25) => decode_journal_reference_value(cursor)?,
+            (88, 17) => {
+                if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1..=5) {
+                    return Err(RecordDecodeError);
+                }
+            }
+            (88, 18 | 21) => decode_record_id_value(cursor)?,
+            (88, 19) => {
+                if !matches!(cursor.uint().map_err(|_| RecordDecodeError)?, 1..=5) {
+                    return Err(RecordDecodeError);
+                }
+            }
+            (88, 20) => {
+                if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+                    return Err(RecordDecodeError);
+                }
+            }
+            (88, 22) => decode_sorted_record_id_set(cursor)?,
+            (88, 23) => decode_sorted_journal_reference_set(cursor)?,
+            (88, 24) => decode_sorted_text_set(cursor)?,
+            _ => return Err(RecordDecodeError),
+        }
+        if record_type == 12 && key == 20 {
+            source_binding_present = true;
+        }
+        if record_type == 83 && key == 23 {
+            counterexample_present = true;
+        }
+    }
+    if !cursor.finished() {
+        return Err(RecordDecodeError);
+    }
+    let bit = |key: u32| 1_u64 << key;
+    let required = match record_type {
+        5 => bit(16) | bit(17) | bit(19) | bit(20),
+        6 => bit(16) | bit(17) | bit(18) | bit(19) | bit(21) | bit(22),
+        7 => bit(16) | bit(17) | bit(18) | bit(19) | bit(20),
+        12 => {
+            bit(16)
+                | bit(17)
+                | bit(18)
+                | bit(19)
+                | bit(21)
+                | bit(22)
+                | bit(24)
+                | bit(25)
+                | bit(26)
+                | bit(27)
+                | bit(28)
+                | bit(29)
+                | bit(30)
+                | bit(31)
+        }
+        50 => bit(16) | bit(17) | bit(18) | bit(19) | bit(20) | bit(22) | bit(30) | bit(31),
+        62 => (16..=22).fold(0, |mask, key| mask | bit(key)),
+        71 => (16..=20).fold(0, |mask, key| mask | bit(key)),
+        72 => bit(16) | bit(17) | bit(18) | bit(20),
+        80 => (16..=21).fold(0, |mask, key| mask | bit(key)),
+        81 => {
+            bit(16)
+                | bit(17)
+                | bit(18)
+                | bit(19)
+                | bit(20)
+                | bit(21)
+                | bit(22)
+                | bit(23)
+                | bit(24)
+                | bit(26)
+                | bit(28)
+                | bit(29)
+        }
+        82 | 85 => bit(16) | bit(19) | bit(20) | bit(21) | bit(22),
+        83 => {
+            bit(16)
+                | bit(17)
+                | bit(18)
+                | bit(19)
+                | bit(20)
+                | bit(21)
+                | bit(22)
+                | bit(24)
+                | bit(25)
+                | bit(28)
+                | bit(29)
+        }
+        84 => (16..=21).fold(0, |mask, key| mask | bit(key)),
+        86 => (16..=24).fold(0, |mask, key| mask | bit(key)) | bit(26),
+        87 => bit(16) | bit(19) | bit(20) | bit(21) | bit(22) | bit(23),
+        88 => (16..=22).fold(0, |mask, key| mask | bit(key)) | bit(24) | bit(25),
+        _ => return Err(RecordDecodeError),
+    };
+    if present & required != required {
+        return Err(RecordDecodeError);
+    }
+    if record_type == 12
+        && !matches!(
+            (verification_target, source_binding_present),
+            (Some(1), false) | (Some(2), true)
+        )
+    {
+        return Err(RecordDecodeError);
+    }
+    if record_type == 50 && !matches!((event_type, disposition), (500, Some(1)) | (501, Some(2))) {
+        return Err(RecordDecodeError);
+    }
+    if record_type == 50
+        && present & bit(24) != 0
+        && (failed_candidate_record_roles | failed_candidate_journal_roles) & bit(8) as u16 != 0
+    {
+        return Err(RecordDecodeError);
+    }
+    if record_type == 72 {
+        let expected = match event_type {
+            701 => 1,
+            702 => 2,
+            703 => 3,
+            _ => return Err(RecordDecodeError),
+        };
+        if terminal_disposition != Some(expected)
+            || (expected == 2) != observed_eviction_state_present
+        {
+            return Err(RecordDecodeError);
+        }
+    }
+    if matches!(record_type, 82 | 85 | 87) {
+        let explicit_present = present & bit(17) != 0;
+        let predicate_present = present & bit(18) != 0;
+        if !matches!(
+            (target_mode, explicit_present, predicate_present),
+            (Some(1), true, false) | (Some(2), false, true)
+        ) {
+            return Err(RecordDecodeError);
+        }
+    }
+    if record_type == 83 && (formal_outcome == Some(2)) != counterexample_present {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn validate_review_admission_record_schema(
+    event_type: u16,
+    record_bytes: &[u8],
+) -> Result<(), RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 32)?;
+    let mut present = 0_u64;
+    let mut disposition = None;
+    let mut resolved_roles = 0_u16;
+    let mut failed_roles = 0_u16;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !(16..=23).contains(&key) {
+            return Err(RecordDecodeError);
+        }
+        present |= 1_u64
+            .checked_shl(u32::try_from(key).map_err(|_| RecordDecodeError)?)
+            .ok_or(RecordDecodeError)?;
+        match key {
+            16 => {
+                let value = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if !matches!(value, 1 | 2) {
+                    return Err(RecordDecodeError);
+                }
+                disposition = Some(value);
+            }
+            17..=19 => {
+                decode_journal_reference_value(&mut cursor)?;
+                resolved_roles |= 1_u16 << (key - 16);
+            }
+            20 => {
+                failed_roles |= decode_failed_candidate_record_set(&mut cursor, 1..=3)?;
+            }
+            21 => {
+                failed_roles |= decode_failed_candidate_journal_set(&mut cursor, 1..=3)?;
+            }
+            22 => decode_sorted_text_set(&mut cursor)?,
+            23 => decode_journal_reference_value(&mut cursor)?,
+            _ => return Err(RecordDecodeError),
+        }
+    }
+    let required = (1_u64 << 16) | (1_u64 << 22) | (1_u64 << 23);
+    if !cursor.finished()
+        || present & required != required
+        || !matches!((event_type, disposition), (302, Some(1)) | (303, Some(2)))
+    {
+        return Err(RecordDecodeError);
+    }
+    if disposition == Some(1) {
+        let accepted_references = (1_u64 << 17) | (1_u64 << 18) | (1_u64 << 19);
+        if present & accepted_references != accepted_references
+            || present & ((1_u64 << 20) | (1_u64 << 21)) != 0
+        {
+            return Err(RecordDecodeError);
+        }
+    } else if resolved_roles & failed_roles != 0 {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn decode_nonempty_policy_verification_requirements(
+    cursor: &mut CborCursor<'_>,
+) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count == 0 || count > cursor.remaining() / 4 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous = None;
+    for _ in 0..count {
+        cursor.map_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        let phase = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        let target = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(2).map_err(|_| RecordDecodeError)?;
+        let authority = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(3).map_err(|_| RecordDecodeError)?;
+        let required_count = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let value = (phase, target, authority, required_count);
+        if !matches!(phase, 1 | 2)
+            || !matches!(target, 1 | 2)
+            || authority != 1
+            || previous.is_some_and(|prior| prior >= value)
+        {
+            return Err(RecordDecodeError);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn decode_nonempty_policy_diversity_requirements(
+    cursor: &mut CborCursor<'_>,
+) -> Result<(), RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count == 0 || count > cursor.remaining() / 2 {
+        return Err(RecordDecodeError);
+    }
+    let mut previous_dimension = None;
+    for _ in 0..count {
+        cursor.map_exact(2).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        let dimension = cursor.uint().map_err(|_| RecordDecodeError)?;
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        let _distinct_count = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !matches!(dimension, 1 | 2) || previous_dimension.is_some_and(|prior| prior >= dimension)
+        {
+            return Err(RecordDecodeError);
+        }
+        previous_dimension = Some(dimension);
+    }
+    Ok(())
+}
+
+fn decode_nonempty_policy_closeout_postconditions(
+    cursor: &mut CborCursor<'_>,
+) -> Result<(), RecordDecodeError> {
+    cursor.map_exact(4).map_err(|_| RecordDecodeError)?;
+    for (key, expected) in [(0, 1), (1, 1), (2, 2), (3, 2)] {
+        cursor.key(key).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != expected {
+            return Err(RecordDecodeError);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_policy_record_schema(record_bytes: &[u8]) -> Result<(), RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 40)?;
+    let mut present = 0_u64;
+    let mut supported_contexts = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if !(16..=30).contains(&key) {
+            return Err(RecordDecodeError);
+        }
+        present |= 1_u64
+            .checked_shl(u32::try_from(key).map_err(|_| RecordDecodeError)?)
+            .ok_or(RecordDecodeError)?;
+        match key {
+            16 | 25 => decode_record_id_value(&mut cursor)?,
+            17 => {
+                let requirements = decode_review_admission_review_requirements(&mut cursor)?;
+                if requirements
+                    .iter()
+                    .any(|requirement| !(1..=5).contains(&requirement.review_role_id()))
+                {
+                    return Err(RecordDecodeError);
+                }
+            }
+            18 | 19 => {
+                decode_nonempty_sorted_uint_set(&mut cursor, |value| matches!(value, 1..=3))?;
+            }
+            20 => decode_nonempty_policy_verification_requirements(&mut cursor)?,
+            21 => {
+                cursor.map_exact(1).map_err(|_| RecordDecodeError)?;
+                cursor.key(0).map_err(|_| RecordDecodeError)?;
+                decode_sorted_event_type_id_set(&mut cursor)?;
+            }
+            22 => {
+                cursor.uint().map_err(|_| RecordDecodeError)?;
+            }
+            23 => {
+                cursor.map_exact(4).map_err(|_| RecordDecodeError)?;
+                for key in 0..=3 {
+                    cursor.key(key).map_err(|_| RecordDecodeError)?;
+                    cursor.bool().map_err(|_| RecordDecodeError)?;
+                }
+            }
+            24 => {
+                cursor.map_exact(1).map_err(|_| RecordDecodeError)?;
+                cursor.key(0).map_err(|_| RecordDecodeError)?;
+                decode_nonempty_sorted_uint_set(&mut cursor, |value| matches!(value, 1..=6))?;
+            }
+            26 => {
+                let fields = cursor.map().map_err(|_| RecordDecodeError)?;
+                if !matches!(fields, 1 | 3) {
+                    return Err(RecordDecodeError);
+                }
+                cursor.key(0).map_err(|_| RecordDecodeError)?;
+                let required = cursor.bool().map_err(|_| RecordDecodeError)?;
+                if required != (fields == 3) {
+                    return Err(RecordDecodeError);
+                }
+                if required {
+                    cursor.key(1).map_err(|_| RecordDecodeError)?;
+                    decode_nonempty_sorted_uint_set(&mut cursor, |value| matches!(value, 1..=5))?;
+                    cursor.key(2).map_err(|_| RecordDecodeError)?;
+                    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+                    if count == 0 {
+                        return Err(RecordDecodeError);
+                    }
+                    let mut previous = None;
+                    for _ in 0..count {
+                        let identity = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+                        if previous.is_some_and(|prior| prior >= identity) {
+                            return Err(RecordDecodeError);
+                        }
+                        previous = Some(identity);
+                    }
+                }
+            }
+            27 => decode_nonempty_policy_diversity_requirements(&mut cursor)?,
+            28 => decode_nonempty_policy_closeout_postconditions(&mut cursor)?,
+            29 => decode_journal_reference_value(&mut cursor)?,
+            30 => {
+                supported_contexts = Some(decode_nonempty_sorted_uint_set(&mut cursor, |value| {
+                    matches!(value, 1..=5)
+                })?);
+            }
+            _ => return Err(RecordDecodeError),
+        }
+    }
+    let required = (1_u64 << 16) | (1_u64 << 29) | (1_u64 << 30);
+    let supported_contexts = supported_contexts.ok_or(RecordDecodeError)?;
+    if !cursor.finished() || present & required != required {
+        return Err(RecordDecodeError);
+    }
+    let mut context_mask = 0_u64;
+    for context in supported_contexts {
+        context_mask |= 1_u64 << context;
+    }
+    let field_contexts = [
+        (17, (1_u64 << 2) | (1_u64 << 3) | (1_u64 << 5)),
+        (18, (1_u64 << 2) | (1_u64 << 3) | (1_u64 << 4)),
+        (19, (1_u64 << 2) | (1_u64 << 3) | (1_u64 << 4)),
+        (20, 1_u64 << 3),
+        (21, 1_u64 << 3),
+        (22, 1_u64 << 3),
+        (23, 1_u64 << 1),
+        (24, 1_u64 << 2),
+        (25, 1_u64 << 3),
+        (26, 1_u64 << 3),
+        (27, 1_u64 << 3),
+        (28, (1_u64 << 3) | (1_u64 << 4)),
+    ];
+    if field_contexts
+        .iter()
+        .any(|(key, applicable)| present & (1_u64 << key) != 0 && context_mask & applicable == 0)
+    {
+        return Err(RecordDecodeError);
+    }
+    let review_required = context_mask & ((1_u64 << 2) | (1_u64 << 5)) != 0;
+    if review_required && present & (1_u64 << 17) == 0
+        || context_mask & (1_u64 << 4) != 0 && present & (1_u64 << 28) == 0
+        || present & (1_u64 << 28) != 0
+            && context_mask & ((1_u64 << 3) | (1_u64 << 4)) != ((1_u64 << 3) | (1_u64 << 4))
+    {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn validate_event_record_type_local_schema(
+    event_type: u16,
+    record_bytes: &[u8],
+) -> Result<(), RecordDecodeError> {
+    match event_type {
+        1 => GenesisRecord::decode_authoritative(record_bytes).map(|_| ()),
+        100 => FreezeAttemptStartRecord::decode_authoritative(record_bytes).map(|_| ()),
+        101 => FreezeReceiptRecord::decode_authoritative(record_bytes).map(|_| ()),
+        300 => ReviewRequestRecord::decode_authoritative(record_bytes).map(|_| ()),
+        301 => ReviewResultRecord::decode_authoritative(record_bytes).map(|_| ()),
+        302 | 303 => validate_review_admission_record_schema(event_type, record_bytes),
+        400 => validate_policy_record_schema(record_bytes),
+        102..=104 | 200 | 500..=501 | 600 | 700..=703 | 800..=808 => {
+            let record_type =
+                expected_record_type_for_event(event_type).ok_or(RecordDecodeError)?;
+            let (mut cursor, field_count) = decode_event_record_body(record_bytes, record_type)?;
+            validate_remaining_event_record_fields(
+                record_type,
+                event_type,
+                &mut cursor,
+                field_count,
+            )
+        }
+        _ => Err(RecordDecodeError),
+    }
+}
+
+fn validate_event_record_lifecycle_binding(
+    entry: &RetainedJournalEntry,
+    record_bytes: &[u8],
+) -> Result<(), RecordDecodeError> {
+    let event_type = entry.event_type_id().value();
+    match event_type {
+        102..=104 | 700..=703 => {
+            let record_type =
+                expected_record_type_for_event(event_type).ok_or(RecordDecodeError)?;
+            let (mut cursor, field_count) = decode_event_record_body(record_bytes, record_type)?;
+            let mut lifecycle_object_id = None;
+            for _ in 0..field_count {
+                let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if key == 16 {
+                    lifecycle_object_id = Some(cursor.bstr_32().map_err(|_| RecordDecodeError)?);
+                } else {
+                    cursor.skip_value().map_err(|_| RecordDecodeError)?;
+                }
+            }
+            if lifecycle_object_id != Some(entry.lifecycle_object_id()) {
+                return Err(RecordDecodeError);
+            }
+        }
+        600 => {
+            if entry.lifecycle_object_id() != *entry.registry_id().as_bytes() {
+                return Err(RecordDecodeError);
+            }
+        }
+        200 | 302..=303 | 400 | 500..=501 | 800..=808
+            if entry.lifecycle_object_id() != *entry.event_record_id().as_bytes() =>
+        {
+            return Err(RecordDecodeError);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_redundant_event_specific_bindings(
+    entry: &RetainedJournalEntry,
+    record_bytes: &[u8],
+) -> Result<(), RecordDecodeError> {
+    let RetainedJournalEntry::Common(common_entry) = entry else {
+        return Ok(());
+    };
+    match entry.event_type_id().value() {
+        104 => {
+            let common = decode_journal_entry_with_event_specific_keys(
+                &common_entry.authoritative_bytes,
+                &[16, 18, 19],
+            )
+            .map_err(|_| RecordDecodeError)?;
+            let [(_, DecodedEventSpecificField::Bytes(journal_attempt)), (_, DecodedEventSpecificField::JournalReference(journal_start)), (_, DecodedEventSpecificField::JournalReference(journal_terminal))] =
+                common.event_specific_fields.as_slice()
+            else {
+                return Err(RecordDecodeError);
+            };
+            let (mut cursor, field_count) = decode_event_record_body(record_bytes, 7)?;
+            let mut record_attempt = None;
+            let mut record_start = None;
+            let mut record_terminal = None;
+            for _ in 0..field_count {
+                let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+                match key {
+                    16 => record_attempt = Some(cursor.bstr_32().map_err(|_| RecordDecodeError)?),
+                    17 => {
+                        record_start = Some(
+                            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?,
+                        )
+                    }
+                    18 => {
+                        record_terminal = Some(
+                            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?,
+                        )
+                    }
+                    _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+                }
+            }
+            if record_attempt.as_ref() != Some(journal_attempt)
+                || record_start.as_ref() != Some(journal_start)
+                || record_terminal.as_ref() != Some(journal_terminal)
+            {
+                return Err(RecordDecodeError);
+            }
+        }
+        200 => {
+            let journal_bracket = decode_journal_entry_with_event_specific_keys(
+                &common_entry.authoritative_bytes,
+                &[20],
+            )
+            .ok()
+            .and_then(|common| match common.event_specific_fields.as_slice() {
+                [(_, DecodedEventSpecificField::JournalReference(reference))] => {
+                    Some(reference.clone())
+                }
+                _ => None,
+            });
+            let (mut cursor, field_count) = decode_event_record_body(record_bytes, 12)?;
+            let mut record_bracket = None;
+            for _ in 0..field_count {
+                let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+                if key == 32 {
+                    record_bracket =
+                        Some(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
+                } else {
+                    cursor.skip_value().map_err(|_| RecordDecodeError)?;
+                }
+            }
+            if record_bracket != journal_bracket {
+                return Err(RecordDecodeError);
+            }
+        }
+        700 => {
+            let common = decode_journal_entry_with_event_specific_keys(
+                &common_entry.authoritative_bytes,
+                &[21, 22, 23, 24],
+            )
+            .map_err(|_| RecordDecodeError)?;
+            let [(_, DecodedEventSpecificField::Bytes(journal_attempt)), (_, DecodedEventSpecificField::JournalReference(journal_freeze)), (_, DecodedEventSpecificField::Bytes(journal_manifest)), (_, DecodedEventSpecificField::Bytes(journal_scope))] =
+                common.event_specific_fields.as_slice()
+            else {
+                return Err(RecordDecodeError);
+            };
+            let (mut cursor, field_count) = decode_event_record_body(record_bytes, 71)?;
+            let mut record_attempt = None;
+            let mut record_freeze = None;
+            let mut record_manifest = None;
+            let mut record_scope = None;
+            for _ in 0..field_count {
+                let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+                match key {
+                    16 => record_attempt = Some(cursor.bstr_32().map_err(|_| RecordDecodeError)?),
+                    17 => {
+                        record_freeze = Some(
+                            decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?,
+                        )
+                    }
+                    18 => record_manifest = Some(cursor.bstr_32().map_err(|_| RecordDecodeError)?),
+                    19 => record_scope = Some(cursor.bstr_32().map_err(|_| RecordDecodeError)?),
+                    _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+                }
+            }
+            if record_attempt.as_ref() != Some(journal_attempt)
+                || record_freeze.as_ref() != Some(journal_freeze)
+                || record_manifest.as_ref() != Some(journal_manifest)
+                || record_scope.as_ref() != Some(journal_scope)
+            {
+                return Err(RecordDecodeError);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_exact_authority_dependencies(
+    entry: &RetainedJournalEntry,
+    expected: &[JournalReference],
+) -> Result<(), RecordDecodeError> {
+    if !expected
+        .iter()
+        .all(|reference| entry.authority_dependencies().contains(reference))
+        || !entry
+            .authority_dependencies()
+            .iter()
+            .all(|reference| expected.contains(reference))
+    {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn validate_resolved_prior_reference(
+    retained_journal: &RetainedJournal,
+    entry: &RetainedJournalEntry,
+    reference: &JournalReference,
+) -> Result<(), RecordDecodeError> {
+    let resolved = retained_journal
+        .resolve_reference(reference)
+        .map_err(|_| RecordDecodeError)?;
+    if resolved.entry_index().value() >= entry.entry_index().value() {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn decode_record_id_for_binding(
+    cursor: &mut CborCursor<'_>,
+) -> Result<RecordId, RecordDecodeError> {
+    RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+        .map_err(|_| RecordDecodeError)
+}
+
+fn decode_record_id_set_for_binding(
+    cursor: &mut CborCursor<'_>,
+) -> Result<Vec<RecordId>, RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() / 34 {
+        return Err(RecordDecodeError);
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| RecordDecodeError)?;
+    for _ in 0..count {
+        values.push(decode_record_id_for_binding(cursor)?);
+    }
+    Ok(values)
+}
+
+fn decode_journal_reference_set_for_binding(
+    cursor: &mut CborCursor<'_>,
+) -> Result<Vec<JournalReference>, RecordDecodeError> {
+    let count = cursor.array().map_err(|_| RecordDecodeError)?;
+    if count > cursor.remaining() / 105 {
+        return Err(RecordDecodeError);
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| RecordDecodeError)?;
+    for _ in 0..count {
+        values.push(decode_journal_reference(cursor).map_err(|_| RecordDecodeError)?);
+    }
+    Ok(values)
+}
+
+fn require_reference_event_type(
+    reference: &JournalReference,
+    allowed_event_types: &[u16],
+) -> Result<(), RecordDecodeError> {
+    if !allowed_event_types.contains(&reference.event_type_id().value()) {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn decode_typed_journal_reference_for_binding(
+    cursor: &mut CborCursor<'_>,
+    allowed_event_types: &[u16],
+) -> Result<JournalReference, RecordDecodeError> {
+    let reference = decode_journal_reference(cursor).map_err(|_| RecordDecodeError)?;
+    require_reference_event_type(&reference, allowed_event_types)?;
+    Ok(reference)
+}
+
+fn decode_typed_journal_reference_set_for_binding(
+    cursor: &mut CborCursor<'_>,
+    allowed_event_types: &[u16],
+) -> Result<Vec<JournalReference>, RecordDecodeError> {
+    let references = decode_journal_reference_set_for_binding(cursor)?;
+    for reference in &references {
+        require_reference_event_type(reference, allowed_event_types)?;
+    }
+    Ok(references)
+}
+
+fn validate_exact_identity_dependencies(
+    entry: &RetainedJournalEntry,
+    mut expected: Vec<RecordId>,
+) -> Result<(), RecordDecodeError> {
+    expected.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    expected.dedup_by(|left, right| left.as_bytes() == right.as_bytes());
+    if entry.identity_dependencies().len() != expected.len() {
+        return Err(RecordDecodeError);
+    }
+    for dependency in entry.identity_dependencies() {
+        let IdentityDependency::RecordId(record_id) = dependency else {
+            return Err(RecordDecodeError);
+        };
+        if expected
+            .binary_search_by(|candidate| candidate.as_bytes().cmp(record_id.as_bytes()))
+            .is_err()
+        {
+            return Err(RecordDecodeError);
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_typed_identity_dependencies(
+    entry: &RetainedJournalEntry,
+    expected: &[IdentityDependency],
+) -> Result<(), RecordDecodeError> {
+    if expected
+        .iter()
+        .any(|dependency| !entry.identity_dependencies().contains(dependency))
+        || entry
+            .identity_dependencies()
+            .iter()
+            .any(|dependency| !expected.contains(dependency))
+    {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn decode_policy_supported_contexts(record_bytes: &[u8]) -> Result<Vec<u64>, RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 40)?;
+    let mut supported_contexts = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if key == 30 {
+            let count = cursor.array().map_err(|_| RecordDecodeError)?;
+            if count == 0 || count > cursor.remaining() {
+                return Err(RecordDecodeError);
+            }
+            let mut contexts = Vec::with_capacity(count);
+            for _ in 0..count {
+                contexts.push(cursor.uint().map_err(|_| RecordDecodeError)?);
+            }
+            supported_contexts = Some(contexts);
+        } else {
+            cursor.skip_value().map_err(|_| RecordDecodeError)?;
+        }
+    }
+    supported_contexts.ok_or(RecordDecodeError)
+}
+
+fn validate_freeze_commit_policy_requirements(
+    receipt_record_bytes: &[u8],
+    records: &[(RecordId, Vec<u8>)],
+) -> Result<(), RecordDecodeError> {
+    let receipt = FreezeReceiptRecord::decode_authoritative(receipt_record_bytes)?;
+    let policy_record_id = receipt.input().policy_record_id;
+    let policy_bytes = records
+        .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(policy_record_id.as_bytes()))
+        .ok()
+        .map(|index| records[index].1.as_slice())
+        .ok_or(RecordDecodeError)?;
+    let policy_frame = StrictRecordFrame::decode_authoritative(policy_bytes)?;
+    if policy_frame.record_id() != policy_record_id {
+        return Err(RecordDecodeError);
+    }
+    validate_policy_record_schema(policy_bytes)?;
+
+    let (mut cursor, field_count) = decode_event_record_body(policy_bytes, 40)?;
+    let mut contexts = None;
+    let mut minimum_durability = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match key {
+            23 => {
+                cursor.map_exact(4).map_err(|_| RecordDecodeError)?;
+                let mut requirements = [false; 4];
+                for (requirement_key, requirement) in requirements.iter_mut().enumerate() {
+                    cursor
+                        .key(u64::try_from(requirement_key).map_err(|_| RecordDecodeError)?)
+                        .map_err(|_| RecordDecodeError)?;
+                    *requirement = cursor.bool().map_err(|_| RecordDecodeError)?;
+                }
+                minimum_durability = Some(requirements);
+            }
+            30 => {
+                contexts = Some(decode_nonempty_sorted_uint_set(&mut cursor, |value| {
+                    matches!(value, 1..=5)
+                })?);
+            }
+            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+        }
+    }
+    if !cursor.finished() || !contexts.ok_or(RecordDecodeError)?.contains(&1) {
+        return Err(RecordDecodeError);
+    }
+    if let Some(
+        [require_file_content_flush, require_atomic_publish_no_replace, require_parent_directory_flush, require_platform_strongest_available],
+    ) = minimum_durability
+    {
+        if require_file_content_flush && receipt.input().file_content_flush_state != 1
+            || require_atomic_publish_no_replace
+                && receipt.input().atomic_publish_no_replace_state != 1
+            || require_parent_directory_flush && receipt.input().parent_directory_flush_state != 1
+            || require_platform_strongest_available && !receipt.input().platform_strongest_available
+        {
+            return Err(RecordDecodeError);
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_request_replay_contract(
+    retained_journal: &RetainedJournal,
+    entry: &RetainedJournalEntry,
+    request: &ReviewRequestRecord,
+    records: &[(RecordId, Vec<u8>)],
+) -> Result<(), RecordDecodeError> {
+    if request.freeze_authority_ref().event_type_id().value() != 101
+        || request.policy_authority_ref().event_type_id().value() != 400
+    {
+        return Err(RecordDecodeError);
+    }
+    let authorities = [
+        request.freeze_authority_ref().clone(),
+        request.policy_authority_ref().clone(),
+    ];
+    validate_exact_authority_dependencies(entry, &authorities)?;
+    let identities = [
+        IdentityDependency::RecordId(request.manifest_id()),
+        IdentityDependency::RecordId(request.required_checks_ref()),
+        IdentityDependency::RecordId(request.review_scope_ref()),
+        IdentityDependency::RecordId(request.review_method_ref()),
+        IdentityDependency::JournalAnchorId(request.review_package_anchor_id()),
+    ];
+    validate_exact_typed_identity_dependencies(entry, &identities)?;
+    for reference in authorities
+        .iter()
+        .chain([request.operation_start_journal_ref()])
+    {
+        validate_resolved_prior_reference(retained_journal, entry, reference)?;
+    }
+    let policy_contexts = decode_policy_supported_contexts(record_bytes_for_reference(
+        records,
+        request.policy_authority_ref(),
+    )?)?;
+    if !policy_contexts.contains(&5) {
+        return Err(RecordDecodeError);
+    }
+    let policy = ReviewAdmissionPolicyRecord::decode_authoritative(record_bytes_for_reference(
+        records,
+        request.policy_authority_ref(),
+    )?)?;
+    if !policy.review_requirements().iter().any(|requirement| {
+        requirement.review_role_id() == request.review_role_id()
+            && requirement.review_scope_ref() == request.review_scope_ref()
+            && requirement.review_method_ref() == request.review_method_ref()
+            && requirement.required_checks_ref() == request.required_checks_ref()
+    }) {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn validate_review_result_replay_contract(
+    retained_journal: &RetainedJournal,
+    entry: &RetainedJournalEntry,
+    result: &ReviewResultRecord,
+    records: &[(RecordId, Vec<u8>)],
+) -> Result<(), RecordDecodeError> {
+    if result
+        .review_request_authority_ref()
+        .event_type_id()
+        .value()
+        != 300
+    {
+        return Err(RecordDecodeError);
+    }
+    let authorities = [result.review_request_authority_ref().clone()];
+    validate_exact_authority_dependencies(entry, &authorities)?;
+    let mut identities = vec![
+        IdentityDependency::RecordId(result.manifest_id()),
+        IdentityDependency::RecordId(result.review_scope_ref()),
+        IdentityDependency::RecordId(result.review_method_ref()),
+        IdentityDependency::JournalAnchorId(result.review_package_anchor_id()),
+    ];
+    identities.extend(
+        result
+            .findings()
+            .iter()
+            .copied()
+            .map(IdentityDependency::RecordId),
+    );
+    validate_exact_typed_identity_dependencies(entry, &identities)?;
+    for reference in authorities
+        .iter()
+        .chain([result.operation_start_journal_ref()])
+    {
+        validate_resolved_prior_reference(retained_journal, entry, reference)?;
+    }
+    let request = ReviewRequestRecord::decode_authoritative(record_bytes_for_reference(
+        records,
+        result.review_request_authority_ref(),
+    )?)?;
+    if result.freeze_authority_ref() != request.freeze_authority_ref()
+        || result.manifest_id() != request.manifest_id()
+        || result.review_role_id() != request.review_role_id()
+        || result.review_scope_ref() != request.review_scope_ref()
+        || result.review_method_ref() != request.review_method_ref()
+        || result.review_package_anchor_id() != request.review_package_anchor_id()
+    {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn record_bytes_for_reference<'a>(
+    records: &'a [(RecordId, Vec<u8>)],
+    reference: &JournalReference,
+) -> Result<&'a [u8], RecordDecodeError> {
+    let record_id = RecordId::try_from(reference.event_record_id().as_bytes().as_slice())
+        .map_err(|_| RecordDecodeError)?;
+    records
+        .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(record_id.as_bytes()))
+        .ok()
+        .map(|index| records[index].1.as_slice())
+        .ok_or(RecordDecodeError)
+}
+
+struct RecordNamespaceResolver<'a>(&'a [(RecordId, Vec<u8>)]);
+
+impl ExactRecordByteResolver for RecordNamespaceResolver<'_> {
+    fn resolve(&self, record_id: RecordId) -> Option<&[u8]> {
+        self.0
+            .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(record_id.as_bytes()))
+            .ok()
+            .map(|index| self.0[index].1.as_slice())
+    }
+}
+
+fn decode_capability_observation_provenance(
+    record_bytes: &[u8],
+) -> Result<(RecordId, RecordId, bool), RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 63)?;
+    if !(4..=8).contains(&field_count) {
+        return Err(RecordDecodeError);
+    }
+    let mut storage = None;
+    let mut environment = None;
+    let mut cache_reused = None;
+    let mut process_scope_present = false;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match key {
+            16 => storage = Some(decode_record_id_for_binding(&mut cursor)?),
+            17 => environment = Some(decode_record_id_for_binding(&mut cursor)?),
+            18 => cache_reused = Some(cursor.bool().map_err(|_| RecordDecodeError)?),
+            19 => {
+                cursor.bstr().map_err(|_| RecordDecodeError)?;
+                process_scope_present = true;
+            }
+            20..=22 => {
+                cursor.bstr().map_err(|_| RecordDecodeError)?;
+            }
+            23 => {
+                cursor.text().map_err(|_| RecordDecodeError)?;
+            }
+            _ => return Err(RecordDecodeError),
+        }
+    }
+    if !cursor.finished() || !process_scope_present {
+        return Err(RecordDecodeError);
+    }
+    Ok((
+        storage.ok_or(RecordDecodeError)?,
+        environment.ok_or(RecordDecodeError)?,
+        cache_reused.ok_or(RecordDecodeError)?,
+    ))
+}
+
+fn validate_event_record_reference_bindings(
+    retained_journal: &RetainedJournal,
+    entry: &RetainedJournalEntry,
+    record_bytes: &[u8],
+    records: &[(RecordId, Vec<u8>)],
+) -> Result<(), RecordDecodeError> {
+    let event_type = entry.event_type_id().value();
+    if !matches!(event_type, 102..=104 | 200 | 600 | 700..=703 | 800..=808) {
+        return Ok(());
+    }
+    let record_type = expected_record_type_for_event(event_type).ok_or(RecordDecodeError)?;
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, record_type)?;
+    let mut authorities = Vec::new();
+    let mut identities = Vec::new();
+    let mut other_references = Vec::new();
+    let mut prior_storage = None;
+    let mut prior_environment = None;
+    let mut new_storage = None;
+    let mut new_environment = None;
+    let mut capability_provenance = None;
+    let mut capability_epoch = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match (event_type, key) {
+            (102 | 103, 17) | (104, 17) => authorities.push(
+                decode_typed_journal_reference_for_binding(&mut cursor, &[100])?,
+            ),
+            (104, 18) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[101, 102, 103],
+            )?),
+            (700, 17) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[101],
+            )?),
+            (701..=703, 17) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[700],
+            )?),
+            (801, 16) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[800],
+            )?),
+            (803, 26) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[101],
+            )?),
+            (804, 16 | 17) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[800],
+            )?),
+            (806, 25) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[806],
+            )?),
+            (808, 16) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[803],
+            )?),
+            (802, 17) => authorities.extend(decode_typed_journal_reference_set_for_binding(
+                &mut cursor,
+                &[801],
+            )?),
+            (805, 17) => authorities.extend(decode_typed_journal_reference_set_for_binding(
+                &mut cursor,
+                &[804],
+            )?),
+            (807, 17) => authorities.extend(decode_typed_journal_reference_set_for_binding(
+                &mut cursor,
+                &[806],
+            )?),
+            (803, 25) => authorities.extend(decode_typed_journal_reference_set_for_binding(
+                &mut cursor,
+                &[800],
+            )?),
+            (808, 23) => {
+                authorities.extend(decode_journal_reference_set_for_binding(&mut cursor)?);
+            }
+            (102, 20)
+            | (103, 22)
+            | (200, 18)
+            | (600, 22)
+            | (700, 20)
+            | (800, 21)
+            | (801, 28)
+            | (802, 22)
+            | (803, 28)
+            | (804, 21)
+            | (805, 22)
+            | (806, 26)
+            | (807, 23)
+            | (808, 25) => {
+                other_references
+                    .push(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
+            }
+            (801, 24) => {
+                capability_epoch =
+                    Some(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
+            }
+            (200, 19) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[101],
+            )?),
+            (200, 32) => authorities.push(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[500],
+            )?),
+            (102, 18)
+            | (200, 20 | 21 | 29 | 30)
+            | (700, 18 | 19)
+            | (800, 19 | 20)
+            | (801, 17 | 18 | 27)
+            | (802 | 805, 18 | 19)
+            | (803, 17 | 18 | 19 | 20 | 21 | 23 | 24 | 27)
+            | (804, 18 | 19)
+            | (806, 16)
+            | (807, 18 | 19)
+            | (808, 18 | 21) => {
+                identities.push(decode_record_id_for_binding(&mut cursor)?);
+            }
+            (801, 21)
+            | (802 | 805 | 807, 20)
+            | (804, 20)
+            | (806, 17 | 18 | 19 | 20 | 21 | 22 | 24)
+            | (808, 22) => {
+                identities.extend(decode_record_id_set_for_binding(&mut cursor)?);
+            }
+            (600, 16..=19) => {
+                let record_id = decode_record_id_for_binding(&mut cursor)?;
+                match key {
+                    16 => prior_storage = Some(record_id),
+                    17 => new_storage = Some(record_id),
+                    18 => prior_environment = Some(record_id),
+                    19 => new_environment = Some(record_id),
+                    _ => unreachable!(),
+                }
+                identities.push(record_id);
+            }
+            (801, 22 | 23) => {
+                let record_id = decode_record_id_for_binding(&mut cursor)?;
+                if key == 22 {
+                    new_storage = Some(record_id);
+                } else {
+                    new_environment = Some(record_id);
+                }
+                identities.push(record_id);
+            }
+            (801, 25) => {
+                let record_id = decode_record_id_for_binding(&mut cursor)?;
+                capability_provenance = Some(record_id);
+                identities.push(record_id);
+            }
+            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+        }
+    }
+    validate_exact_authority_dependencies(entry, &authorities)?;
+    if event_type != 600 || !entry.identity_dependencies().is_empty() {
+        validate_exact_identity_dependencies(entry, identities)?;
+    }
+    for reference in authorities.iter().chain(other_references.iter()) {
+        validate_resolved_prior_reference(retained_journal, entry, reference)?;
+    }
+    if matches!(event_type, 600 | 801)
+        && (new_storage != Some(entry.storage_capability_class_id())
+            || new_environment != Some(entry.environment_observation_id()))
+    {
+        return Err(RecordDecodeError);
+    }
+    if event_type == 600 {
+        let predecessor_index = entry
+            .entry_index()
+            .value()
+            .checked_sub(1)
+            .ok_or(RecordDecodeError)?;
+        let predecessor = retained_journal
+            .entries
+            .iter()
+            .find(|candidate| candidate.entry_index().value() == predecessor_index)
+            .ok_or(RecordDecodeError)?;
+        if entry.previous_entry_hash() != Some(predecessor.entry_hash())
+            || prior_storage != Some(predecessor.storage_capability_class_id())
+            || prior_environment != Some(predecessor.environment_observation_id())
+        {
+            return Err(RecordDecodeError);
+        }
+    }
+    if event_type == 801 {
+        let epoch_reference = capability_epoch.as_ref().ok_or(RecordDecodeError)?;
+        if !matches!(epoch_reference.event_type_id().value(), 1 | 600) {
+            return Err(RecordDecodeError);
+        }
+        let applicable_epoch = retained_journal
+            .entries
+            .iter()
+            .rev()
+            .find(|candidate| {
+                candidate.entry_index().value() < entry.entry_index().value()
+                    && candidate.event_type_id().value() == 600
+            })
+            .or_else(|| retained_journal.entries.first())
+            .ok_or(RecordDecodeError)?;
+        let applicable_epoch_reference = JournalReference::new(
+            applicable_epoch.registry_id(),
+            applicable_epoch.entry_index(),
+            applicable_epoch.entry_hash(),
+            applicable_epoch.event_type_id(),
+            applicable_epoch.event_record_id(),
+        );
+        if *epoch_reference != applicable_epoch_reference {
+            return Err(RecordDecodeError);
+        }
+        let epoch = retained_journal
+            .resolve_reference(epoch_reference)
+            .map_err(|_| RecordDecodeError)?;
+        if epoch.entry_index().value() >= entry.entry_index().value()
+            || Some(epoch.storage_capability_class_id()) != new_storage
+            || Some(epoch.environment_observation_id()) != new_environment
+        {
+            return Err(RecordDecodeError);
+        }
+        if capability_provenance.is_none() {
+            return Err(RecordDecodeError);
+        }
+    }
+    if let Some(provenance_id) = capability_provenance {
+        let provenance_bytes = records
+            .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(provenance_id.as_bytes()))
+            .ok()
+            .map(|index| records[index].1.as_slice())
+            .ok_or(RecordDecodeError)?;
+        let (storage, environment, cache_reused) =
+            decode_capability_observation_provenance(provenance_bytes)?;
+        if !cache_reused || Some(storage) != new_storage || Some(environment) != new_environment {
+            return Err(RecordDecodeError);
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_event_bindings(
+    retained_journal: &RetainedJournal,
+    entry: &RetainedJournalEntry,
+    record_bytes: &[u8],
+) -> Result<(), RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 40)?;
+    let mut identities = Vec::new();
+    let mut operation_start = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match key {
+            16 | 25 => identities.push(decode_record_id_for_binding(&mut cursor)?),
+            17 => {
+                let count = cursor.array().map_err(|_| RecordDecodeError)?;
+                if count == 0 || count > cursor.remaining() / 5 {
+                    return Err(RecordDecodeError);
+                }
+                for _ in 0..count {
+                    cursor.map_exact(5).map_err(|_| RecordDecodeError)?;
+                    cursor.key(0).map_err(|_| RecordDecodeError)?;
+                    cursor.uint().map_err(|_| RecordDecodeError)?;
+                    for nested_key in 1..=3 {
+                        cursor.key(nested_key).map_err(|_| RecordDecodeError)?;
+                        identities.push(decode_record_id_for_binding(&mut cursor)?);
+                    }
+                    cursor.key(4).map_err(|_| RecordDecodeError)?;
+                    cursor.uint().map_err(|_| RecordDecodeError)?;
+                }
+            }
+            26 => {
+                let fields = cursor.map().map_err(|_| RecordDecodeError)?;
+                cursor.key(0).map_err(|_| RecordDecodeError)?;
+                let required = cursor.bool().map_err(|_| RecordDecodeError)?;
+                if required && fields == 3 {
+                    cursor.key(1).map_err(|_| RecordDecodeError)?;
+                    cursor.skip_value().map_err(|_| RecordDecodeError)?;
+                    cursor.key(2).map_err(|_| RecordDecodeError)?;
+                    identities.extend(decode_record_id_set_for_binding(&mut cursor)?);
+                } else if required || fields != 1 {
+                    return Err(RecordDecodeError);
+                }
+            }
+            29 => {
+                operation_start =
+                    Some(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
+            }
+            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+        }
+    }
+    validate_exact_authority_dependencies(entry, &[])?;
+    validate_exact_identity_dependencies(entry, identities)?;
+    validate_resolved_prior_reference(
+        retained_journal,
+        entry,
+        operation_start.as_ref().ok_or(RecordDecodeError)?,
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct PolicyCloseoutFacts {
+    supports_closeout_creation: bool,
+    closeout_postconditions_present: bool,
+    bootstrap_scope: Option<RecordId>,
+}
+
+fn decode_policy_closeout_facts(
+    record_bytes: &[u8],
+) -> Result<PolicyCloseoutFacts, RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 40)?;
+    let mut supports_closeout_creation = false;
+    let mut closeout_postconditions_present = false;
+    let mut bootstrap_scope = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match key {
+            25 => bootstrap_scope = Some(decode_record_id_for_binding(&mut cursor)?),
+            28 => {
+                closeout_postconditions_present = true;
+                cursor.skip_value().map_err(|_| RecordDecodeError)?;
+            }
+            30 => {
+                let count = cursor.array().map_err(|_| RecordDecodeError)?;
+                for _ in 0..count {
+                    if cursor.uint().map_err(|_| RecordDecodeError)? == 3 {
+                        supports_closeout_creation = true;
+                    }
+                }
+            }
+            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+        }
+    }
+    Ok(PolicyCloseoutFacts {
+        supports_closeout_creation,
+        closeout_postconditions_present,
+        bootstrap_scope,
+    })
+}
+
+fn decode_assumption_establishment_definition(
+    record_bytes: &[u8],
+) -> Result<JournalReference, RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 81)?;
+    let mut definition = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if key == 16 {
+            definition = Some(decode_typed_journal_reference_for_binding(
+                &mut cursor,
+                &[800],
+            )?);
+        } else {
+            cursor.skip_value().map_err(|_| RecordDecodeError)?;
+        }
+    }
+    definition.ok_or(RecordDecodeError)
+}
+
+fn decode_compatibility_definitions(
+    record_bytes: &[u8],
+) -> Result<(JournalReference, JournalReference), RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 84)?;
+    let mut source = None;
+    let mut target = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match key {
+            16 => {
+                source = Some(decode_typed_journal_reference_for_binding(
+                    &mut cursor,
+                    &[800],
+                )?)
+            }
+            17 => {
+                target = Some(decode_typed_journal_reference_for_binding(
+                    &mut cursor,
+                    &[800],
+                )?)
+            }
+            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+        }
+    }
+    Ok((
+        source.ok_or(RecordDecodeError)?,
+        target.ok_or(RecordDecodeError)?,
+    ))
+}
+
+fn decode_bootstrap_declaration_scope(record_bytes: &[u8]) -> Result<RecordId, RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 86)?;
+    let mut scope = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if key == 16 {
+            scope = Some(decode_record_id_for_binding(&mut cursor)?);
+        } else {
+            cursor.skip_value().map_err(|_| RecordDecodeError)?;
+        }
+    }
+    scope.ok_or(RecordDecodeError)
+}
+
+fn validate_closeout_formal_binding(
+    records: &[(RecordId, Vec<u8>)],
+    definition: &JournalReference,
+    establishment: &JournalReference,
+    compatibility: Option<&JournalReference>,
+) -> Result<(), RecordDecodeError> {
+    let establishment_definition = decode_assumption_establishment_definition(
+        record_bytes_for_reference(records, establishment)?,
+    )?;
+    if establishment_definition == *definition {
+        return compatibility
+            .is_none()
+            .then_some(())
+            .ok_or(RecordDecodeError);
+    }
+    let compatibility = compatibility.ok_or(RecordDecodeError)?;
+    let (source, target) =
+        decode_compatibility_definitions(record_bytes_for_reference(records, compatibility)?)?;
+    if source != establishment_definition || target != *definition {
+        return Err(RecordDecodeError);
+    }
+    Ok(())
+}
+
+fn validate_closeout_bootstrap_scopes(
+    records: &[(RecordId, Vec<u8>)],
+    declarations: &[JournalReference],
+    required_scope: RecordId,
+) -> Result<(), RecordDecodeError> {
+    if declarations.is_empty() {
+        return Err(RecordDecodeError);
+    }
+    for declaration in declarations {
+        if decode_bootstrap_declaration_scope(record_bytes_for_reference(records, declaration)?)?
+            != required_scope
+        {
+            return Err(RecordDecodeError);
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_admission_event_bindings(
+    retained_journal: &RetainedJournal,
+    entry: &RetainedJournalEntry,
+    record_bytes: &[u8],
+    records: &[(RecordId, Vec<u8>)],
+) -> Result<(), RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 32)?;
+    let mut authorities = Vec::new();
+    let identities = Vec::new();
+    let mut operation_start = None;
+    let mut request_reference = None;
+    let mut result_reference = None;
+    let mut policy_reference = None;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match key {
+            17..=19 => {
+                let expected_event_type = match key {
+                    17 => 300,
+                    18 => 301,
+                    19 => 400,
+                    _ => unreachable!(),
+                };
+                let reference = decode_typed_journal_reference_for_binding(
+                    &mut cursor,
+                    &[expected_event_type],
+                )?;
+                match key {
+                    17 => request_reference = Some(reference.clone()),
+                    18 => result_reference = Some(reference.clone()),
+                    19 => policy_reference = Some(reference.clone()),
+                    _ => unreachable!(),
+                }
+                authorities.push(reference);
+            }
+            20 => {
+                decode_failed_candidate_record_set(&mut cursor, 1..=3)?;
+            }
+            21 => {
+                decode_failed_candidate_journal_set(&mut cursor, 1..=3)?;
+            }
+            23 => {
+                operation_start =
+                    Some(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
+            }
+            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+        }
+    }
+    validate_exact_authority_dependencies(entry, &authorities)?;
+    validate_exact_identity_dependencies(entry, identities)?;
+    for reference in authorities.iter().chain(operation_start.as_ref()) {
+        validate_resolved_prior_reference(retained_journal, entry, reference)?;
+    }
+    let request = request_reference
+        .as_ref()
+        .map(|reference| {
+            ReviewRequestRecord::decode_authoritative(record_bytes_for_reference(
+                records, reference,
+            )?)
+        })
+        .transpose()?;
+    let result = result_reference
+        .as_ref()
+        .map(|reference| {
+            ReviewResultRecord::decode_authoritative(record_bytes_for_reference(
+                records, reference,
+            )?)
+        })
+        .transpose()?;
+    if let (Some(request_reference), Some(request), Some(result)) = (
+        request_reference.as_ref(),
+        request.as_ref(),
+        result.as_ref(),
+    ) {
+        if result.review_request_authority_ref() != request_reference
+            || result.freeze_authority_ref() != request.freeze_authority_ref()
+            || result.manifest_id() != request.manifest_id()
+            || result.review_role_id() != request.review_role_id()
+            || result.review_scope_ref() != request.review_scope_ref()
+            || result.review_method_ref() != request.review_method_ref()
+            || result.review_package_anchor_id() != request.review_package_anchor_id()
+        {
+            return Err(RecordDecodeError);
+        }
+    }
+    if let (Some(request), Some(policy_reference)) = (request.as_ref(), policy_reference.as_ref()) {
+        if request.policy_authority_ref() != policy_reference {
+            return Err(RecordDecodeError);
+        }
+    }
+
+    if entry.event_type_id().value() == 302 {
+        let policy_reference = policy_reference.as_ref().ok_or(RecordDecodeError)?;
+        let contexts = decode_policy_supported_contexts(record_bytes_for_reference(
+            records,
+            policy_reference,
+        )?)?;
+        if !contexts.contains(&2) {
+            return Err(RecordDecodeError);
+        }
+    }
+    Ok(())
+}
+
+fn validate_closeout_event_bindings(
+    retained_journal: &RetainedJournal,
+    entry: &RetainedJournalEntry,
+    record_bytes: &[u8],
+    records: &[(RecordId, Vec<u8>)],
+) -> Result<(), RecordDecodeError> {
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 50)?;
+    let mut authorities = Vec::new();
+    let mut identities = Vec::new();
+    let mut predecessor_closeout_id = None;
+    let mut operation_start = None;
+    let mut freeze_reference = None;
+    let mut policy_reference = None;
+    let mut manifest_id = None;
+    let mut pre_verification_present = false;
+    let mut bootstrap_scope = None;
+    let mut bootstrap_authorities = Vec::new();
+    let mut formal_bindings = Vec::new();
+    let mut resolved_record_candidates = Vec::new();
+    let mut resolved_journal_candidates = Vec::new();
+    let mut failed_record_candidates = Vec::new();
+    let mut failed_journal_candidates = Vec::new();
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        match key {
+            17 | 21 | 22 => {
+                let expected_event_type = match key {
+                    17 => 101,
+                    21 => 200,
+                    22 => 400,
+                    _ => unreachable!(),
+                };
+                let reference = decode_typed_journal_reference_for_binding(
+                    &mut cursor,
+                    &[expected_event_type],
+                )?;
+                if key == 17 {
+                    freeze_reference = Some(reference.clone());
+                } else if key == 21 {
+                    pre_verification_present = true;
+                    resolved_journal_candidates.push((7, reference.clone()));
+                    resolved_record_candidates
+                        .push((7, record_id_from_event_reference(&reference)));
+                } else if key == 22 {
+                    policy_reference = Some(reference.clone());
+                }
+                authorities.push(reference);
+            }
+            19 | 20 | 26 | 27 => {
+                let expected_event_type = match key {
+                    19 => 302,
+                    20 => 200,
+                    26 => 806,
+                    27 => 808,
+                    _ => unreachable!(),
+                };
+                let references = decode_typed_journal_reference_set_for_binding(
+                    &mut cursor,
+                    &[expected_event_type],
+                )?;
+                if key == 26 {
+                    bootstrap_authorities = references.clone();
+                }
+                let candidate_role = match key {
+                    19 => 5,
+                    20 => 6,
+                    26 => 12,
+                    27 => 13,
+                    _ => unreachable!(),
+                };
+                resolved_journal_candidates.extend(
+                    references
+                        .iter()
+                        .cloned()
+                        .map(|reference| (candidate_role, reference)),
+                );
+                resolved_record_candidates.extend(
+                    references.iter().map(|reference| {
+                        (candidate_role, record_id_from_event_reference(reference))
+                    }),
+                );
+                authorities.extend(references);
+            }
+            18 | 23 => {
+                let record_id = decode_record_id_for_binding(&mut cursor)?;
+                if key == 18 {
+                    manifest_id = Some(record_id);
+                    resolved_record_candidates.push((14, record_id));
+                } else {
+                    bootstrap_scope = Some(record_id);
+                }
+                identities.push(record_id);
+            }
+            24 => {
+                let record_id = decode_record_id_for_binding(&mut cursor)?;
+                predecessor_closeout_id = Some(record_id);
+                resolved_record_candidates.push((8, record_id));
+            }
+            25 => {
+                cursor.map_exact(2).map_err(|_| RecordDecodeError)?;
+                cursor.key(0).map_err(|_| RecordDecodeError)?;
+                let verification_references =
+                    decode_typed_journal_reference_set_for_binding(&mut cursor, &[803])?;
+                resolved_journal_candidates.extend(
+                    verification_references
+                        .iter()
+                        .cloned()
+                        .map(|reference| (9, reference)),
+                );
+                resolved_record_candidates.extend(
+                    verification_references
+                        .iter()
+                        .map(|reference| (9, record_id_from_event_reference(reference))),
+                );
+                authorities.extend(verification_references);
+                cursor.key(1).map_err(|_| RecordDecodeError)?;
+                let count = cursor.array().map_err(|_| RecordDecodeError)?;
+                for _ in 0..count {
+                    let fields = cursor.map().map_err(|_| RecordDecodeError)?;
+                    if !matches!(fields, 2 | 3) {
+                        return Err(RecordDecodeError);
+                    }
+                    cursor.key(0).map_err(|_| RecordDecodeError)?;
+                    let definition =
+                        decode_typed_journal_reference_for_binding(&mut cursor, &[800])?;
+                    cursor.key(1).map_err(|_| RecordDecodeError)?;
+                    let establishment =
+                        decode_typed_journal_reference_for_binding(&mut cursor, &[801])?;
+                    let compatibility = if fields == 3 {
+                        cursor.key(2).map_err(|_| RecordDecodeError)?;
+                        Some(decode_typed_journal_reference_for_binding(
+                            &mut cursor,
+                            &[804],
+                        )?)
+                    } else {
+                        None
+                    };
+                    resolved_journal_candidates.push((10, establishment.clone()));
+                    resolved_record_candidates
+                        .push((10, record_id_from_event_reference(&establishment)));
+                    resolved_journal_candidates.extend(
+                        compatibility
+                            .iter()
+                            .cloned()
+                            .map(|reference| (11, reference)),
+                    );
+                    resolved_record_candidates.extend(
+                        compatibility
+                            .iter()
+                            .map(|reference| (11, record_id_from_event_reference(reference))),
+                    );
+                    authorities.push(definition.clone());
+                    authorities.push(establishment.clone());
+                    authorities.extend(compatibility.iter().cloned());
+                    formal_bindings.push((definition, establishment, compatibility));
+                }
+            }
+            28 => {
+                failed_record_candidates
+                    .extend(decode_failed_candidate_record_set_with_values(&mut cursor, 5..=14)?.1);
+            }
+            29 => {
+                failed_journal_candidates.extend(
+                    decode_failed_candidate_journal_set_with_values(&mut cursor, 5..=14)?.1,
+                );
+            }
+            31 => {
+                operation_start =
+                    Some(decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?);
+            }
+            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+        }
+    }
+    if let Some(predecessor_id) = predecessor_closeout_id {
+        let mut matching = entry.authority_dependencies().iter().filter(|reference| {
+            reference.event_type_id().value() == 500
+                && reference.event_record_id().as_bytes() == predecessor_id.as_bytes()
+        });
+        let predecessor = matching.next().ok_or(RecordDecodeError)?;
+        if matching.next().is_some() {
+            return Err(RecordDecodeError);
+        }
+        authorities.push(predecessor.clone());
+        resolved_journal_candidates.push((8, predecessor.clone()));
+        resolved_record_candidates.push((8, record_id_from_event_reference(predecessor)));
+    }
+    if failed_record_candidates
+        .iter()
+        .any(|candidate| resolved_record_candidates.contains(candidate))
+        || failed_journal_candidates
+            .iter()
+            .any(|candidate| resolved_journal_candidates.contains(candidate))
+    {
+        return Err(RecordDecodeError);
+    }
+    validate_exact_authority_dependencies(entry, &authorities)?;
+    validate_exact_identity_dependencies(entry, identities)?;
+    for reference in authorities.iter().chain(operation_start.as_ref()) {
+        validate_resolved_prior_reference(retained_journal, entry, reference)?;
+    }
+    let freeze_reference = freeze_reference.as_ref().ok_or(RecordDecodeError)?;
+    let freeze = FreezeReceiptRecord::decode_authoritative(record_bytes_for_reference(
+        records,
+        freeze_reference,
+    )?)?;
+    if manifest_id != Some(freeze.input().manifest_id) {
+        return Err(RecordDecodeError);
+    }
+    let policy_reference = policy_reference.as_ref().ok_or(RecordDecodeError)?;
+    let policy =
+        decode_policy_closeout_facts(record_bytes_for_reference(records, policy_reference)?)?;
+    if !policy.supports_closeout_creation
+        || pre_verification_present != policy.closeout_postconditions_present
+        || bootstrap_scope != policy.bootstrap_scope
+        || !bootstrap_authorities.is_empty() != policy.bootstrap_scope.is_some()
+    {
+        return Err(RecordDecodeError);
+    }
+    if let Some(required_scope) = bootstrap_scope {
+        validate_closeout_bootstrap_scopes(records, &bootstrap_authorities, required_scope)?;
+    }
+    for (definition, establishment, compatibility) in formal_bindings {
+        validate_closeout_formal_binding(
+            records,
+            &definition,
+            &establishment,
+            compatibility.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_authoritative_event_records(
+    retained_journal: &RetainedJournal,
+    records: &[(RecordId, Vec<u8>)],
+) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+    for entry in &retained_journal.entries {
+        let event_reference = JournalReference::new(
+            entry.registry_id(),
+            entry.entry_index(),
+            entry.entry_hash(),
+            entry.event_type_id(),
+            entry.event_record_id(),
+        );
+        let record_id = record_id_from_event_reference(&event_reference);
+        let record_bytes = records
+            .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(record_id.as_bytes()))
+            .ok()
+            .map(|index| records[index].1.as_slice())
+            .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordUnavailable)?;
+        validate_event_record_structural_binding(retained_journal, &event_reference, record_bytes)
+            .map_err(AuthoritativeRegistryStoreOpenError::EventRecordBinding)?;
+        let frame = StrictRecordFrame::decode_authoritative(record_bytes)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+        let expected_record_type = expected_record_type_for_event(entry.event_type_id().value())
+            .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+        if frame.record_type_id().value() != expected_record_type {
+            return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+        }
+        validate_event_record_type_local_schema(entry.event_type_id().value(), record_bytes)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+        validate_event_record_lifecycle_binding(entry, record_bytes)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+        validate_redundant_event_specific_bindings(entry, record_bytes)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+        validate_event_record_reference_bindings(retained_journal, entry, record_bytes, records)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+
+        match entry.event_type_id().value() {
+            1 => {
+                GenesisRecord::decode_authoritative(record_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            }
+            100 => {
+                let record = FreezeAttemptStartRecord::decode_authoritative(record_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                if record.input().freeze_attempt_id.as_bytes() != &entry.lifecycle_object_id()
+                    || entry.freeze_attempt_intended_root_id()
+                        != Some(record.input().intended_root_id)
+                    || derive_freeze_root(entry.registry_id(), record.input().freeze_attempt_id)
+                        .intended_root_id()
+                        != record.input().intended_root_id
+                {
+                    return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+                }
+                let policy_bytes = records
+                    .binary_search_by(|(stored_id, _)| {
+                        stored_id
+                            .as_bytes()
+                            .cmp(record.input().policy_record_id.as_bytes())
+                    })
+                    .ok()
+                    .map(|index| records[index].1.as_slice())
+                    .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                validate_policy_record_schema(policy_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                if !decode_policy_supported_contexts(policy_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+                    .contains(&1)
+                {
+                    return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+                }
+            }
+            101 => {
+                match validate_resolved_freeze_committed_binding(
+                    retained_journal,
+                    event_reference.clone(),
+                    &RecordNamespaceResolver(records),
+                )
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+                {
+                    ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable => {}
+                }
+                validate_freeze_commit_policy_requirements(record_bytes, records)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                let record = FreezeReceiptRecord::decode_authoritative(record_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                if record.input().freeze_attempt_id.as_bytes() != &entry.lifecycle_object_id() {
+                    return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+                }
+            }
+            300 => {
+                validate_review_request_recorded_binding(
+                    retained_journal,
+                    &event_reference,
+                    record_bytes,
+                )
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                let request = ReviewRequestRecord::decode_authoritative(record_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                validate_review_request_replay_contract(retained_journal, entry, &request, records)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            }
+            301 => {
+                validate_review_result_recorded_binding(
+                    retained_journal,
+                    &event_reference,
+                    record_bytes,
+                )
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                let result = ReviewResultRecord::decode_authoritative(record_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                validate_review_result_replay_contract(retained_journal, entry, &result, records)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            }
+            302 | 303 => {
+                validate_review_admission_event_bindings(
+                    retained_journal,
+                    entry,
+                    record_bytes,
+                    records,
+                )
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            }
+            400 => {
+                validate_policy_event_bindings(retained_journal, entry, record_bytes)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            }
+            500 | 501 => {
+                validate_closeout_event_bindings(retained_journal, entry, record_bytes, records)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            }
+            _ => {}
+        }
+        if event_semantic_authority_is_unavailable(entry.event_type_id().value(), record_bytes)
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+        {
+            return Err(AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn event_semantic_authority_is_unavailable(
+    event_type: u16,
+    record_bytes: &[u8],
+) -> Result<bool, RecordDecodeError> {
+    if matches!(event_type, 200 | 302 | 303 | 500 | 501 | 600 | 700) {
+        // The retained inputs do not uniquely re-establish all frozen contextual semantics for
+        // these families: Verification-to-Freeze/Manifest continuity remains incomplete; generic
+        // Review Admission and Closeout Policy satisfaction require an unassigned generic
+        // gate-Scope relation; capability transition sets lack a frozen capability-ID mapping; and
+        // Manifest-relative eviction Scope validation lacks assigned selected-profile semantics.
+        // Type-local, event/body, dependency, and otherwise decidable contextual checks run before
+        // this gate so malformed histories retain their more precise classification. A locally
+        // valid event in any of these families still cannot enter positive authoritative replay.
+        return Ok(true);
+    }
+    if event_type != 801 {
+        return Ok(false);
+    }
+    let (mut cursor, field_count) = decode_event_record_body(record_bytes, 81)?;
+    let mut cached_provenance_present = false;
+    for _ in 0..field_count {
+        let key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        if key == 25 {
+            cached_provenance_present = true;
+        }
+        cursor.skip_value().map_err(|_| RecordDecodeError)?;
+    }
+    // The frozen bytes provide no independent witness that key-25 omission represents an
+    // operation-time fresh observation. Cached observations remain supported through their exact
+    // type-63 provenance Record.
+    Ok(!cached_provenance_present)
+}
+
+fn expected_record_type_for_event(event_type: u16) -> Option<u16> {
+    match event_type {
+        1 => Some(1),
+        100 => Some(3),
+        101 => Some(4),
+        102 => Some(5),
+        103 => Some(6),
+        104 => Some(7),
+        200 => Some(12),
+        300 => Some(30),
+        301 => Some(31),
+        302 | 303 => Some(32),
+        400 => Some(40),
+        500 | 501 => Some(50),
+        600 => Some(62),
+        700 => Some(71),
+        701..=703 => Some(72),
+        800..=808 => Some(80 + (event_type - 800)),
+        _ => None,
+    }
 }
 
 fn parse_record_filename(name: &str) -> Option<RecordId> {
@@ -837,4 +5349,2154 @@ fn parse_record_filename(name: &str) -> Option<RecordId> {
 fn record_id_from_event_reference(reference: &JournalReference) -> RecordId {
     RecordId::try_from(reference.event_record_id().as_bytes().as_slice())
         .expect("EventRecordId has RecordId width")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn store_open_fails_without_mandatory_retained_generation_protection() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-open-protection-unavailable-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "store-open-protection-test".to_owned(),
+        })
+        .unwrap();
+        let genesis_entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        fs::write(
+            root.join("registry/genesis.cbor"),
+            genesis_record.authoritative_cbor(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            genesis_entry.authoritative_cbor(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            AuthoritativeRegistryStore::open(&root).unwrap_err(),
+            AuthoritativeRegistryStoreOpenError::RetainedGenerationProtectionUnavailable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn store_open_rejects_authority_bytes_changed_after_replay_before_positive_return() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-open-generation-race-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "store-open-generation-race-test".to_owned(),
+        })
+        .unwrap();
+        let genesis_entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        let genesis_path = root.join("registry/genesis.cbor");
+        fs::write(&genesis_path, genesis_record.authoritative_cbor()).unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            genesis_entry.authoritative_cbor(),
+        )
+        .unwrap();
+
+        let result = AuthoritativeRegistryStore::open_with_generation_hook(&root, || {
+            let mut changed = genesis_record.authoritative_cbor();
+            changed[0] ^= 1;
+            fs::write(&genesis_path, changed).unwrap();
+        });
+
+        assert_eq!(
+            result.unwrap_err(),
+            AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authoritative_publication_lock_serializes_terminal_writers() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-publication-lock-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+
+        let first = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        assert!(acquire_authoritative_publication_lock(&root, &root_hold).is_err());
+        drop(first);
+        let second = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        drop(second);
+
+        fs::remove_file(root.join(".evidence-registry-publication.lock")).unwrap();
+        drop(root_hold);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_held_handle_promotion_is_single_name_and_no_replace() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-held-promotion-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let temp = root.join("candidate.tmp");
+        let final_path = root.join("final.cbor");
+        let mut file = create_owned_publication_temp(&temp).unwrap();
+        file.write_all(b"authoritative bytes").unwrap();
+        file.sync_all().unwrap();
+
+        let parent_hold = open_publication_directory_hold(&root).unwrap();
+        assert_eq!(
+            sync_retained_directory(&root, &parent_hold),
+            Ok(DurabilityActionState::Performed)
+        );
+        assert!(
+            fs::rename(&root, root.with_extension("displaced")).is_err(),
+            "the publication-parent handle must deny replacement through its durability boundary"
+        );
+        assert_eq!(
+            promote_held_file_no_replace(&file, &parent_hold, &final_path),
+            Ok(HeldFilePromotion::Published)
+        );
+        assert!(!temp.exists());
+        assert_eq!(fs::read(&final_path).unwrap(), b"authoritative bytes");
+        assert_eq!(windows_file_identity(&file).unwrap().link_count, 1);
+        drop(file);
+
+        let second_temp = root.join("competitor.tmp");
+        let mut competitor = create_owned_publication_temp(&second_temp).unwrap();
+        competitor.write_all(b"competitor bytes").unwrap();
+        competitor.sync_all().unwrap();
+        let competing_outcome =
+            promote_held_file_no_replace(&competitor, &parent_hold, &final_path);
+        assert_eq!(
+            (
+                competing_outcome,
+                fs::read(&final_path).unwrap(),
+                second_temp.exists()
+            ),
+            (
+                Ok(HeldFilePromotion::Conflict),
+                b"authoritative bytes".to_vec(),
+                true
+            )
+        );
+        assert_eq!(fs::read(&final_path).unwrap(), b"authoritative bytes");
+        assert_eq!(fs::read(&second_temp).unwrap(), b"competitor bytes");
+
+        remove_owned_publication_temp(competitor, &second_temp).unwrap();
+        assert!(!second_temp.exists());
+        fs::remove_file(final_path).unwrap();
+        drop(parent_hold);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_post_visibility_failure_is_an_explicit_uncertain_publication() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-visible-uncertain-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let parent_hold = open_publication_directory_hold(&root).unwrap();
+
+        let outcome = publish_new_immutable_file_with_hooks(
+            &root,
+            &parent_hold,
+            Path::new("terminal.cbor"),
+            b"terminal bytes",
+            || {},
+            || Err(()),
+        );
+
+        assert!(matches!(
+            outcome,
+            Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain)
+        ));
+        assert_eq!(
+            fs::read(root.join("terminal.cbor")).unwrap(),
+            b"terminal bytes"
+        );
+
+        fs::remove_file(root.join("terminal.cbor")).unwrap();
+        drop(parent_hold);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_directory_open_is_root_handle_relative() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "evidence-registry-relative-open-{}-{sequence}",
+            std::process::id()
+        ));
+        let original_root = parent.join("root");
+        let moved_root = parent.join("moved-root");
+        fs::create_dir_all(original_root.join("registry")).unwrap();
+        fs::write(original_root.join("registry/original"), b"original").unwrap();
+        let root_hold = open_windows_identity_handle(&original_root, true).unwrap();
+        fs::rename(&original_root, &moved_root).unwrap();
+        fs::create_dir_all(original_root.join("registry")).unwrap();
+        fs::write(original_root.join("registry/replacement"), b"replacement").unwrap();
+
+        let child = open_child_directory_hold(&root_hold, &original_root, "registry").unwrap();
+        let moved_child = open_real_directory_hold(&moved_root.join("registry")).unwrap();
+        let replacement_child = open_real_directory_hold(&original_root.join("registry")).unwrap();
+        assert!(handles_identify_same_object(&child, &moved_child));
+        assert!(!handles_identify_same_object(&child, &replacement_child));
+
+        let displaced_child = moved_root.join("registry-displaced");
+        let rename = fs::rename(moved_root.join("registry"), &displaced_child);
+        if rename.is_ok() {
+            fs::rename(&displaced_child, moved_root.join("registry")).unwrap();
+        }
+        assert!(
+            rename.is_err(),
+            "the rooted child hold must deny namespace substitution while pathname reads occur"
+        );
+
+        drop(replacement_child);
+        drop(moved_child);
+        drop(child);
+        drop(root_hold);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_child_directory_open_is_root_handle_relative() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "evidence-registry-relative-open-{}-{sequence}",
+            std::process::id()
+        ));
+        let original_root = parent.join("root");
+        let moved_root = parent.join("moved-root");
+        fs::create_dir_all(original_root.join("registry")).unwrap();
+        fs::write(original_root.join("registry/original"), b"original").unwrap();
+        let root_hold = open_real_directory_hold(&original_root).unwrap();
+        fs::rename(&original_root, &moved_root).unwrap();
+        fs::create_dir_all(original_root.join("registry")).unwrap();
+        fs::write(original_root.join("registry/replacement"), b"replacement").unwrap();
+
+        let child = open_child_directory_hold(&root_hold, &original_root, "registry").unwrap();
+        let moved_child = open_real_directory_hold(&moved_root.join("registry")).unwrap();
+        let replacement_child = open_real_directory_hold(&original_root.join("registry")).unwrap();
+        assert!(handles_identify_same_object(&child, &moved_child));
+        assert!(!handles_identify_same_object(&child, &replacement_child));
+
+        drop(replacement_child);
+        drop(moved_child);
+        drop(child);
+        drop(root_hold);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_publication_stays_bound_to_the_retained_parent_generation() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let outer = std::env::temp_dir().join(format!(
+            "evidence-registry-rooted-publication-{}-{sequence}",
+            std::process::id()
+        ));
+        let parent = outer.join("records");
+        let displaced = outer.join("records-displaced");
+        fs::create_dir_all(&parent).unwrap();
+        let parent_hold = open_real_directory_hold(&parent).unwrap();
+
+        assert!(matches!(
+            publish_new_immutable_file_with_hook(
+                &parent,
+                &parent_hold,
+                Path::new("final.cbor"),
+                b"owned",
+                || {
+                    fs::rename(&parent, &displaced).unwrap();
+                    fs::create_dir(&parent).unwrap();
+                },
+            ),
+            Err(())
+        ));
+        assert!(!parent.join("final.cbor").exists());
+        assert!(!displaced.join("final.cbor").exists());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&displaced).unwrap().count(), 0);
+
+        drop(parent_hold);
+        fs::remove_dir(parent).unwrap();
+        fs::remove_dir(displaced).unwrap();
+        fs::remove_dir(outer).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn retained_directory_sync_rejects_path_replacement() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "evidence-registry-held-directory-sync-{}-{sequence}",
+            std::process::id()
+        ));
+        let original = parent.join("namespace");
+        let displaced = parent.join("namespace-displaced");
+        fs::create_dir_all(&original).unwrap();
+        let hold = open_real_directory_hold(&original).unwrap();
+        fs::rename(&original, &displaced).unwrap();
+        fs::create_dir(&original).unwrap();
+
+        assert_eq!(sync_retained_directory(&original, &hold), Err(()));
+
+        drop(hold);
+        fs::remove_dir(original).unwrap();
+        fs::remove_dir(displaced).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn file_rename_information_layout_supports_32_and_64_bit_windows_abi() {
+        assert_eq!(
+            file_rename_information_layout(4),
+            Some(FileRenameInformationLayout {
+                root_directory_offset: 4,
+                file_name_length_offset: 8,
+                file_name_offset: 12,
+                allocation_header_size: 16,
+                alignment: 4,
+            })
+        );
+        assert_eq!(
+            file_rename_information_layout(8),
+            Some(FileRenameInformationLayout {
+                root_directory_offset: 8,
+                file_name_length_offset: 16,
+                file_name_offset: 20,
+                allocation_header_size: 24,
+                alignment: 8,
+            })
+        );
+        assert_eq!(file_rename_information_layout(16), None);
+    }
+
+    #[test]
+    fn every_frozen_event_rejects_a_frame_valid_but_schema_incomplete_record() {
+        let mappings = [
+            (1, 1),
+            (100, 3),
+            (101, 4),
+            (102, 5),
+            (103, 6),
+            (104, 7),
+            (200, 12),
+            (300, 30),
+            (301, 31),
+            (302, 32),
+            (303, 32),
+            (400, 40),
+            (500, 50),
+            (501, 50),
+            (600, 62),
+            (700, 71),
+            (701, 72),
+            (702, 72),
+            (703, 72),
+            (800, 80),
+            (801, 81),
+            (802, 82),
+            (803, 83),
+            (804, 84),
+            (805, 85),
+            (806, 86),
+            (807, 87),
+            (808, 88),
+        ];
+        for (event_type, record_type) in mappings {
+            let mut bytes = Vec::new();
+            bytes.push(0x84);
+            encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+            encode_uint(&mut bytes, record_type);
+            encode_uint(&mut bytes, 1);
+            bytes.push(0xa2);
+            bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+            encode_uint(&mut bytes, record_type);
+            assert!(StrictRecordFrame::decode_authoritative(&bytes).is_ok());
+            assert_eq!(
+                validate_event_record_type_local_schema(event_type, &bytes),
+                Err(RecordDecodeError),
+                "event_type_id={event_type} must require its complete type-local schema"
+            );
+        }
+    }
+
+    #[test]
+    fn freeze_commit_rejection_accepts_any_structural_attempted_transition_event_type() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(100).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let conflicting = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(2).unwrap(),
+            JournalEntryHash::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(102).unwrap(),
+            EventRecordId::try_from([0x50; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 7);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa7);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x07, 0x10]);
+        encode_bstr_32(&mut bytes, &[0x60; ID_LENGTH]);
+        bytes.push(0x11);
+        bytes.extend_from_slice(&start.authoritative_cbor());
+        bytes.push(0x12);
+        bytes.extend_from_slice(&conflicting.authoritative_cbor());
+        bytes.push(0x13);
+        encode_uint(&mut bytes, 102);
+        bytes.push(0x14);
+        encode_text(&mut bytes, "ATTEMPT_ALREADY_TERMINAL");
+
+        assert_eq!(validate_event_record_type_local_schema(104, &bytes), Ok(()));
+    }
+
+    #[test]
+    fn closeout_rejects_failed_candidate_roles_outside_the_closeout_role_registry() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let reference = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(101).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 50);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xab);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 50, 0x10, 0x02, 0x11]);
+        bytes.extend_from_slice(&reference.authoritative_cbor());
+        bytes.push(0x12);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x13, 0x80, 0x14, 0x80, 0x16]);
+        bytes.extend_from_slice(&reference.authoritative_cbor());
+        bytes.extend_from_slice(&[0x18, 0x1c, 0x81, 0xa3, 0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, &[0x50; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x02, 0x14, 0x18, 0x1e, 0x81]);
+        encode_text(&mut bytes, "REJECTED");
+        bytes.extend_from_slice(&[0x18, 0x1f]);
+        bytes.extend_from_slice(&reference.authoritative_cbor());
+
+        assert_eq!(
+            validate_event_record_type_local_schema(501, &bytes),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn closeout_rejects_a_resolved_and_failed_predecessor_closeout_combination() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let reference = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(101).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 50);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 50, 0x10, 0x02, 0x11]);
+        bytes.extend_from_slice(&reference.authoritative_cbor());
+        bytes.push(0x12);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x13, 0x80, 0x14, 0x80, 0x16]);
+        bytes.extend_from_slice(&reference.authoritative_cbor());
+        bytes.extend_from_slice(&[0x18, 0x18]);
+        encode_bstr_32(&mut bytes, &[0x50; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x18, 0x1c, 0x81, 0xa3, 0x00, 0x08, 0x01]);
+        encode_bstr_32(&mut bytes, &[0x60; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x02, 0x14, 0x18, 0x1e, 0x81]);
+        encode_text(&mut bytes, "REJECTED");
+        bytes.extend_from_slice(&[0x18, 0x1f]);
+        bytes.extend_from_slice(&reference.authoritative_cbor());
+
+        assert_eq!(
+            validate_event_record_type_local_schema(501, &bytes),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn closeout_rejects_resolved_predecessor_with_failed_journal_candidate() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let freeze = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(101).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let predecessor = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(2).unwrap(),
+            JournalEntryHash::try_from([0x21; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(500).unwrap(),
+            EventRecordId::try_from([0x50; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 50);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 50, 0x10, 0x02, 0x11]);
+        bytes.extend_from_slice(&freeze.authoritative_cbor());
+        bytes.push(0x12);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x13, 0x80, 0x14, 0x80, 0x16]);
+        bytes.extend_from_slice(&freeze.authoritative_cbor());
+        bytes.extend_from_slice(&[0x18, 0x18]);
+        encode_bstr_32(&mut bytes, predecessor.event_record_id().as_bytes());
+        bytes.extend_from_slice(&[0x18, 0x1d, 0x81, 0xa3, 0x00, 0x08, 0x01]);
+        bytes.extend_from_slice(&predecessor.authoritative_cbor());
+        bytes.extend_from_slice(&[0x02, 0x01, 0x18, 0x1e, 0x81]);
+        encode_text(&mut bytes, "REJECTED");
+        bytes.extend_from_slice(&[0x18, 0x1f]);
+        bytes.extend_from_slice(&freeze.authoritative_cbor());
+
+        assert_eq!(
+            validate_event_record_type_local_schema(501, &bytes),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn closeout_authority_dependencies_treat_reused_formal_authority_as_one_set_member() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let shared_definition = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(800).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(2).unwrap(),
+            previous_entry_hash: shared_definition.entry_hash(),
+            event_type_id: EventTypeId::try_from(500).unwrap(),
+            event_record_id: EventRecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            storage_capability_class_id: RecordId::try_from([0x50; ID_LENGTH].as_slice()).unwrap(),
+            environment_observation_id: RecordId::try_from([0x60; ID_LENGTH].as_slice()).unwrap(),
+            lifecycle_object_kind: LifecycleObjectKind::Registry,
+            lifecycle_object_id: *registry_id.as_bytes(),
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: vec![shared_definition.clone()],
+            },
+            authoritative_bytes: Vec::new(),
+        });
+
+        assert_eq!(
+            validate_exact_authority_dependencies(
+                &entry,
+                &[shared_definition.clone(), shared_definition]
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn closeout_replay_rejects_candidates_marked_both_resolved_and_failed() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            storage,
+            environment,
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let operation_start = journal.current_head_reference();
+
+        let mut policy_bytes = Vec::new();
+        policy_bytes.push(0x84);
+        encode_text(&mut policy_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut policy_bytes, 40);
+        encode_uint(&mut policy_bytes, 1);
+        policy_bytes.push(0xa5);
+        policy_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+        encode_bstr_32(&mut policy_bytes, &[0x41; ID_LENGTH]);
+        policy_bytes.extend_from_slice(&[0x18, 0x1d]);
+        policy_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        policy_bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x03]);
+        let policy_id = StrictRecordFrame::decode_authoritative(&policy_bytes)
+            .unwrap()
+            .record_id();
+
+        let manifest_id = RecordId::try_from([0x42; ID_LENGTH].as_slice()).unwrap();
+        let mut receipt_bytes = Vec::new();
+        receipt_bytes.push(0x84);
+        encode_text(&mut receipt_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut receipt_bytes, 4);
+        encode_uint(&mut receipt_bytes, 1);
+        receipt_bytes.push(0xb1);
+        receipt_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x04, 0x10]);
+        encode_bstr_32(&mut receipt_bytes, &[0x43; ID_LENGTH]);
+        receipt_bytes.push(0x11);
+        encode_bstr_32(&mut receipt_bytes, &[0x44; ID_LENGTH]);
+        receipt_bytes.push(0x12);
+        receipt_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        receipt_bytes.push(0x13);
+        encode_bstr_32(&mut receipt_bytes, &[0x45; ID_LENGTH]);
+        receipt_bytes.push(0x14);
+        encode_bstr_32(&mut receipt_bytes, manifest_id.as_bytes());
+        receipt_bytes.extend_from_slice(&[0x15, 0x01, 0x16]);
+        encode_bstr_32(&mut receipt_bytes, &[0x46; ID_LENGTH]);
+        receipt_bytes.extend_from_slice(&[0x17, 0x01, 0x18, 0x18]);
+        encode_bstr_32(&mut receipt_bytes, &[0x47; ID_LENGTH]);
+        receipt_bytes.extend_from_slice(&[0x18, 0x19]);
+        encode_bstr_32(&mut receipt_bytes, policy_id.as_bytes());
+        receipt_bytes.extend_from_slice(&[
+            0x18, 0x1a, 0x01, 0x18, 0x1b, 0x01, 0x18, 0x1c, 0x01, 0x18, 0x1d, 0xf4, 0x18, 0x1f,
+        ]);
+        encode_text(&mut receipt_bytes, "closeout-overlap-test");
+        let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes).unwrap();
+
+        let append_authority = |journal: &mut RetainedJournal,
+                                event_type: u16,
+                                record_id: RecordId,
+                                marker: u8| {
+            let previous = journal.current_head_reference();
+            journal
+                .entries
+                .push(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                    registry_id,
+                    entry_index: JournalEntryIndex::try_from(previous.entry_index().value() + 1)
+                        .unwrap(),
+                    previous_entry_hash: previous.entry_hash(),
+                    event_type_id: EventTypeId::try_from(u64::from(event_type)).unwrap(),
+                    event_record_id: EventRecordId::try_from(record_id.as_bytes().as_slice())
+                        .unwrap(),
+                    storage_capability_class_id: storage,
+                    environment_observation_id: environment,
+                    lifecycle_object_kind: EventTypeId::try_from(u64::from(event_type))
+                        .unwrap()
+                        .lifecycle_object_kind(),
+                    lifecycle_object_id: *record_id.as_bytes(),
+                    freeze_attempt_intended_root_id: None,
+                    identity_dependencies: IdentityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authority_dependencies: AuthorityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authoritative_bytes: vec![marker],
+                }));
+            journal.current_head_reference()
+        };
+        let freeze_reference = append_authority(&mut journal, 101, receipt.record_id(), 0x51);
+        let review_record_id = RecordId::try_from([0x52; ID_LENGTH].as_slice()).unwrap();
+        let review_reference = append_authority(&mut journal, 302, review_record_id, 0x52);
+        let policy_reference = append_authority(&mut journal, 400, policy_id, 0x53);
+
+        let mut closeout_bytes = Vec::new();
+        closeout_bytes.push(0x84);
+        encode_text(&mut closeout_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut closeout_bytes, 50);
+        encode_uint(&mut closeout_bytes, 1);
+        closeout_bytes.push(0xab);
+        closeout_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 50, 0x10, 0x02, 0x11]);
+        closeout_bytes.extend_from_slice(&freeze_reference.authoritative_cbor());
+        closeout_bytes.push(0x12);
+        encode_bstr_32(&mut closeout_bytes, manifest_id.as_bytes());
+        closeout_bytes.extend_from_slice(&[0x13, 0x81]);
+        closeout_bytes.extend_from_slice(&review_reference.authoritative_cbor());
+        closeout_bytes.extend_from_slice(&[0x14, 0x80, 0x16]);
+        closeout_bytes.extend_from_slice(&policy_reference.authoritative_cbor());
+        closeout_bytes.extend_from_slice(&[0x18, 0x1d, 0x81, 0xa3, 0x00, 0x05, 0x01]);
+        closeout_bytes.extend_from_slice(&review_reference.authoritative_cbor());
+        closeout_bytes.extend_from_slice(&[0x02, 0x01, 0x18, 0x1e, 0x81]);
+        encode_text(&mut closeout_bytes, "REVIEW_REJECTED");
+        closeout_bytes.extend_from_slice(&[0x18, 0x1f]);
+        closeout_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        let closeout_id = StrictRecordFrame::decode_authoritative(&closeout_bytes)
+            .unwrap()
+            .record_id();
+        let closeout_entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(
+                journal.current_head_reference().entry_index().value() + 1,
+            )
+            .unwrap(),
+            previous_entry_hash: journal.current_head_reference().entry_hash(),
+            event_type_id: EventTypeId::try_from(501).unwrap(),
+            event_record_id: EventRecordId::try_from(closeout_id.as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id: storage,
+            environment_observation_id: environment,
+            lifecycle_object_kind: EventTypeId::try_from(501).unwrap().lifecycle_object_kind(),
+            lifecycle_object_id: *closeout_id.as_bytes(),
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: vec![IdentityDependency::RecordId(manifest_id)],
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: vec![
+                    freeze_reference.clone(),
+                    review_reference.clone(),
+                    policy_reference.clone(),
+                ],
+            },
+            authoritative_bytes: Vec::new(),
+        });
+        let mut records = vec![
+            (receipt.record_id(), receipt_bytes),
+            (policy_id, policy_bytes),
+        ];
+        records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+
+        assert_eq!(
+            validate_closeout_event_bindings(&journal, &closeout_entry, &closeout_bytes, &records,),
+            Err(RecordDecodeError)
+        );
+
+        let mut manifest_overlap_bytes = Vec::new();
+        manifest_overlap_bytes.push(0x84);
+        encode_text(&mut manifest_overlap_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut manifest_overlap_bytes, 50);
+        encode_uint(&mut manifest_overlap_bytes, 1);
+        manifest_overlap_bytes.push(0xab);
+        manifest_overlap_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 50, 0x10, 0x02, 0x11]);
+        manifest_overlap_bytes.extend_from_slice(&freeze_reference.authoritative_cbor());
+        manifest_overlap_bytes.push(0x12);
+        encode_bstr_32(&mut manifest_overlap_bytes, manifest_id.as_bytes());
+        manifest_overlap_bytes.extend_from_slice(&[0x13, 0x81]);
+        manifest_overlap_bytes.extend_from_slice(&review_reference.authoritative_cbor());
+        manifest_overlap_bytes.extend_from_slice(&[0x14, 0x80, 0x16]);
+        manifest_overlap_bytes.extend_from_slice(&policy_reference.authoritative_cbor());
+        manifest_overlap_bytes.extend_from_slice(&[0x18, 0x1c, 0x81, 0xa3, 0x00, 0x0e, 0x01]);
+        encode_bstr_32(&mut manifest_overlap_bytes, manifest_id.as_bytes());
+        manifest_overlap_bytes.extend_from_slice(&[0x02, 0x14, 0x18, 0x1e, 0x81]);
+        encode_text(&mut manifest_overlap_bytes, "MANIFEST_REJECTED");
+        manifest_overlap_bytes.extend_from_slice(&[0x18, 0x1f]);
+        manifest_overlap_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        let manifest_overlap_id = StrictRecordFrame::decode_authoritative(&manifest_overlap_bytes)
+            .unwrap()
+            .record_id();
+        let manifest_overlap_entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(
+                journal.current_head_reference().entry_index().value() + 1,
+            )
+            .unwrap(),
+            previous_entry_hash: journal.current_head_reference().entry_hash(),
+            event_type_id: EventTypeId::try_from(501).unwrap(),
+            event_record_id: EventRecordId::try_from(manifest_overlap_id.as_bytes().as_slice())
+                .unwrap(),
+            storage_capability_class_id: storage,
+            environment_observation_id: environment,
+            lifecycle_object_kind: EventTypeId::try_from(501).unwrap().lifecycle_object_kind(),
+            lifecycle_object_id: *manifest_overlap_id.as_bytes(),
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: vec![IdentityDependency::RecordId(manifest_id)],
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: vec![
+                    freeze_reference.clone(),
+                    review_reference.clone(),
+                    policy_reference.clone(),
+                ],
+            },
+            authoritative_bytes: Vec::new(),
+        });
+        assert_eq!(
+            validate_closeout_event_bindings(
+                &journal,
+                &manifest_overlap_entry,
+                &manifest_overlap_bytes,
+                &records,
+            ),
+            Err(RecordDecodeError)
+        );
+
+        let mut review_record_overlap_bytes = Vec::new();
+        review_record_overlap_bytes.push(0x84);
+        encode_text(
+            &mut review_record_overlap_bytes,
+            "EvidenceRegistry.Record.v1",
+        );
+        encode_uint(&mut review_record_overlap_bytes, 50);
+        encode_uint(&mut review_record_overlap_bytes, 1);
+        review_record_overlap_bytes.push(0xab);
+        review_record_overlap_bytes
+            .extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 50, 0x10, 0x02, 0x11]);
+        review_record_overlap_bytes.extend_from_slice(&freeze_reference.authoritative_cbor());
+        review_record_overlap_bytes.push(0x12);
+        encode_bstr_32(&mut review_record_overlap_bytes, manifest_id.as_bytes());
+        review_record_overlap_bytes.extend_from_slice(&[0x13, 0x81]);
+        review_record_overlap_bytes.extend_from_slice(&review_reference.authoritative_cbor());
+        review_record_overlap_bytes.extend_from_slice(&[0x14, 0x80, 0x16]);
+        review_record_overlap_bytes.extend_from_slice(&policy_reference.authoritative_cbor());
+        review_record_overlap_bytes.extend_from_slice(&[0x18, 0x1c, 0x81, 0xa3, 0x00, 0x05, 0x01]);
+        encode_bstr_32(
+            &mut review_record_overlap_bytes,
+            review_record_id.as_bytes(),
+        );
+        review_record_overlap_bytes.extend_from_slice(&[0x02, 0x14, 0x18, 0x1e, 0x81]);
+        encode_text(&mut review_record_overlap_bytes, "REVIEW_RECORD_REJECTED");
+        review_record_overlap_bytes.extend_from_slice(&[0x18, 0x1f]);
+        review_record_overlap_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        let review_record_overlap_id =
+            StrictRecordFrame::decode_authoritative(&review_record_overlap_bytes)
+                .unwrap()
+                .record_id();
+        let review_record_overlap_entry =
+            RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                registry_id,
+                entry_index: JournalEntryIndex::try_from(
+                    journal.current_head_reference().entry_index().value() + 1,
+                )
+                .unwrap(),
+                previous_entry_hash: journal.current_head_reference().entry_hash(),
+                event_type_id: EventTypeId::try_from(501).unwrap(),
+                event_record_id: EventRecordId::try_from(
+                    review_record_overlap_id.as_bytes().as_slice(),
+                )
+                .unwrap(),
+                storage_capability_class_id: storage,
+                environment_observation_id: environment,
+                lifecycle_object_kind: EventTypeId::try_from(501).unwrap().lifecycle_object_kind(),
+                lifecycle_object_id: *review_record_overlap_id.as_bytes(),
+                freeze_attempt_intended_root_id: None,
+                identity_dependencies: IdentityDependencyCollection {
+                    elements: vec![IdentityDependency::RecordId(manifest_id)],
+                },
+                authority_dependencies: AuthorityDependencyCollection {
+                    elements: vec![freeze_reference, review_reference, policy_reference],
+                },
+                authoritative_bytes: Vec::new(),
+            });
+        assert_eq!(
+            validate_closeout_event_bindings(
+                &journal,
+                &review_record_overlap_entry,
+                &review_record_overlap_bytes,
+                &records,
+            ),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn policy_recorded_accepts_a_valid_zero_requirement_freeze_commit_policy() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let operation_start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(100).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 40);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa5);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x18, 0x1d]);
+        bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x01]);
+
+        assert_eq!(validate_event_record_type_local_schema(400, &bytes), Ok(()));
+    }
+
+    #[test]
+    fn general_policy_accepts_zero_required_count_as_a_canonical_uint() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let operation_start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(100).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 40);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa6);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x11, 0x81, 0xa5, 0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, &[0x41; ID_LENGTH]);
+        bytes.push(0x02);
+        encode_bstr_32(&mut bytes, &[0x42; ID_LENGTH]);
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, &[0x43; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x04, 0x00, 0x18, 0x1d]);
+        bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x02]);
+
+        assert_eq!(validate_event_record_type_local_schema(400, &bytes), Ok(()));
+    }
+
+    #[test]
+    fn general_policy_rejects_duplicate_review_selectors_with_different_counts() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let operation_start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(100).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 40);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa6);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x11, 0x82]);
+        for required_count in [0_u8, 1] {
+            bytes.extend_from_slice(&[0xa5, 0x00, 0x01, 0x01]);
+            encode_bstr_32(&mut bytes, &[0x41; ID_LENGTH]);
+            bytes.push(0x02);
+            encode_bstr_32(&mut bytes, &[0x42; ID_LENGTH]);
+            bytes.push(0x03);
+            encode_bstr_32(&mut bytes, &[0x43; ID_LENGTH]);
+            bytes.extend_from_slice(&[0x04, required_count]);
+        }
+        bytes.extend_from_slice(&[0x18, 0x1d]);
+        bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x02]);
+
+        assert_eq!(
+            validate_event_record_type_local_schema(400, &bytes),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn general_policy_accepts_zero_as_a_diversity_distinct_count() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let operation_start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(100).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 40);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa6);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x18, 0x1b, 0x81, 0xa2, 0x00, 0x01, 0x01, 0x00]);
+        bytes.extend_from_slice(&[0x18, 0x1d]);
+        bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x03]);
+
+        assert_eq!(validate_event_record_type_local_schema(400, &bytes), Ok(()));
+    }
+
+    #[test]
+    fn general_policy_intervening_event_ids_use_the_event_type_domain() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let operation_start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(100).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let build = |event_type_id: u64| {
+            let mut bytes = Vec::new();
+            bytes.push(0x84);
+            encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+            encode_uint(&mut bytes, 40);
+            encode_uint(&mut bytes, 1);
+            bytes.push(0xa6);
+            bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+            encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+            bytes.extend_from_slice(&[0x15, 0xa1, 0x00, 0x81]);
+            encode_uint(&mut bytes, event_type_id);
+            bytes.extend_from_slice(&[0x18, 0x1d]);
+            bytes.extend_from_slice(&operation_start.authoritative_cbor());
+            bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x03]);
+            bytes
+        };
+
+        assert_eq!(
+            validate_event_record_type_local_schema(400, &build(1)),
+            Ok(())
+        );
+        for invalid in [0, 65_536] {
+            assert_eq!(
+                validate_event_record_type_local_schema(400, &build(invalid)),
+                Err(RecordDecodeError)
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_review_admission_accepts_an_exact_failed_request_candidate() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let operation_start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(100).unwrap(),
+            EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 32);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa6);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 32, 0x10, 0x02]);
+        bytes.extend_from_slice(&[0x14, 0x81, 0xa3, 0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x02, 0x14, 0x16, 0x81]);
+        encode_text(&mut bytes, "REQUEST_INVALID");
+        bytes.push(0x17);
+        bytes.extend_from_slice(&operation_start.authoritative_cbor());
+
+        assert_eq!(validate_event_record_type_local_schema(303, &bytes), Ok(()));
+    }
+
+    #[test]
+    fn rejected_admission_failed_journal_candidates_are_not_identity_dependencies() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+            RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let operation_start = journal.current_head_reference();
+        let failed_candidate = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(99).unwrap(),
+            JournalEntryHash::try_from([0x50; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(300).unwrap(),
+            EventRecordId::try_from([0x60; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut record_bytes = Vec::new();
+        record_bytes.push(0x84);
+        encode_text(&mut record_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut record_bytes, 32);
+        encode_uint(&mut record_bytes, 1);
+        record_bytes.push(0xa6);
+        record_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 32, 0x10, 0x02]);
+        record_bytes.extend_from_slice(&[0x15, 0x81, 0xa3, 0x00, 0x01, 0x01]);
+        record_bytes.extend_from_slice(&failed_candidate.authoritative_cbor());
+        record_bytes.extend_from_slice(&[0x02, 0x01, 0x16, 0x81]);
+        encode_text(&mut record_bytes, "REQUEST_UNAVAILABLE");
+        record_bytes.push(0x17);
+        record_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        let record_id = StrictRecordFrame::decode_authoritative(&record_bytes)
+            .unwrap()
+            .record_id();
+        let entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(1).unwrap(),
+            previous_entry_hash: operation_start.entry_hash(),
+            event_type_id: EventTypeId::try_from(303).unwrap(),
+            event_record_id: EventRecordId::try_from(record_id.as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id: RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+            environment_observation_id: RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            lifecycle_object_kind: LifecycleObjectKind::ReviewAdmissionAttempt,
+            lifecycle_object_id: *record_id.as_bytes(),
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authoritative_bytes: Vec::new(),
+        });
+
+        assert_eq!(
+            validate_review_admission_event_bindings(&journal, &entry, &record_bytes, &[]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn storage_change_does_not_promote_should_identity_bindings_to_must() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let prior_storage = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let new_storage = RecordId::try_from([0x21; ID_LENGTH].as_slice()).unwrap();
+        let prior_environment = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let new_environment = RecordId::try_from([0x31; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            prior_storage,
+            prior_environment,
+        );
+        let journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let operation_start = journal.current_head_reference();
+        let mut record_bytes = Vec::new();
+        record_bytes.push(0x84);
+        encode_text(&mut record_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut record_bytes, 62);
+        encode_uint(&mut record_bytes, 1);
+        record_bytes.push(0xa9);
+        record_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 62, 0x10]);
+        encode_bstr_32(&mut record_bytes, prior_storage.as_bytes());
+        record_bytes.push(0x11);
+        encode_bstr_32(&mut record_bytes, new_storage.as_bytes());
+        record_bytes.push(0x12);
+        encode_bstr_32(&mut record_bytes, prior_environment.as_bytes());
+        record_bytes.push(0x13);
+        encode_bstr_32(&mut record_bytes, new_environment.as_bytes());
+        record_bytes.extend_from_slice(&[0x14, 0x80, 0x15, 0x80, 0x16]);
+        record_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        let record_id = StrictRecordFrame::decode_authoritative(&record_bytes)
+            .unwrap()
+            .record_id();
+        let entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(1).unwrap(),
+            previous_entry_hash: operation_start.entry_hash(),
+            event_type_id: EventTypeId::try_from(600).unwrap(),
+            event_record_id: EventRecordId::try_from(record_id.as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id: new_storage,
+            environment_observation_id: new_environment,
+            lifecycle_object_kind: LifecycleObjectKind::Registry,
+            lifecycle_object_id: *registry_id.as_bytes(),
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authoritative_bytes: Vec::new(),
+        });
+
+        assert_eq!(
+            validate_event_record_reference_bindings(&journal, &entry, &record_bytes, &[]),
+            Ok(())
+        );
+    }
+
+    fn capability_observation_provenance_record(
+        storage: RecordId,
+        environment: RecordId,
+        cache_reused: bool,
+        include_process_scope: bool,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 63);
+        encode_uint(&mut bytes, 1);
+        bytes.push(if include_process_scope { 0xa6 } else { 0xa5 });
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 63, 0x10]);
+        encode_bstr_32(&mut bytes, storage.as_bytes());
+        bytes.push(0x11);
+        encode_bstr_32(&mut bytes, environment.as_bytes());
+        bytes.extend_from_slice(&[0x12, if cache_reused { 0xf5 } else { 0xf4 }]);
+        if include_process_scope {
+            bytes.extend_from_slice(&[0x13, 0x41, 0x01]);
+        }
+        bytes
+    }
+
+    fn minimal_establishment_record(definition: &JournalReference) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 81);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa3);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 81, 0x10]);
+        bytes.extend_from_slice(&definition.authoritative_cbor());
+        bytes
+    }
+
+    fn compatibility_record(source: &JournalReference, target: &JournalReference) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 84);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xa8);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 84, 0x10]);
+        bytes.extend_from_slice(&source.authoritative_cbor());
+        bytes.push(0x11);
+        bytes.extend_from_slice(&target.authoritative_cbor());
+        bytes.push(0x12);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.push(0x13);
+        encode_bstr_32(&mut bytes, &[0x41; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x14, 0x80, 0x15]);
+        bytes.extend_from_slice(&source.authoritative_cbor());
+        bytes
+    }
+
+    fn bootstrap_declaration_record(
+        scope: RecordId,
+        operation_start: &JournalReference,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0x84);
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut bytes, 86);
+        encode_uint(&mut bytes, 1);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 86, 0x10]);
+        encode_bstr_32(&mut bytes, scope.as_bytes());
+        for key in 17_u8..=22 {
+            bytes.extend_from_slice(&[key, 0x80]);
+        }
+        bytes.extend_from_slice(&[0x17, 0x80, 0x18, 0x18, 0x80, 0x18, 0x1a]);
+        bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        bytes
+    }
+
+    #[test]
+    fn closeout_formal_support_requires_exact_directional_compatibility() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let reference = |index: u64, event_type: u16, record_id: RecordId| {
+            JournalReference::new(
+                registry_id,
+                JournalEntryIndex::try_from(index).unwrap(),
+                JournalEntryHash::try_from([index as u8; ID_LENGTH].as_slice()).unwrap(),
+                EventTypeId::try_from(u64::from(event_type)).unwrap(),
+                EventRecordId::try_from(record_id.as_bytes().as_slice()).unwrap(),
+            )
+        };
+        let source_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let target_id = RecordId::try_from([0x21; ID_LENGTH].as_slice()).unwrap();
+        let establishment_id = RecordId::try_from([0x22; ID_LENGTH].as_slice()).unwrap();
+        let compatibility_id = RecordId::try_from([0x23; ID_LENGTH].as_slice()).unwrap();
+        let swapped_compatibility_id = RecordId::try_from([0x24; ID_LENGTH].as_slice()).unwrap();
+        let source = reference(1, 800, source_id);
+        let target = reference(2, 800, target_id);
+        let establishment = reference(3, 801, establishment_id);
+        let compatibility = reference(4, 804, compatibility_id);
+        let swapped_compatibility = reference(5, 804, swapped_compatibility_id);
+        let mut records = vec![
+            (establishment_id, minimal_establishment_record(&source)),
+            (compatibility_id, compatibility_record(&source, &target)),
+            (
+                swapped_compatibility_id,
+                compatibility_record(&target, &source),
+            ),
+        ];
+        records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+
+        assert_eq!(
+            validate_closeout_formal_binding(
+                &records,
+                &target,
+                &establishment,
+                Some(&compatibility),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_closeout_formal_binding(
+                &records,
+                &target,
+                &establishment,
+                Some(&swapped_compatibility),
+            ),
+            Err(RecordDecodeError)
+        );
+        assert_eq!(
+            validate_closeout_formal_binding(
+                &records,
+                &source,
+                &establishment,
+                Some(&compatibility),
+            ),
+            Err(RecordDecodeError),
+            "same-Definition support forbids an unnecessary compatibility authority"
+        );
+    }
+
+    #[test]
+    fn closeout_bootstrap_support_requires_every_declaration_scope_to_match() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let required_scope = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let wrong_scope = RecordId::try_from([0x31; ID_LENGTH].as_slice()).unwrap();
+        let declaration_id = RecordId::try_from([0x32; ID_LENGTH].as_slice()).unwrap();
+        let operation_start = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(0).unwrap(),
+            JournalEntryHash::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(1).unwrap(),
+            EventRecordId::try_from([0x41; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let declaration = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(1).unwrap(),
+            JournalEntryHash::try_from([0x42; ID_LENGTH].as_slice()).unwrap(),
+            EventTypeId::try_from(806).unwrap(),
+            EventRecordId::try_from(declaration_id.as_bytes().as_slice()).unwrap(),
+        );
+        let matching = vec![(
+            declaration_id,
+            bootstrap_declaration_record(required_scope, &operation_start),
+        )];
+        let mismatched = vec![(
+            declaration_id,
+            bootstrap_declaration_record(wrong_scope, &operation_start),
+        )];
+
+        assert_eq!(
+            decode_bootstrap_declaration_scope(&matching[0].1),
+            Ok(required_scope)
+        );
+
+        assert_eq!(
+            validate_closeout_bootstrap_scopes(
+                &matching,
+                std::slice::from_ref(&declaration),
+                required_scope,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_closeout_bootstrap_scopes(&mismatched, &[declaration], required_scope),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn capability_observation_provenance_requires_the_complete_frozen_schema() {
+        let storage = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let complete = capability_observation_provenance_record(storage, environment, true, true);
+        let missing_process_scope =
+            capability_observation_provenance_record(storage, environment, true, false);
+
+        assert_eq!(
+            decode_capability_observation_provenance(&complete),
+            Ok((storage, environment, true))
+        );
+        assert_eq!(
+            decode_capability_observation_provenance(&missing_process_scope),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn event_600_replay_binds_prior_capability_values_to_the_exact_predecessor() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let prior_storage = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let prior_environment = RecordId::try_from([0x21; ID_LENGTH].as_slice()).unwrap();
+        let new_storage = RecordId::try_from([0x22; ID_LENGTH].as_slice()).unwrap();
+        let new_environment = RecordId::try_from([0x23; ID_LENGTH].as_slice()).unwrap();
+        let wrong_prior_storage = RecordId::try_from([0x24; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id: prior_storage,
+            environment_observation_id: prior_environment,
+            created_by_tool_version: "event-600-test".to_owned(),
+        })
+        .unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            prior_storage,
+            prior_environment,
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let operation_start = journal.current_head_reference();
+
+        let mut record_bytes = Vec::new();
+        record_bytes.push(0x84);
+        encode_text(&mut record_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut record_bytes, 62);
+        encode_uint(&mut record_bytes, 1);
+        record_bytes.push(0xa9);
+        record_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 62, 0x10]);
+        encode_bstr_32(&mut record_bytes, wrong_prior_storage.as_bytes());
+        record_bytes.push(0x11);
+        encode_bstr_32(&mut record_bytes, new_storage.as_bytes());
+        record_bytes.push(0x12);
+        encode_bstr_32(&mut record_bytes, prior_environment.as_bytes());
+        record_bytes.push(0x13);
+        encode_bstr_32(&mut record_bytes, new_environment.as_bytes());
+        record_bytes.extend_from_slice(&[0x14, 0x80, 0x15, 0x80, 0x16]);
+        record_bytes.extend_from_slice(&operation_start.authoritative_cbor());
+        let record_id = StrictRecordFrame::decode_authoritative(&record_bytes)
+            .unwrap()
+            .record_id();
+        let entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(1).unwrap(),
+            previous_entry_hash: operation_start.entry_hash(),
+            event_type_id: EventTypeId::try_from(600).unwrap(),
+            event_record_id: EventRecordId::try_from(record_id.as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id: new_storage,
+            environment_observation_id: new_environment,
+            lifecycle_object_kind: LifecycleObjectKind::Registry,
+            lifecycle_object_id: *registry_id.as_bytes(),
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authoritative_bytes: Vec::new(),
+        });
+
+        assert_eq!(
+            validate_event_record_reference_bindings(&journal, &entry, &record_bytes, &[]),
+            Err(RecordDecodeError)
+        );
+
+        let mut valid_record_bytes = record_bytes;
+        let wrong_prior = valid_record_bytes
+            .windows(ID_LENGTH)
+            .position(|window| window == wrong_prior_storage.as_bytes())
+            .unwrap();
+        valid_record_bytes[wrong_prior..wrong_prior + ID_LENGTH]
+            .copy_from_slice(prior_storage.as_bytes());
+        let valid_record_id = StrictRecordFrame::decode_authoritative(&valid_record_bytes)
+            .unwrap()
+            .record_id();
+        let mut valid_entry = entry;
+        let RetainedJournalEntry::Common(common) = &mut valid_entry else {
+            unreachable!();
+        };
+        common.event_record_id =
+            EventRecordId::try_from(valid_record_id.as_bytes().as_slice()).unwrap();
+        journal.entries.push(valid_entry);
+        let mut records = vec![
+            (
+                genesis_record.record_id(),
+                genesis_record.authoritative_cbor(),
+            ),
+            (valid_record_id, valid_record_bytes),
+        ];
+        records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        assert_eq!(
+            validate_authoritative_event_records(&journal, &records),
+            Err(AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable)
+        );
+    }
+
+    #[test]
+    fn unsupported_contextual_event_semantics_fail_closed_before_positive_replay() {
+        for event_type in [200, 302, 303, 500, 501, 600, 700] {
+            assert_eq!(
+                event_semantic_authority_is_unavailable(event_type, &[]),
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn event_801_requires_authoritative_cache_provenance_and_matching_capability_epoch() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage = RecordId::try_from([0x23; ID_LENGTH].as_slice()).unwrap();
+        let environment = RecordId::try_from([0x24; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x11; ID_LENGTH].as_slice()).unwrap(),
+            storage,
+            environment,
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let genesis_reference = journal.current_head_reference();
+        let definition_record_id = RecordId::try_from([0x12; ID_LENGTH].as_slice()).unwrap();
+        journal
+            .entries
+            .push(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                registry_id,
+                entry_index: JournalEntryIndex::try_from(1).unwrap(),
+                previous_entry_hash: genesis_reference.entry_hash(),
+                event_type_id: EventTypeId::try_from(800).unwrap(),
+                event_record_id: EventRecordId::try_from(
+                    definition_record_id.as_bytes().as_slice(),
+                )
+                .unwrap(),
+                storage_capability_class_id: storage,
+                environment_observation_id: environment,
+                lifecycle_object_kind: EventTypeId::try_from(800).unwrap().lifecycle_object_kind(),
+                lifecycle_object_id: *definition_record_id.as_bytes(),
+                freeze_attempt_intended_root_id: None,
+                identity_dependencies: IdentityDependencyCollection {
+                    elements: Vec::new(),
+                },
+                authority_dependencies: AuthorityDependencyCollection {
+                    elements: Vec::new(),
+                },
+                authoritative_bytes: b"retained definition".to_vec(),
+            }));
+        let definition = journal.current_head_reference();
+        let changed_storage = RecordId::try_from([0x25; ID_LENGTH].as_slice()).unwrap();
+        let changed_environment = RecordId::try_from([0x26; ID_LENGTH].as_slice()).unwrap();
+        let append_epoch = |journal: &mut RetainedJournal,
+                            storage,
+                            environment,
+                            marker: &'static [u8]| {
+            let previous = journal.current_head_reference();
+            let index = previous.entry_index().value() + 1;
+            journal
+                .entries
+                .push(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                    registry_id,
+                    entry_index: JournalEntryIndex::try_from(index).unwrap(),
+                    previous_entry_hash: previous.entry_hash(),
+                    event_type_id: EventTypeId::try_from(600).unwrap(),
+                    event_record_id: EventRecordId::try_from([index as u8; ID_LENGTH].as_slice())
+                        .unwrap(),
+                    storage_capability_class_id: storage,
+                    environment_observation_id: environment,
+                    lifecycle_object_kind: LifecycleObjectKind::Registry,
+                    lifecycle_object_id: *registry_id.as_bytes(),
+                    freeze_attempt_intended_root_id: None,
+                    identity_dependencies: IdentityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authority_dependencies: AuthorityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authoritative_bytes: marker.to_vec(),
+                }));
+            journal.current_head_reference()
+        };
+        append_epoch(
+            &mut journal,
+            changed_storage,
+            changed_environment,
+            b"changed capability epoch",
+        );
+        let current_epoch = append_epoch(
+            &mut journal,
+            storage,
+            environment,
+            b"restored capability epoch",
+        );
+        let scope = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let method = RecordId::try_from([0x21; ID_LENGTH].as_slice()).unwrap();
+        let evidence = RecordId::try_from([0x22; ID_LENGTH].as_slice()).unwrap();
+
+        let check = |provenance_cache_reused: Option<bool>, capability_epoch: &JournalReference| {
+            let provenance_bytes = provenance_cache_reused.map(|cache_reused| {
+                capability_observation_provenance_record(storage, environment, cache_reused, true)
+            });
+            let provenance_id = provenance_bytes.as_ref().map(|bytes| {
+                StrictRecordFrame::decode_authoritative(bytes)
+                    .unwrap()
+                    .record_id()
+            });
+            let mut record_bytes = Vec::new();
+            record_bytes.push(0x84);
+            encode_text(&mut record_bytes, "EvidenceRegistry.Record.v1");
+            encode_uint(&mut record_bytes, 81);
+            encode_uint(&mut record_bytes, 1);
+            record_bytes.push(if provenance_id.is_some() { 0xaf } else { 0xae });
+            record_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 81, 0x10]);
+            record_bytes.extend_from_slice(&definition.authoritative_cbor());
+            record_bytes.push(0x11);
+            encode_bstr_32(&mut record_bytes, scope.as_bytes());
+            record_bytes.push(0x12);
+            encode_bstr_32(&mut record_bytes, method.as_bytes());
+            record_bytes.extend_from_slice(&[0x13, 0x01, 0x14, 0x01, 0x15, 0x81]);
+            encode_bstr_32(&mut record_bytes, evidence.as_bytes());
+            record_bytes.push(0x16);
+            encode_bstr_32(&mut record_bytes, storage.as_bytes());
+            record_bytes.push(0x17);
+            encode_bstr_32(&mut record_bytes, environment.as_bytes());
+            record_bytes.extend_from_slice(&[0x18, 0x18]);
+            record_bytes.extend_from_slice(&capability_epoch.authoritative_cbor());
+            if let Some(provenance_id) = provenance_id {
+                record_bytes.extend_from_slice(&[0x18, 0x19]);
+                encode_bstr_32(&mut record_bytes, provenance_id.as_bytes());
+            }
+            record_bytes.extend_from_slice(&[0x18, 0x1a, 0x80, 0x18, 0x1c]);
+            record_bytes.extend_from_slice(&genesis_reference.authoritative_cbor());
+            record_bytes.extend_from_slice(&[0x18, 0x1d, 0x80]);
+            let record_id = StrictRecordFrame::decode_authoritative(&record_bytes)
+                .unwrap()
+                .record_id();
+            assert_eq!(
+                validate_event_record_type_local_schema(801, &record_bytes),
+                Ok(())
+            );
+            assert_eq!(
+                event_semantic_authority_is_unavailable(801, &record_bytes),
+                Ok(provenance_id.is_none())
+            );
+            let mut identity_ids = vec![scope, method, evidence, storage, environment];
+            if let Some(provenance_id) = provenance_id {
+                identity_ids.push(provenance_id);
+            }
+            let entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                registry_id,
+                entry_index: JournalEntryIndex::try_from(
+                    journal.current_head_reference().entry_index().value() + 1,
+                )
+                .unwrap(),
+                previous_entry_hash: journal.current_head_reference().entry_hash(),
+                event_type_id: EventTypeId::try_from(801).unwrap(),
+                event_record_id: EventRecordId::try_from(record_id.as_bytes().as_slice()).unwrap(),
+                storage_capability_class_id: storage,
+                environment_observation_id: environment,
+                lifecycle_object_kind: EventTypeId::try_from(801).unwrap().lifecycle_object_kind(),
+                lifecycle_object_id: *record_id.as_bytes(),
+                freeze_attempt_intended_root_id: None,
+                identity_dependencies: IdentityDependencyCollection {
+                    elements: identity_ids
+                        .into_iter()
+                        .map(IdentityDependency::RecordId)
+                        .collect(),
+                },
+                authority_dependencies: AuthorityDependencyCollection {
+                    elements: vec![definition.clone()],
+                },
+                authoritative_bytes: Vec::new(),
+            });
+            let mut records = provenance_id
+                .zip(provenance_bytes)
+                .into_iter()
+                .collect::<Vec<_>>();
+            records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+            validate_event_record_reference_bindings(&journal, &entry, &record_bytes, &records)
+        };
+
+        assert_eq!(check(None, &genesis_reference), Err(RecordDecodeError));
+        assert_eq!(
+            check(Some(true), &genesis_reference),
+            Err(RecordDecodeError),
+            "GENESIS is stale after the first material capability change even when later facts return"
+        );
+        assert_eq!(check(Some(true), &current_epoch), Ok(()));
+        assert_eq!(
+            check(Some(true), &definition),
+            Err(RecordDecodeError),
+            "an arbitrary prior event is not the capability epoch"
+        );
+        assert_eq!(
+            check(Some(false), &genesis_reference),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[test]
+    fn eviction_terminal_requires_an_exact_eviction_start_authority_type() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+            RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let wrong_start = journal.current_head_reference();
+        let mut record_bytes = Vec::new();
+        record_bytes.push(0x84);
+        encode_text(&mut record_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut record_bytes, 72);
+        encode_uint(&mut record_bytes, 1);
+        record_bytes.push(0xa6);
+        record_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 72, 0x10]);
+        encode_bstr_32(&mut record_bytes, &[0x50; ID_LENGTH]);
+        record_bytes.push(0x11);
+        record_bytes.extend_from_slice(&wrong_start.authoritative_cbor());
+        record_bytes.extend_from_slice(&[0x12, 0x01, 0x14, 0x81]);
+        encode_text(&mut record_bytes, "COMMITTED");
+        let record_id = StrictRecordFrame::decode_authoritative(&record_bytes)
+            .unwrap()
+            .record_id();
+        let entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(1).unwrap(),
+            previous_entry_hash: wrong_start.entry_hash(),
+            event_type_id: EventTypeId::try_from(701).unwrap(),
+            event_record_id: EventRecordId::try_from(record_id.as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id: RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+            environment_observation_id: RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            lifecycle_object_kind: LifecycleObjectKind::ArtifactEvictionAttempt,
+            lifecycle_object_id: [0x50; ID_LENGTH],
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: vec![wrong_start],
+            },
+            authoritative_bytes: Vec::new(),
+        });
+
+        assert_eq!(
+            validate_event_record_reference_bindings(&journal, &entry, &record_bytes, &[]),
+            Err(RecordDecodeError)
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn freeze_entry_for_record_binding_test(
+        registry_id: RegistryId,
+        entry_index: u64,
+        previous_entry_hash: JournalEntryHash,
+        event_type: u16,
+        event_record_id: RecordId,
+        freeze_attempt_id: [u8; ID_LENGTH],
+        authority: Option<&JournalReference>,
+        second_event_key: u8,
+        second_event_field: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+        bytes.push(0xae);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, entry_index);
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(event_type));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, event_record_id.as_bytes());
+        bytes.push(0x06);
+        bytes.push(0x80);
+        bytes.push(0x07);
+        if let Some(authority) = authority {
+            bytes.push(0x81);
+            bytes.extend_from_slice(&authority.authoritative_cbor());
+        } else {
+            bytes.push(0x80);
+        }
+        bytes.extend_from_slice(&[0x08, 0x02, 0x09]);
+        encode_bstr_32(&mut bytes, &freeze_attempt_id);
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, &[0x60; ID_LENGTH]);
+        bytes.push(0x10);
+        encode_bstr_32(&mut bytes, &freeze_attempt_id);
+        bytes.push(second_event_key);
+        bytes.extend_from_slice(second_event_field);
+        bytes
+    }
+
+    fn generic_abort_binding_fixture(
+        record_freeze_attempt_id: [u8; ID_LENGTH],
+        record_start_matches_journal_authority: bool,
+    ) -> (RetainedJournal, Vec<(RecordId, Vec<u8>)>) {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id: RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            environment_observation_id: RecordId::try_from([0x60; ID_LENGTH].as_slice()).unwrap(),
+            created_by_tool_version: "binding-test".to_owned(),
+        })
+        .unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            RecordId::try_from([0x60; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let freeze_attempt_id = FreezeAttemptId::try_from([0x70; ID_LENGTH].as_slice()).unwrap();
+        let start_record = FreezeAttemptStartRecord::new(FreezeAttemptStartRecordInput {
+            freeze_attempt_id,
+            intended_root_id: derive_freeze_root(registry_id, freeze_attempt_id).intended_root_id(),
+            subject_id: [0x80; ID_LENGTH],
+            policy_record_id: RecordId::try_from([0x90; ID_LENGTH].as_slice()).unwrap(),
+        });
+        let genesis_reference = journal.current_head_reference();
+        let start_entry = freeze_entry_for_record_binding_test(
+            registry_id,
+            1,
+            journal.current_head_reference().entry_hash(),
+            100,
+            start_record.record_id(),
+            *freeze_attempt_id.as_bytes(),
+            None,
+            0x11,
+            &{
+                let mut value = Vec::new();
+                encode_bstr_32(&mut value, start_record.input().intended_root_id.as_bytes());
+                value
+            },
+        );
+        journal.append_strict_entry(&start_entry).unwrap();
+        let start_reference = journal.current_head_reference();
+
+        let mut abort_record = Vec::new();
+        abort_record.push(0x84);
+        encode_text(&mut abort_record, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut abort_record, 5);
+        encode_uint(&mut abort_record, 1);
+        abort_record.push(0xa6);
+        abort_record.extend_from_slice(&[0x00, 0x01, 0x01, 0x05, 0x10]);
+        encode_bstr_32(&mut abort_record, &record_freeze_attempt_id);
+        abort_record.push(0x11);
+        abort_record.extend_from_slice(
+            if record_start_matches_journal_authority {
+                &start_reference
+            } else {
+                &genesis_reference
+            }
+            .authoritative_cbor()
+            .as_slice(),
+        );
+        abort_record.extend_from_slice(&[0x13, 0x80, 0x14]);
+        abort_record.extend_from_slice(&journal.current_head_reference().authoritative_cbor());
+        let abort_record_id = StrictRecordFrame::decode_authoritative(&abort_record)
+            .unwrap()
+            .record_id();
+        let abort_entry = freeze_entry_for_record_binding_test(
+            registry_id,
+            2,
+            start_reference.entry_hash(),
+            102,
+            abort_record_id,
+            *freeze_attempt_id.as_bytes(),
+            Some(&start_reference),
+            0x12,
+            &start_reference.authoritative_cbor(),
+        );
+        journal.append_strict_entry(&abort_entry).unwrap();
+        let mut records = vec![
+            (
+                genesis_record.record_id(),
+                genesis_record.authoritative_cbor(),
+            ),
+            (start_record.record_id(), start_record.authoritative_cbor()),
+            (abort_record_id, abort_record),
+        ];
+        records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        (journal, records)
+    }
+
+    #[test]
+    fn authoritative_replay_rejects_a_generic_record_for_a_different_lifecycle_object() {
+        let (journal, records) = generic_abort_binding_fixture([0x71; ID_LENGTH], true);
+        assert_eq!(
+            validate_authoritative_event_records(&journal, &records),
+            Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode)
+        );
+    }
+
+    #[test]
+    fn authoritative_replay_requires_a_generic_records_named_authority_dependency() {
+        let (journal, records) = generic_abort_binding_fixture([0x70; ID_LENGTH], false);
+        assert_eq!(
+            validate_authoritative_event_records(&journal, &records),
+            Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode)
+        );
+    }
+
+    #[test]
+    fn retained_replay_accepts_a_valid_freeze_commit_rejection_entry() {
+        let (mut journal, _) = generic_abort_binding_fixture([0x70; ID_LENGTH], true);
+        let registry_id = journal.registry_id;
+        let start_entry = &journal.entries[1];
+        let start_reference = JournalReference::new(
+            registry_id,
+            start_entry.entry_index(),
+            start_entry.entry_hash(),
+            start_entry.event_type_id(),
+            start_entry.event_record_id(),
+        );
+        let conflicting_terminal = journal.current_head_reference();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+        bytes.push(0xaf);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, 3);
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, conflicting_terminal.entry_hash().as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, 104);
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, &[0xa0; ID_LENGTH]);
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x82]);
+        bytes.extend_from_slice(&start_reference.authoritative_cbor());
+        bytes.extend_from_slice(&conflicting_terminal.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x02, 0x09]);
+        encode_bstr_32(&mut bytes, &[0x70; ID_LENGTH]);
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, &[0x60; ID_LENGTH]);
+        bytes.push(0x10);
+        encode_bstr_32(&mut bytes, &[0x70; ID_LENGTH]);
+        bytes.push(0x12);
+        bytes.extend_from_slice(&start_reference.authoritative_cbor());
+        bytes.push(0x13);
+        bytes.extend_from_slice(&conflicting_terminal.authoritative_cbor());
+
+        assert_eq!(journal.append_strict_entry(&bytes), Ok(()));
+        assert_eq!(
+            journal.current_head_reference().event_type_id().value(),
+            104
+        );
+    }
+
+    fn policy_recorded_entry_for_ancestor_test(
+        registry_id: RegistryId,
+        entry_index: u64,
+        previous_entry_hash: JournalEntryHash,
+        policy_record_id: RecordId,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, entry_index);
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, 400);
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, policy_record_id.as_bytes());
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08]);
+        encode_uint(&mut bytes, 7);
+        bytes.push(0x09);
+        encode_bstr_32(&mut bytes, policy_record_id.as_bytes());
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, &[0x40; ID_LENGTH]);
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, &[0x60; ID_LENGTH]);
+        bytes
+    }
+
+    #[test]
+    fn published_reference_authentication_accepts_an_exact_retained_ancestor() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            RecordId::try_from([0x60; ID_LENGTH].as_slice()).unwrap(),
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let first = policy_recorded_entry_for_ancestor_test(
+            registry_id,
+            1,
+            journal.current_head_reference().entry_hash(),
+            RecordId::try_from([0x81; ID_LENGTH].as_slice()).unwrap(),
+        );
+        journal.append_strict_entry(&first).unwrap();
+        let published = journal.current_head_reference();
+        let second = policy_recorded_entry_for_ancestor_test(
+            registry_id,
+            2,
+            published.entry_hash(),
+            RecordId::try_from([0x82; ID_LENGTH].as_slice()).unwrap(),
+        );
+        journal.append_strict_entry(&second).unwrap();
+        assert_ne!(journal.current_head_reference(), published);
+
+        assert_eq!(
+            authenticate_published_journal_reference(&journal, &published),
+            Ok(())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_generation_guard_denies_path_and_alias_writes() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-generation-guard-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("retained.cbor");
+        let alias = root.join("retained-alias.cbor");
+        fs::write(&path, b"retained generation").unwrap();
+        let source = read_regular_file(&path, &mut NamespaceBudget::new()).unwrap();
+        let mut guard = open_retained_file_guard(&source.witness).unwrap();
+
+        assert!(fs::write(&path, b"path mutation").is_err());
+        revalidate_retained_file_witness(&mut guard).unwrap();
+
+        drop(guard);
+        fs::hard_link(&path, &alias).unwrap();
+        assert!(open_retained_file_guard(&source.witness).is_err());
+        drop(source);
+        fs::remove_file(alias).unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn authoritative_namespace_budget_bounds_object_count_independently() {
+        let mut budget = NamespaceBudget::new();
+        for _ in 0..AUTHORITATIVE_STORE_MAX_OBJECTS {
+            budget.reserve(0).unwrap();
+        }
+        assert_eq!(budget.reserve(0), Err(NamespaceReadError::ResourceLimit));
+    }
+
+    #[test]
+    fn authoritative_namespace_budget_bounds_aggregate_bytes_independently() {
+        let mut budget = NamespaceBudget::new();
+        for _ in 0..(AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES / AUTHORITATIVE_STORE_MAX_OBJECT_BYTES)
+        {
+            budget
+                .reserve(u64::try_from(AUTHORITATIVE_STORE_MAX_OBJECT_BYTES).unwrap())
+                .unwrap();
+        }
+        assert_eq!(budget.reserve(1), Err(NamespaceReadError::ResourceLimit));
+    }
+
+    #[test]
+    fn record_loader_counts_publication_residue_in_its_single_namespace_pass() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let records = std::env::temp_dir().join(format!(
+            "evidence-registry-record-budget-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&records).unwrap();
+        fs::write(
+            records.join(".evidence-registry-publish-1-1.tmp"),
+            b"residue",
+        )
+        .unwrap();
+        let mut budget = NamespaceBudget::new();
+        for _ in 0..AUTHORITATIVE_STORE_MAX_OBJECTS {
+            budget.reserve(0).unwrap();
+        }
+
+        assert!(matches!(
+            load_record_namespace(&records, &mut budget),
+            Err(AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit)
+        ));
+
+        fs::remove_dir_all(records).unwrap();
+    }
+
+    #[test]
+    fn frozen_event_record_type_map_is_complete() {
+        let expected = [
+            (1, 1),
+            (100, 3),
+            (101, 4),
+            (102, 5),
+            (103, 6),
+            (104, 7),
+            (200, 12),
+            (300, 30),
+            (301, 31),
+            (302, 32),
+            (303, 32),
+            (400, 40),
+            (500, 50),
+            (501, 50),
+            (600, 62),
+            (700, 71),
+            (701, 72),
+            (702, 72),
+            (703, 72),
+            (800, 80),
+            (801, 81),
+            (802, 82),
+            (803, 83),
+            (804, 84),
+            (805, 85),
+            (806, 86),
+            (807, 87),
+            (808, 88),
+        ];
+        for (event_type, record_type) in expected {
+            assert_eq!(
+                expected_record_type_for_event(event_type),
+                Some(record_type)
+            );
+        }
+        assert_eq!(expected_record_type_for_event(0), None);
+        assert_eq!(expected_record_type_for_event(809), None);
+    }
 }

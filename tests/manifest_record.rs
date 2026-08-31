@@ -43,6 +43,26 @@ fn replace_unique_range(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) 
     );
 }
 
+fn manifest_with_artifact_paths(paths: &[&[u8]]) -> Vec<u8> {
+    assert!(!paths.is_empty() && paths.len() < 24);
+    let canonical = hex_bytes(MANIFEST_RECORD_HEX);
+    let fields = canonical
+        .windows(8)
+        .position(|window| window == [0x11, 0x01, 0x12, 0x01, 0x13, 0x01, 0x14, 0x81])
+        .unwrap();
+    let mut bytes = canonical[..fields].to_vec();
+    bytes.extend_from_slice(&[0x11, paths.len() as u8, 0x12, 0x01, 0x13, 0x01, 0x14]);
+    bytes.push(0x80 + paths.len() as u8);
+    for path in paths {
+        assert!(!path.is_empty() && path.len() < 24);
+        bytes.extend_from_slice(&[0x85, 0x01, 0x81, 0x40 + path.len() as u8]);
+        bytes.extend_from_slice(path);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x58, 0x20]);
+        bytes.extend(0_u8..32);
+    }
+    bytes
+}
+
 #[test]
 fn manifest_record_decodes_fixed_local_artifact_fields_and_exact_identity() {
     let canonical = hex_bytes(MANIFEST_RECORD_HEX);
@@ -75,6 +95,14 @@ fn manifest_record_decodes_fixed_local_artifact_fields_and_exact_identity() {
         decoded.input().artifacts[0].digest_bytes,
         hex_id("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
     );
+}
+
+#[test]
+fn manifest_record_rejects_nonadjacent_duplicate_raw_path_component_sequences() {
+    let duplicate = manifest_with_artifact_paths(&[b"same", b"middle", b"same"]);
+
+    assert!(StrictRecordFrame::decode_authoritative(&duplicate).is_ok());
+    assert!(ManifestRecord::decode_authoritative(&duplicate).is_err());
 }
 
 #[test]

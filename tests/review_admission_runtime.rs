@@ -9,9 +9,9 @@ use evidence_registry::{
     validate_review_result_recorded_binding, AuthoritativeRegistryStore, EventRecordId,
     ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
     FreezeAttemptStartRecordInput, GenesisJournalEntry, GenesisRecord, GenesisRecordInput,
-    JournalAnchor, JournalAnchorHistoryComparison, JournalEntryHash, JournalEntryIndex,
-    JournalReference, RecordId, RegistryId, RetainedJournal, RetainedJournalError,
-    RetainedReviewPackageAnchorInputError, ReviewAdmissionAcceptanceError,
+    IntendedRootId, JournalAnchor, JournalAnchorHistoryComparison, JournalEntryHash,
+    JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
+    RetainedJournalError, RetainedReviewPackageAnchorInputError, ReviewAdmissionAcceptanceError,
     ReviewAdmissionCommonRequestResultError, ReviewAdmissionExactScopeProfileError,
     ReviewAdmissionPolicy46RouteOutcome, ReviewAdmissionPolicyContextPrerequisitesError,
     ReviewAdmissionPolicyContextRouteOutcome, ReviewAdmissionPolicyRecord,
@@ -20,8 +20,13 @@ use evidence_registry::{
     ReviewAdmissionSection82PrerequisiteFailure, ReviewAdmissionSection82RoutingOutcome,
     ReviewAdmissionSection83Disposition, ReviewPackageAnchorTransportError, ReviewRequestRecord,
     ReviewRequestRecordedBindingError, ReviewResultRecord, ReviewResultRecordedBindingError,
-    StrictRecordFrame, REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES,
-    REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES,
+    StrictRecordFrame, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
+    REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES, REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES,
+};
+#[cfg(windows)]
+use evidence_registry::{
+    ReviewAdmissionJournalEntry, ReviewAdmissionJournalEntryInput, ReviewAdmissionRecord,
+    ReviewAdmissionRecordInput,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -86,17 +91,6 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-fn freeze_attempt_start_record() -> FreezeAttemptStartRecord {
-    let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
-    let freeze_attempt_id = FreezeAttemptId::try_from(id(0xa0).as_slice()).unwrap();
-    FreezeAttemptStartRecord::new(FreezeAttemptStartRecordInput {
-        freeze_attempt_id,
-        intended_root_id: derive_freeze_root(registry_id, freeze_attempt_id).intended_root_id(),
-        subject_id: id(0xe0),
-        policy_record_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
-    })
-}
-
 fn freeze_start_entry(
     previous_entry_hash: JournalEntryHash,
     start_record: &FreezeAttemptStartRecord,
@@ -130,7 +124,12 @@ fn freeze_start_entry(
     bytes
 }
 
-fn freeze_receipt_bytes(start_reference: &JournalReference, manifest_id: RecordId) -> Vec<u8> {
+fn freeze_receipt_bytes(
+    start_reference: &JournalReference,
+    manifest_id: RecordId,
+    policy_record_id: RecordId,
+    file_content_flush_state: u8,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
@@ -152,11 +151,50 @@ fn freeze_receipt_bytes(start_reference: &JournalReference, manifest_id: RecordI
     bytes.extend_from_slice(&[0x18, 0x18]);
     append_bstr_32(&mut bytes, id(0xf0));
     bytes.extend_from_slice(&[0x18, 0x19]);
-    append_bstr_32(&mut bytes, id(0x40));
+    append_bstr_32(&mut bytes, *policy_record_id.as_bytes());
+    bytes.extend_from_slice(&[0x18, 0x1a, file_content_flush_state]);
     bytes.extend_from_slice(&[
-        0x18, 0x1a, 0x01, 0x18, 0x1b, 0x01, 0x18, 0x1c, 0x01, 0x18, 0x1d, 0xf5, 0x18, 0x1f, 0x64,
+        0x18, 0x1b, 0x01, 0x18, 0x1c, 0x01, 0x18, 0x1d, 0xf5, 0x18, 0x1f, 0x64,
     ]);
     bytes.extend_from_slice(b"test");
+    bytes
+}
+
+fn independently_construct_freeze_commit_policy(
+    operation_start: &JournalReference,
+    context_id: u8,
+    minimum_durability: Option<[bool; 4]>,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[
+        0x18,
+        0x28,
+        0x01,
+        if minimum_durability.is_some() {
+            0xa6
+        } else {
+            0xa5
+        },
+        0x00,
+        0x01,
+        0x01,
+        0x18,
+        0x28,
+        0x10,
+    ]);
+    append_bstr_32(&mut bytes, id(0x31));
+    if let Some(requirements) = minimum_durability {
+        bytes.extend_from_slice(&[0x17, 0xa4]);
+        for (key, required) in requirements.into_iter().enumerate() {
+            bytes.push(u8::try_from(key).unwrap());
+            bytes.push(if required { 0xf5 } else { 0xf4 });
+        }
+    }
+    bytes.extend_from_slice(&[0x18, 0x1d]);
+    append_journal_reference(&mut bytes, operation_start);
+    bytes.extend_from_slice(&[0x18, 0x1e, 0x81, context_id]);
     bytes
 }
 
@@ -204,6 +242,21 @@ fn independently_construct_version_1_review_request() -> Vec<u8> {
     independently_construct_version_1_review_request_with_anchor_id(id(0x10))
 }
 
+fn independently_construct_frozen_v03_review_request() -> Vec<u8> {
+    independently_construct_version_1_review_request()
+}
+
+fn independently_construct_review_request_with_unassigned_key_25() -> Vec<u8> {
+    let mut bytes = independently_construct_version_1_review_request();
+    let body_map = bytes
+        .iter()
+        .position(|byte| *byte == 0xab)
+        .expect("the independent Request has an 11-field body");
+    bytes[body_map] = 0xac;
+    bytes.extend_from_slice(&[0x18, 0x19, 0x01]);
+    bytes
+}
+
 fn independently_construct_version_1_review_request_with_anchor_id(
     review_package_anchor_id: [u8; 32],
 ) -> Vec<u8> {
@@ -213,11 +266,11 @@ fn independently_construct_version_1_review_request_with_anchor_id(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
-    bytes.extend_from_slice(&[0x18, 30, 0x01, 0xac, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
+    bytes.extend_from_slice(&[0x18, 30, 0x01, 0xab, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
     append_journal_reference(&mut bytes, &freeze_authority);
     bytes.push(0x11);
     append_bstr_32(&mut bytes, id(0x80));
-    bytes.extend_from_slice(&[0x12, 0x07, 0x13]);
+    bytes.extend_from_slice(&[0x12, 0x05, 0x13]);
     append_bstr_32(&mut bytes, id(0xa0));
     bytes.push(0x14);
     append_journal_reference(&mut bytes, &policy_authority);
@@ -229,7 +282,6 @@ fn independently_construct_version_1_review_request_with_anchor_id(
     append_bstr_32(&mut bytes, review_package_anchor_id);
     bytes.extend_from_slice(&[0x18, 0x18]);
     append_journal_reference(&mut bytes, &operation_start);
-    bytes.extend_from_slice(&[0x18, 0x19, 0x01]);
     bytes
 }
 
@@ -244,11 +296,11 @@ fn independently_construct_version_1_review_request_with_freeze_policy_scope_anc
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
-    bytes.extend_from_slice(&[0x18, 30, 0x01, 0xac, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
+    bytes.extend_from_slice(&[0x18, 30, 0x01, 0xab, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
     append_journal_reference(&mut bytes, freeze_authority);
     bytes.push(0x11);
     append_bstr_32(&mut bytes, *manifest_id.as_bytes());
-    bytes.extend_from_slice(&[0x12, 0x07, 0x13]);
+    bytes.extend_from_slice(&[0x12, 0x05, 0x13]);
     append_bstr_32(&mut bytes, id(0xa0));
     bytes.push(0x14);
     append_journal_reference(&mut bytes, policy_authority);
@@ -260,7 +312,6 @@ fn independently_construct_version_1_review_request_with_freeze_policy_scope_anc
     append_bstr_32(&mut bytes, review_package_anchor_id);
     bytes.extend_from_slice(&[0x18, 0x18]);
     append_journal_reference(&mut bytes, operation_start);
-    bytes.extend_from_slice(&[0x18, 0x19, 0x01]);
     bytes
 }
 
@@ -391,6 +442,21 @@ fn independently_construct_version_1_review_result() -> Vec<u8> {
     )
 }
 
+fn independently_construct_frozen_v03_review_result() -> Vec<u8> {
+    independently_construct_version_1_review_result()
+}
+
+fn independently_construct_review_result_with_unassigned_key_29() -> Vec<u8> {
+    let mut bytes = independently_construct_version_1_review_result();
+    let body_map = bytes
+        .iter()
+        .position(|byte| *byte == 0xae)
+        .expect("the independent Result has a 14-field body");
+    bytes[body_map] = 0xaf;
+    bytes.extend_from_slice(&[0x18, 0x1d, 0x01]);
+    bytes
+}
+
 fn independently_construct_version_1_review_result_with_transport(
     request_authority: JournalReference,
     review_package_anchor_id: [u8; 32],
@@ -411,13 +477,13 @@ fn independently_construct_version_1_review_result_with_section_82_fields(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
-    bytes.extend_from_slice(&[0x18, 31, 0x01, 0xaf, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
+    bytes.extend_from_slice(&[0x18, 31, 0x01, 0xae, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
     append_journal_reference(&mut bytes, &request_authority);
     bytes.push(0x11);
     append_journal_reference(&mut bytes, &freeze_authority);
     bytes.push(0x12);
     append_bstr_32(&mut bytes, id(0x80));
-    bytes.extend_from_slice(&[0x13, 0x07, 0x14]);
+    bytes.extend_from_slice(&[0x13, 0x05, 0x14]);
     append_bstr_32(&mut bytes, id(0xc0));
     bytes.push(0x15);
     append_bstr_32(&mut bytes, id(0xe0));
@@ -427,7 +493,6 @@ fn independently_construct_version_1_review_result_with_section_82_fields(
     append_bstr_32(&mut bytes, review_package_anchor_id);
     bytes.extend_from_slice(&[0x18, 0x1c]);
     append_journal_reference(&mut bytes, &operation_start);
-    bytes.extend_from_slice(&[0x18, 0x1d, 0x01]);
     bytes
 }
 
@@ -442,13 +507,13 @@ fn independently_construct_version_1_review_result_with_freeze_scope_and_start(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
-    bytes.extend_from_slice(&[0x18, 31, 0x01, 0xaf, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
+    bytes.extend_from_slice(&[0x18, 31, 0x01, 0xae, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
     append_journal_reference(&mut bytes, request_authority);
     bytes.push(0x11);
     append_journal_reference(&mut bytes, freeze_authority);
     bytes.push(0x12);
     append_bstr_32(&mut bytes, *manifest_id.as_bytes());
-    bytes.extend_from_slice(&[0x13, 0x07, 0x14]);
+    bytes.extend_from_slice(&[0x13, 0x05, 0x14]);
     append_bstr_32(&mut bytes, *scope_ref.as_bytes());
     bytes.push(0x15);
     append_bstr_32(&mut bytes, id(0xe0));
@@ -458,7 +523,6 @@ fn independently_construct_version_1_review_result_with_freeze_scope_and_start(
     append_bstr_32(&mut bytes, review_package_anchor_id);
     bytes.extend_from_slice(&[0x18, 0x1c]);
     append_journal_reference(&mut bytes, operation_start);
-    bytes.extend_from_slice(&[0x18, 0x1d, 0x01]);
     bytes
 }
 
@@ -515,33 +579,35 @@ fn review_result_recorded_entry_with_identity_dependencies(
     bytes
 }
 
-fn review_result_recorded_entry_with_authorities(
+fn review_result_recorded_entry_with_dependencies(
     entry_index: u8,
     previous_entry_hash: JournalEntryHash,
     review_result_record_id: RecordId,
-    review_package_anchor_id: [u8; 32],
+    identity_dependencies: &[(u8, [u8; 32])],
     authorities: &[&JournalReference],
 ) -> Vec<u8> {
-    assert!(!authorities.is_empty() && authorities.len() < 24);
-    let mut bytes = review_result_recorded_entry(
+    assert!(authorities.len() < 24);
+    let mut bytes = review_result_recorded_entry_with_identity_dependencies(
         entry_index,
         previous_entry_hash,
         review_result_record_id,
-        Some(review_package_anchor_id),
+        identity_dependencies,
         None,
     );
-    let empty_authorities = bytes
-        .windows(4)
-        .position(|window| window == [0x07, 0x80, 0x08, 0x05])
-        .expect("independent Result helper has the expected empty authority set");
-    let mut encoded_authorities = vec![0x80 + authorities.len() as u8];
-    for authority in authorities {
-        append_journal_reference(&mut encoded_authorities, authority);
+    if !authorities.is_empty() {
+        let empty_authorities = bytes
+            .windows(4)
+            .position(|window| window == [0x07, 0x80, 0x08, 0x05])
+            .expect("independent Result helper has the expected empty authority set");
+        let mut encoded_authorities = vec![0x80 + authorities.len() as u8];
+        for authority in authorities {
+            append_journal_reference(&mut encoded_authorities, authority);
+        }
+        bytes.splice(
+            empty_authorities + 1..empty_authorities + 2,
+            encoded_authorities,
+        );
     }
-    bytes.splice(
-        empty_authorities + 1..empty_authorities + 2,
-        encoded_authorities,
-    );
     bytes
 }
 
@@ -550,13 +616,29 @@ fn independently_construct_review_admission_policy_with_requirement_roles(
     gate_scope_ref: RecordId,
     review_requirement_scope_ref: RecordId,
     review_roles: &[u8],
+    include_verification_requirement: bool,
 ) -> Vec<u8> {
     assert!(!review_roles.is_empty() && review_roles.len() < 24);
     assert!(review_roles.windows(2).all(|pair| pair[0] < pair[1]));
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
-    bytes.extend_from_slice(&[0x18, 40, 0x01, 0xa9, 0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+    bytes.extend_from_slice(&[
+        0x18,
+        40,
+        0x01,
+        if include_verification_requirement {
+            0xaa
+        } else {
+            0xa9
+        },
+        0x00,
+        0x01,
+        0x01,
+        0x18,
+        40,
+        0x10,
+    ]);
     append_bstr_32(&mut bytes, *gate_scope_ref.as_bytes());
     bytes.push(0x11);
     bytes.push(0x80 + review_roles.len() as u8);
@@ -570,9 +652,48 @@ fn independently_construct_review_admission_policy_with_requirement_roles(
         bytes.extend_from_slice(&[0x04, 0x01]);
     }
     bytes.extend_from_slice(&[0x12, 0x81, 0x01, 0x13, 0x81, 0x01]);
+    if include_verification_requirement {
+        bytes.extend_from_slice(&[
+            0x14, 0x81, 0xa4, 0x00, 0x01, 0x01, 0x01, 0x02, 0x01, 0x03, 0x01,
+        ]);
+    }
     bytes.extend_from_slice(&[0x18, 0x18, 0xa1, 0x00, 0x82, 0x01, 0x02, 0x18, 0x1d]);
     append_journal_reference(&mut bytes, operation_start);
-    bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x02]);
+    if include_verification_requirement {
+        bytes.extend_from_slice(&[0x18, 0x1e, 0x83, 0x02, 0x03, 0x05]);
+    } else {
+        bytes.extend_from_slice(&[0x18, 0x1e, 0x82, 0x02, 0x05]);
+    }
+    bytes
+}
+
+fn independently_construct_review_request_creation_policy_with_requirement_roles(
+    operation_start: &JournalReference,
+    gate_scope_ref: RecordId,
+    review_requirement_scope_ref: RecordId,
+    review_roles: &[u8],
+) -> Vec<u8> {
+    assert!(!review_roles.is_empty() && review_roles.len() < 24);
+    assert!(review_roles.windows(2).all(|pair| pair[0] < pair[1]));
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[0x18, 40, 0x01, 0xa6, 0x00, 0x01, 0x01, 0x18, 40, 0x10]);
+    append_bstr_32(&mut bytes, *gate_scope_ref.as_bytes());
+    bytes.push(0x11);
+    bytes.push(0x80 + review_roles.len() as u8);
+    for review_role in review_roles {
+        bytes.extend_from_slice(&[0xa5, 0x00, *review_role, 0x01]);
+        append_bstr_32(&mut bytes, *review_requirement_scope_ref.as_bytes());
+        bytes.push(0x02);
+        append_bstr_32(&mut bytes, id(0xe0));
+        bytes.push(0x03);
+        append_bstr_32(&mut bytes, id(0xa0));
+        bytes.extend_from_slice(&[0x04, 0x01]);
+    }
+    bytes.extend_from_slice(&[0x18, 0x1d]);
+    append_journal_reference(&mut bytes, operation_start);
+    bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x05]);
     bytes
 }
 
@@ -580,6 +701,8 @@ fn policy_recorded_entry_at(
     entry_index: u8,
     previous_entry_hash: JournalEntryHash,
     policy_record_id: RecordId,
+    gate_scope_ref: RecordId,
+    review_requirement_scope_ref: RecordId,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
@@ -590,7 +713,17 @@ fn policy_recorded_entry_at(
     bytes.extend_from_slice(previous_entry_hash.as_bytes());
     bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x90, 0x05]);
     append_bstr_32(&mut bytes, *policy_record_id.as_bytes());
-    bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x07, 0x09]);
+    bytes.push(0x06);
+    let mut identity_dependencies = vec![
+        (1, *gate_scope_ref.as_bytes()),
+        (1, *review_requirement_scope_ref.as_bytes()),
+        (1, id(0xa0)),
+        (1, id(0xe0)),
+    ];
+    identity_dependencies.sort();
+    identity_dependencies.dedup();
+    append_identity_dependencies(&mut bytes, &identity_dependencies);
+    bytes.extend_from_slice(&[0x07, 0x80, 0x08, 0x07, 0x09]);
     append_bstr_32(&mut bytes, *policy_record_id.as_bytes());
     bytes.extend_from_slice(&[0x0a]);
     append_bstr_32(&mut bytes, id(0x40));
@@ -703,14 +836,30 @@ struct AuthoritativeReviewAdmissionFixture {
 
 #[derive(Default)]
 struct ReviewAdmissionFixtureOverrides {
+    freeze_start_record_intended_root: Option<[u8; 32]>,
+    freeze_policy_context_id: Option<u8>,
+    freeze_policy_minimum_durability: Option<[bool; 4]>,
+    freeze_receipt_file_content_flush_state: Option<u8>,
+    manifest_bytes: Option<Vec<u8>>,
     policy_operation_start: Option<JournalReference>,
     policy_context_id: Option<u8>,
+    policy_includes_verification_requirement: bool,
     gate_scope_bytes: Option<Vec<u8>>,
     common_scope_bytes: Option<Vec<u8>>,
+    request_freeze_authority: Option<JournalReference>,
     request_operation_start: Option<JournalReference>,
+    result_request_authority: Option<JournalReference>,
+    result_freeze_authority: Option<JournalReference>,
     result_operation_start: Option<JournalReference>,
     result_method_status: Option<u8>,
     result_finding_state: Option<u8>,
+    result_findings: Option<Vec<RecordId>>,
+    result_manifest_id: Option<RecordId>,
+    result_review_role_id: Option<u8>,
+    result_scope_ref: Option<RecordId>,
+    result_method_ref: Option<RecordId>,
+    result_package_anchor_id: Option<[u8; 32]>,
+    result_identities: Option<IdentityDependencyMode>,
     policy_anchor_current_head_only: bool,
 }
 
@@ -738,17 +887,17 @@ enum IdentityDependencyMode {
 }
 
 fn authoritative_review_admission_fixture(
-    evaluator_1015_scope_matches: bool,
+    gate_scope_matches_common_scope: bool,
 ) -> AuthoritativeReviewAdmissionFixture {
-    authoritative_review_admission_fixture_with_roles(evaluator_1015_scope_matches, &[7])
+    authoritative_review_admission_fixture_with_roles(gate_scope_matches_common_scope, &[5])
 }
 
 fn authoritative_review_admission_fixture_with_roles(
-    evaluator_1015_scope_matches: bool,
+    gate_scope_matches_common_scope: bool,
     review_roles: &[u8],
 ) -> AuthoritativeReviewAdmissionFixture {
     authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
-        evaluator_1015_scope_matches,
+        gate_scope_matches_common_scope,
         review_roles,
         IdentityDependencyMode::Exact,
         AuthorityDependencyMode::Exact,
@@ -757,14 +906,14 @@ fn authoritative_review_admission_fixture_with_roles(
 }
 
 fn authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
-    evaluator_1015_scope_matches: bool,
+    gate_scope_matches_common_scope: bool,
     review_roles: &[u8],
     request_identities: IdentityDependencyMode,
     request_authorities: AuthorityDependencyMode,
     result_authorities: AuthorityDependencyMode,
 ) -> AuthoritativeReviewAdmissionFixture {
     authoritative_review_admission_fixture_with_overrides(
-        evaluator_1015_scope_matches,
+        gate_scope_matches_common_scope,
         review_roles,
         request_identities,
         request_authorities,
@@ -774,7 +923,7 @@ fn authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
 }
 
 fn authoritative_review_admission_fixture_with_overrides(
-    evaluator_1015_scope_matches: bool,
+    gate_scope_matches_common_scope: bool,
     review_roles: &[u8],
     request_identities: IdentityDependencyMode,
     request_authorities: AuthorityDependencyMode,
@@ -782,14 +931,30 @@ fn authoritative_review_admission_fixture_with_overrides(
     overrides: ReviewAdmissionFixtureOverrides,
 ) -> AuthoritativeReviewAdmissionFixture {
     let ReviewAdmissionFixtureOverrides {
+        freeze_start_record_intended_root,
+        freeze_policy_context_id,
+        freeze_policy_minimum_durability,
+        freeze_receipt_file_content_flush_state,
+        manifest_bytes,
         policy_operation_start,
         policy_context_id,
+        policy_includes_verification_requirement,
         gate_scope_bytes,
         common_scope_bytes,
+        request_freeze_authority,
         request_operation_start,
+        result_request_authority,
+        result_freeze_authority,
         result_operation_start,
         result_method_status,
         result_finding_state,
+        result_findings,
+        result_manifest_id,
+        result_review_role_id,
+        result_scope_ref,
+        result_method_ref,
+        result_package_anchor_id,
+        result_identities,
         policy_anchor_current_head_only,
     } = overrides;
     let genesis = genesis();
@@ -801,8 +966,29 @@ fn authoritative_review_admission_fixture_with_overrides(
         evidence_registry::EventTypeId::try_from(1_u64).unwrap(),
         EventRecordId::try_from(genesis_record().record_id().as_bytes().as_slice()).unwrap(),
     );
-    let start_record = freeze_attempt_start_record();
-    let start_entry = freeze_start_entry(genesis.entry_hash(), &start_record);
+    let freeze_policy_bytes = independently_construct_freeze_commit_policy(
+        &genesis_reference,
+        freeze_policy_context_id.unwrap_or(1),
+        freeze_policy_minimum_durability,
+    );
+    let freeze_policy_id =
+        RecordId::try_from(Sha256::digest(&freeze_policy_bytes).as_slice()).unwrap();
+    let expected_intended_root = derive_freeze_root(
+        registry_id,
+        FreezeAttemptId::try_from(id(0xa0).as_slice()).unwrap(),
+    )
+    .intended_root_id();
+    let start_record = FreezeAttemptStartRecord::new(FreezeAttemptStartRecordInput {
+        freeze_attempt_id: FreezeAttemptId::try_from(id(0xa0).as_slice()).unwrap(),
+        intended_root_id: freeze_start_record_intended_root
+            .map(|value| IntendedRootId::try_from(value.as_slice()).unwrap())
+            .unwrap_or(expected_intended_root),
+        subject_id: id(0xe0),
+        policy_record_id: freeze_policy_id,
+    });
+    let mut start_entry = freeze_start_entry(genesis.entry_hash(), &start_record);
+    let retained_root_offset = start_entry.len() - 32;
+    start_entry[retained_root_offset..].copy_from_slice(expected_intended_root.as_bytes());
     let start_entry_hash: [u8; 32] = Sha256::digest(&start_entry).into();
     let start_reference = JournalReference::new(
         registry_id,
@@ -811,9 +997,14 @@ fn authoritative_review_admission_fixture_with_overrides(
         evidence_registry::EventTypeId::try_from(100_u64).unwrap(),
         EventRecordId::try_from(start_record.record_id().as_bytes().as_slice()).unwrap(),
     );
-    let manifest_bytes = hex_bytes(MANIFEST_RECORD_HEX);
+    let manifest_bytes = manifest_bytes.unwrap_or_else(|| hex_bytes(MANIFEST_RECORD_HEX));
     let manifest_id = RecordId::try_from(Sha256::digest(&manifest_bytes).as_slice()).unwrap();
-    let receipt_bytes = freeze_receipt_bytes(&start_reference, manifest_id);
+    let receipt_bytes = freeze_receipt_bytes(
+        &start_reference,
+        manifest_id,
+        freeze_policy_id,
+        freeze_receipt_file_content_flush_state.unwrap_or(1),
+    );
     let receipt_id = RecordId::try_from(Sha256::digest(&receipt_bytes).as_slice()).unwrap();
     let committed_entry = freeze_committed_entry(
         JournalEntryHash::try_from(start_entry_hash.as_slice()).unwrap(),
@@ -832,7 +1023,7 @@ fn authoritative_review_admission_fixture_with_overrides(
         gate_scope_bytes.unwrap_or_else(independently_construct_exact_review_admission_scope);
     let gate_scope_id = RecordId::try_from(Sha256::digest(&gate_scope_bytes).as_slice()).unwrap();
     let common_scope_bytes = common_scope_bytes.unwrap_or_else(|| {
-        if evaluator_1015_scope_matches {
+        if gate_scope_matches_common_scope {
             gate_scope_bytes.clone()
         } else {
             independently_construct_labeled_exact_review_admission_scope("other")
@@ -840,17 +1031,29 @@ fn authoritative_review_admission_fixture_with_overrides(
     });
     let common_scope_id =
         RecordId::try_from(Sha256::digest(&common_scope_bytes).as_slice()).unwrap();
-    let mut policy_bytes = independently_construct_review_admission_policy_with_requirement_roles(
-        policy_operation_start
-            .as_ref()
-            .unwrap_or(&genesis_reference),
-        gate_scope_id,
-        common_scope_id,
-        review_roles,
-    );
-    if let Some(policy_context_id) = policy_context_id {
-        *policy_bytes.last_mut().unwrap() = policy_context_id;
-    }
+    let operation_start = policy_operation_start
+        .as_ref()
+        .unwrap_or(&genesis_reference);
+    let mut policy_bytes = if policy_context_id == Some(5) {
+        independently_construct_review_request_creation_policy_with_requirement_roles(
+            operation_start,
+            gate_scope_id,
+            common_scope_id,
+            review_roles,
+        )
+    } else {
+        let mut bytes = independently_construct_review_admission_policy_with_requirement_roles(
+            operation_start,
+            gate_scope_id,
+            common_scope_id,
+            review_roles,
+            policy_includes_verification_requirement,
+        );
+        if let Some(policy_context_id) = policy_context_id {
+            *bytes.last_mut().unwrap() = policy_context_id;
+        }
+        bytes
+    };
     if policy_anchor_current_head_only {
         let anchor_requirement = policy_bytes
             .windows(7)
@@ -864,6 +1067,8 @@ fn authoritative_review_admission_fixture_with_overrides(
         3,
         JournalEntryHash::try_from(committed_entry_hash.as_slice()).unwrap(),
         policy_id,
+        gate_scope_id,
+        common_scope_id,
     );
     let policy_entry_hash: [u8; 32] = Sha256::digest(&policy_entry).into();
     let policy_reference = JournalReference::new(
@@ -882,7 +1087,9 @@ fn authoritative_review_admission_fixture_with_overrides(
     .unwrap();
     let request_bytes =
         independently_construct_version_1_review_request_with_freeze_policy_scope_anchor_and_start(
-            &freeze_authority_reference,
+            request_freeze_authority
+                .as_ref()
+                .unwrap_or(&freeze_authority_reference),
             &policy_reference,
             common_scope_id,
             *package_anchor.anchor_id().as_bytes(),
@@ -924,7 +1131,10 @@ fn authoritative_review_admission_fixture_with_overrides(
             request.record_id(),
             *package_anchor.anchor_id().as_bytes(),
             &request_identity_dependencies,
-            &[&freeze_authority_reference, &policy_reference],
+            &[
+                request.freeze_authority_ref(),
+                request.policy_authority_ref(),
+            ],
         ),
         AuthorityDependencyMode::Extra => review_request_recorded_entry_at_with_authorities(
             4,
@@ -947,17 +1157,47 @@ fn authoritative_review_admission_fixture_with_overrides(
         evidence_registry::EventTypeId::try_from(300_u64).unwrap(),
         EventRecordId::try_from(request.record_id().as_bytes().as_slice()).unwrap(),
     );
+    let selected_result_request_authority = result_request_authority
+        .as_ref()
+        .unwrap_or(&request_reference)
+        .clone();
+    let selected_result_freeze_authority = result_freeze_authority
+        .as_ref()
+        .unwrap_or(&freeze_authority_reference)
+        .clone();
+    let selected_result_scope_ref = result_scope_ref.unwrap_or(common_scope_id);
+    let selected_result_package_anchor_id =
+        result_package_anchor_id.unwrap_or(*package_anchor.anchor_id().as_bytes());
+    let selected_result_operation_start = result_operation_start
+        .as_ref()
+        .unwrap_or(&request_reference)
+        .clone();
+    let selected_result_manifest_id = result_manifest_id.unwrap_or(manifest_id);
+    let selected_result_method_ref = result_method_ref.unwrap_or(request.review_method_ref());
     let mut result_bytes =
         independently_construct_version_1_review_result_with_freeze_scope_and_start(
-            &request_reference,
-            &freeze_authority_reference,
-            common_scope_id,
-            *package_anchor.anchor_id().as_bytes(),
-            result_operation_start
-                .as_ref()
-                .unwrap_or(&request_reference),
-            manifest_id,
+            &selected_result_request_authority,
+            &selected_result_freeze_authority,
+            selected_result_scope_ref,
+            selected_result_package_anchor_id,
+            &selected_result_operation_start,
+            selected_result_manifest_id,
         );
+    if let Some(role_id) = result_review_role_id {
+        let role = result_bytes
+            .windows(3)
+            .position(|window| window == [0x13, 0x05, 0x14])
+            .unwrap();
+        result_bytes[role + 1] = role_id;
+    }
+    if result_method_ref.is_some() {
+        let method = result_bytes
+            .windows(4)
+            .position(|window| window == [0x15, 0x58, 0x20, 0xe0])
+            .unwrap();
+        result_bytes[method + 3..method + 35]
+            .copy_from_slice(selected_result_method_ref.as_bytes());
+    }
     let status_fields = result_bytes
         .windows(6)
         .position(|window| window == [0x16, 0x01, 0x17, 0x01, 0x18, 0x18])
@@ -968,27 +1208,61 @@ fn authoritative_review_admission_fixture_with_overrides(
     if let Some(finding_state) = result_finding_state {
         result_bytes[status_fields + 3] = finding_state;
     }
-    let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
+    if let Some(findings) = result_findings.as_ref() {
+        let empty_findings = result_bytes
+            .windows(5)
+            .position(|window| window == [0x18, 0x19, 0x80, 0x18, 0x1b])
+            .unwrap();
+        let mut encoded = vec![0x80 + u8::try_from(findings.len()).unwrap()];
+        for finding in findings {
+            append_bstr_32(&mut encoded, *finding.as_bytes());
+        }
+        result_bytes.splice(empty_findings + 2..empty_findings + 3, encoded);
+    }
+    let result_frame = StrictRecordFrame::decode_authoritative(&result_bytes).unwrap();
+    let mut result_identity_dependencies = vec![
+        (1, *selected_result_manifest_id.as_bytes()),
+        (1, *selected_result_scope_ref.as_bytes()),
+        (1, *selected_result_method_ref.as_bytes()),
+        (2, selected_result_package_anchor_id),
+    ];
+    result_identity_dependencies.extend(
+        result_findings
+            .iter()
+            .flatten()
+            .map(|finding| (1, *finding.as_bytes())),
+    );
+    match result_identities.unwrap_or(IdentityDependencyMode::Exact) {
+        IdentityDependencyMode::Missing => {
+            result_identity_dependencies.remove(0);
+        }
+        IdentityDependencyMode::Exact => {}
+        IdentityDependencyMode::Extra => {
+            result_identity_dependencies.push((1, *start_record.record_id().as_bytes()));
+        }
+    }
+    result_identity_dependencies.sort_unstable();
+    result_identity_dependencies.dedup();
     let result_entry = match result_authorities {
-        AuthorityDependencyMode::Missing => review_result_recorded_entry(
+        AuthorityDependencyMode::Missing => review_result_recorded_entry_with_dependencies(
             5,
             JournalEntryHash::try_from(request_entry_hash.as_slice()).unwrap(),
-            result.record_id(),
-            Some(*package_anchor.anchor_id().as_bytes()),
-            None,
+            result_frame.record_id(),
+            &result_identity_dependencies,
+            &[],
         ),
-        AuthorityDependencyMode::Exact => review_result_recorded_entry(
+        AuthorityDependencyMode::Exact => review_result_recorded_entry_with_dependencies(
             5,
             JournalEntryHash::try_from(request_entry_hash.as_slice()).unwrap(),
-            result.record_id(),
-            Some(*package_anchor.anchor_id().as_bytes()),
-            Some(&request_reference),
+            result_frame.record_id(),
+            &result_identity_dependencies,
+            &[&selected_result_request_authority],
         ),
-        AuthorityDependencyMode::Extra => review_result_recorded_entry_with_authorities(
+        AuthorityDependencyMode::Extra => review_result_recorded_entry_with_dependencies(
             5,
             JournalEntryHash::try_from(request_entry_hash.as_slice()).unwrap(),
-            result.record_id(),
-            *package_anchor.anchor_id().as_bytes(),
+            result_frame.record_id(),
+            &result_identity_dependencies,
             &[&freeze_authority_reference, &request_reference],
         ),
     };
@@ -998,7 +1272,7 @@ fn authoritative_review_admission_fixture_with_overrides(
         JournalEntryIndex::try_from(5_u64).unwrap(),
         JournalEntryHash::try_from(result_entry_hash.as_slice()).unwrap(),
         evidence_registry::EventTypeId::try_from(301_u64).unwrap(),
-        EventRecordId::try_from(result.record_id().as_bytes().as_slice()).unwrap(),
+        EventRecordId::try_from(result_frame.record_id().as_bytes().as_slice()).unwrap(),
     );
     let genesis_entry_bytes = genesis.authoritative_cbor();
     let genesis_record_bytes = genesis_record().authoritative_cbor();
@@ -1013,10 +1287,11 @@ fn authoritative_review_admission_fixture_with_overrides(
         (start_record.record_id(), start_record.authoritative_cbor()),
         (receipt_id, receipt_bytes),
         (manifest_id, manifest_bytes),
+        (freeze_policy_id, freeze_policy_bytes),
         (gate_scope_id, gate_scope_bytes),
         (policy_id, policy_bytes),
         (request.record_id(), request_bytes.clone()),
-        (result.record_id(), result_bytes.clone()),
+        (result_frame.record_id(), result_bytes.clone()),
     ];
     if common_scope_id != gate_scope_id {
         records.push((common_scope_id, common_scope_bytes));
@@ -1094,12 +1369,19 @@ fn future_review_admission_pair(
     );
     let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
     let result_index = request_index.checked_add(1).unwrap();
-    let result_entry = review_result_recorded_entry(
+    let mut result_identity_dependencies = vec![
+        (1, *result.manifest_id().as_bytes()),
+        (1, *result.review_scope_ref().as_bytes()),
+        (1, *result.review_method_ref().as_bytes()),
+        (2, *result.review_package_anchor_id().as_bytes()),
+    ];
+    result_identity_dependencies.sort_unstable();
+    let result_entry = review_result_recorded_entry_with_dependencies(
         result_index,
         JournalEntryHash::try_from(request_entry_hash.as_slice()).unwrap(),
         result.record_id(),
-        Some(*result.review_package_anchor_id().as_bytes()),
-        Some(&request_reference),
+        &result_identity_dependencies,
+        &[&request_reference],
     );
     let result_entry_hash: [u8; 32] = Sha256::digest(&result_entry).into();
     let result_reference = JournalReference::new(
@@ -1149,7 +1431,7 @@ fn authoritative_review_admission_fixture_with_test_overrides(
 ) -> AuthoritativeReviewAdmissionFixture {
     authoritative_review_admission_fixture_with_overrides(
         false,
-        &[7],
+        &[5],
         IdentityDependencyMode::Exact,
         AuthorityDependencyMode::Exact,
         AuthorityDependencyMode::Exact,
@@ -1221,11 +1503,10 @@ fn retained_journal_exposes_the_exact_current_head_for_accept_and_snapshot() {
 }
 
 #[test]
-fn policy_registry_binds_the_frozen_evaluator_1015_identity() {
-    assert!(policy_evaluator_registry().iter().any(|registration| {
-        registration.id == 1015
-            && registration.name == "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING"
-    }));
+fn policy_registry_excludes_unassigned_evaluator_1015() {
+    assert!(policy_evaluator_registry()
+        .iter()
+        .all(|registration| registration.id != 1015));
 }
 
 #[test]
@@ -1356,8 +1637,32 @@ fn version_1_review_request_strictly_decodes_its_anchor_transport_fields() {
     );
     let record = ReviewRequestRecord::decode_authoritative(&bytes).unwrap();
 
-    assert_eq!(record.review_package_anchor_binding_version(), 1);
     assert_eq!(record.review_package_anchor_id().as_bytes(), &id(0x10));
+}
+
+#[test]
+fn frozen_v03_review_records_accept_only_the_assigned_local_fields() {
+    assert!(ReviewRequestRecord::decode_authoritative(
+        &independently_construct_frozen_v03_review_request()
+    )
+    .is_ok());
+    assert!(ReviewResultRecord::decode_authoritative(
+        &independently_construct_frozen_v03_review_result()
+    )
+    .is_ok());
+
+    assert_eq!(
+        ReviewRequestRecord::decode_authoritative(
+            &independently_construct_review_request_with_unassigned_key_25()
+        ),
+        Err(evidence_registry::RecordDecodeError)
+    );
+    assert_eq!(
+        ReviewResultRecord::decode_authoritative(
+            &independently_construct_review_result_with_unassigned_key_29()
+        ),
+        Err(evidence_registry::RecordDecodeError)
+    );
 }
 
 #[test]
@@ -1365,8 +1670,169 @@ fn version_1_review_result_strictly_decodes_the_exact_anchor_transport_fields() 
     let bytes = independently_construct_version_1_review_result();
     let record = ReviewResultRecord::decode_authoritative(&bytes).unwrap();
 
-    assert_eq!(record.review_package_anchor_binding_version(), 1);
     assert_eq!(record.review_package_anchor_id().as_bytes(), &id(0x10));
+}
+
+#[test]
+fn review_request_and_result_reject_unassigned_review_role_ids() {
+    let mut request = independently_construct_version_1_review_request();
+    let request_role = request
+        .windows(3)
+        .position(|window| window == [0x12, 0x05, 0x13])
+        .unwrap();
+    request[request_role + 1] = 0x06;
+    assert_eq!(
+        ReviewRequestRecord::decode_authoritative(&request),
+        Err(evidence_registry::RecordDecodeError)
+    );
+
+    let mut result = independently_construct_version_1_review_result();
+    let result_role = result
+        .windows(3)
+        .position(|window| window == [0x13, 0x05, 0x14])
+        .unwrap();
+    result[result_role + 1] = 0x06;
+    assert_eq!(
+        ReviewResultRecord::decode_authoritative(&result),
+        Err(evidence_registry::RecordDecodeError)
+    );
+}
+
+#[test]
+fn review_result_rejects_unassigned_method_status_and_finding_state() {
+    for status_offset in [1_usize, 3] {
+        let mut result = independently_construct_version_1_review_result();
+        let status_fields = result
+            .windows(6)
+            .position(|window| window == [0x16, 0x01, 0x17, 0x01, 0x18, 0x18])
+            .unwrap();
+        result[status_fields + status_offset] = 0x04;
+
+        assert_eq!(
+            ReviewResultRecord::decode_authoritative(&result),
+            Err(evidence_registry::RecordDecodeError)
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_store_open_requires_the_exact_freeze_commit_policy_context() {
+    let mut missing_policy = authoritative_review_admission_fixture(true);
+    let freeze_policy_id = missing_policy
+        .resolver
+        .0
+        .iter()
+        .find_map(|(_, bytes)| {
+            FreezeAttemptStartRecord::decode_authoritative(bytes)
+                .ok()
+                .map(|start| start.input().policy_record_id)
+        })
+        .unwrap();
+    missing_policy
+        .resolver
+        .0
+        .retain(|(record_id, _)| *record_id != freeze_policy_id);
+    let missing_policy_store = AuthoritativeReviewStoreFixtureDir::from_fixture(&missing_policy);
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&missing_policy_store.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+
+    let unsupported_context = authoritative_review_admission_fixture_with_overrides(
+        true,
+        &[5],
+        IdentityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        ReviewAdmissionFixtureOverrides {
+            freeze_policy_context_id: Some(3),
+            ..Default::default()
+        },
+    );
+    let unsupported_context_store =
+        AuthoritativeReviewStoreFixtureDir::from_fixture(&unsupported_context);
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&unsupported_context_store.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_store_open_evaluates_freeze_minimum_durability() {
+    let fixture = |file_content_flush_state| {
+        authoritative_review_admission_fixture_with_overrides(
+            true,
+            &[5],
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            ReviewAdmissionFixtureOverrides {
+                freeze_policy_minimum_durability: Some([true, false, false, false]),
+                freeze_receipt_file_content_flush_state: Some(file_content_flush_state),
+                ..Default::default()
+            },
+        )
+    };
+
+    let satisfied = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(1));
+    assert!(AuthoritativeRegistryStore::open(&satisfied.path).is_ok());
+
+    let unsatisfied = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(2));
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&unsatisfied.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+}
+
+#[test]
+fn authoritative_store_open_rejects_unassigned_review_result_status_registries() {
+    for overrides in [
+        ReviewAdmissionFixtureOverrides {
+            result_method_status: Some(4),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_finding_state: Some(4),
+            ..Default::default()
+        },
+    ] {
+        let fixture = authoritative_review_admission_fixture_with_overrides(
+            true,
+            &[5],
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            overrides,
+        );
+        let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+
+        assert_eq!(
+            AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+            evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_store_projects_repeated_result_findings_into_one_identity_set_member() {
+    let finding = RecordId::try_from(id(0xf1).as_slice()).unwrap();
+    let fixture = authoritative_review_admission_fixture_with_overrides(
+        true,
+        &[5],
+        IdentityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        ReviewAdmissionFixtureOverrides {
+            result_findings: Some(vec![finding, finding]),
+            ..Default::default()
+        },
+    );
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+
+    assert!(AuthoritativeRegistryStore::open(&store_dir.path).is_ok());
 }
 
 #[test]
@@ -1382,14 +1848,14 @@ fn version_1_review_records_expose_exact_section_82_comparison_fields() {
 
     assert_eq!(request.freeze_authority_ref().event_type_id().value(), 101);
     assert_eq!(request.manifest_id().as_bytes(), &id(0x80));
-    assert_eq!(request.review_role_id(), 7);
+    assert_eq!(request.review_role_id(), 5);
     assert_eq!(request.required_checks_ref().as_bytes(), &id(0xa0));
     assert_eq!(request.policy_authority_ref().event_type_id().value(), 400);
     assert_eq!(request.review_scope_ref().as_bytes(), &id(0xc0));
     assert_eq!(request.review_method_ref().as_bytes(), &id(0xe0));
     assert_eq!(result.freeze_authority_ref().event_type_id().value(), 101);
     assert_eq!(result.manifest_id().as_bytes(), &id(0x80));
-    assert_eq!(result.review_role_id(), 7);
+    assert_eq!(result.review_role_id(), 5);
     assert_eq!(result.review_scope_ref().as_bytes(), &id(0xc0));
     assert_eq!(result.review_method_ref().as_bytes(), &id(0xe0));
     assert_eq!(result.method_status(), 1);
@@ -1948,7 +2414,7 @@ fn policy_registration_chronology_failure_is_integrated_before_generic_authority
 fn unsupported_policy_context_is_integrated_before_generic_authority_unavailability() {
     let fixture = authoritative_review_admission_fixture_with_test_overrides(
         ReviewAdmissionFixtureOverrides {
-            policy_context_id: Some(1),
+            policy_context_id: Some(5),
             ..Default::default()
         },
     );
@@ -2399,8 +2865,9 @@ fn structurally_complete_inputs_without_authoritative_store_provenance_remain_pr
     assert_eq!(fixture.journal.current_head_reference(), opening_head);
 }
 
+#[cfg(windows)]
 #[test]
-fn authoritative_store_derives_complete_section_82_without_caller_record_authority() {
+fn authoritative_store_keeps_section_82_preterminal_without_freeze_semantic_authority() {
     let fixture = authoritative_review_admission_fixture(true);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
     let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
@@ -2417,39 +2884,13 @@ fn authoritative_store_derives_complete_section_82_without_caller_record_authori
         &fixture.result_reference
     );
 
-    let section_82 = store
-        .complete_authoritative_review_admission_section_82(accepted)
-        .unwrap();
-
     assert_eq!(
-        section_82.operation_start_journal_ref(),
-        &fixture.result_reference
-    );
-    assert_eq!(
-        section_82.request_event_reference(),
-        &fixture.request_reference
-    );
-    assert_eq!(
-        section_82.result_event_reference(),
-        &fixture.result_reference
-    );
-    assert_eq!(
-        section_82.policy_authority_ref(),
-        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
-            .unwrap()
-            .policy_authority_ref()
-    );
-    assert_eq!(
-        section_82.common_review_scope_ref(),
-        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
-            .unwrap()
-            .review_scope_ref()
-    );
-    assert_eq!(
-        section_82.freeze_authority().committed_event_reference(),
-        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
-            .unwrap()
-            .freeze_authority_ref()
+        store.complete_authoritative_review_admission_section_82(accepted),
+        Err(
+            evidence_registry::AuthoritativeReviewAdmissionSection82Error::FreezeAuthority(
+                evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
+            )
+        )
     );
 
     let mut caller_substitution = fixture.request_bytes.clone();
@@ -2470,152 +2911,18 @@ fn authoritative_store_derives_complete_section_82_without_caller_record_authori
     );
 }
 
-#[test]
-fn authoritative_policy_46_composes_one_1001_result_and_mandatory_1015() {
-    fn complete(
-        fixture: &AuthoritativeReviewAdmissionFixture,
-    ) -> evidence_registry::ReviewAdmissionPolicy46Completion {
-        let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(fixture);
-        let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-        let accepted = store
-            .accept_authoritative_review_admission(
-                fixture.request_reference.clone(),
-                &fixture.request_bytes,
-                fixture.result_reference.clone(),
-                &fixture.result_bytes,
-            )
-            .unwrap();
-        let section_82 = store
-            .complete_authoritative_review_admission_section_82(accepted)
-            .unwrap();
-        evidence_registry::evaluate_authoritative_review_admission_policy_46(section_82)
-    }
-
-    fn fixture_with(
-        overrides: ReviewAdmissionFixtureOverrides,
-    ) -> AuthoritativeReviewAdmissionFixture {
-        authoritative_review_admission_fixture_with_overrides(
-            true,
-            &[7],
-            IdentityDependencyMode::Exact,
-            AuthorityDependencyMode::Exact,
-            AuthorityDependencyMode::Exact,
-            overrides,
-        )
-    }
-
-    fn assert_only_failure(
-        completion: &evidence_registry::ReviewAdmissionPolicy46Completion,
-        evaluator_id: u16,
-    ) {
-        assert_eq!(
-            completion.result(),
-            evidence_registry::ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
-        );
-        assert_eq!(
-            completion
-                .evaluator_results()
-                .iter()
-                .filter(|result| {
-                    result.outcome()
-                        == evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Fail
-                })
-                .map(|result| result.evaluator_id())
-                .collect::<Vec<_>>(),
-            vec![evaluator_id]
-        );
-    }
-
-    let alternate_selector_matches = complete(&authoritative_review_admission_fixture_with_roles(
-        true,
-        &[6, 7],
-    ));
-    assert_eq!(
-        alternate_selector_matches.result(),
-        evidence_registry::ReviewAdmissionCompletedPolicyResult::Satisfied
-    );
-    assert_eq!(
-        alternate_selector_matches
-            .evaluator_results()
-            .iter()
-            .map(|result| result.evaluator_id())
-            .collect::<Vec<_>>(),
-        vec![1001, 1003, 1004, 1009, 1015]
-    );
-    assert_eq!(
-        alternate_selector_matches
-            .evaluator_results()
-            .iter()
-            .filter(|result| result.evaluator_id() == 1001)
-            .count(),
-        1
-    );
-    assert_eq!(
-        alternate_selector_matches.evaluator_results()[0].outcome(),
-        evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Pass
-    );
-
-    let no_selector_matches = complete(&authoritative_review_admission_fixture_with_roles(
-        true,
-        &[6],
-    ));
-    assert_eq!(
-        no_selector_matches.result(),
-        evidence_registry::ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
-    );
-    assert_eq!(
-        no_selector_matches.evaluator_results()[0].outcome(),
-        evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Fail
-    );
-
-    let gate_scope_mismatch = complete(&authoritative_review_admission_fixture(false));
-    assert_eq!(
-        gate_scope_mismatch.result(),
-        evidence_registry::ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
-    );
-    assert_eq!(
-        gate_scope_mismatch
-            .evaluator_results()
-            .iter()
-            .find(|result| result.evaluator_id() == 1015)
-            .unwrap()
-            .outcome(),
-        evidence_registry::ReviewAdmissionIndividualEvaluatorOutcome::Fail
-    );
-
-    assert_only_failure(
-        &complete(&fixture_with(ReviewAdmissionFixtureOverrides {
-            result_method_status: Some(2),
-            ..Default::default()
-        })),
-        1003,
-    );
-    assert_only_failure(
-        &complete(&fixture_with(ReviewAdmissionFixtureOverrides {
-            result_finding_state: Some(2),
-            ..Default::default()
-        })),
-        1004,
-    );
-    assert_only_failure(
-        &complete(&fixture_with(ReviewAdmissionFixtureOverrides {
-            policy_anchor_current_head_only: true,
-            ..Default::default()
-        })),
-        1009,
-    );
-}
-
+// Disabled predecessor profile: governing v0.3 authority does not assign evaluator 1015.
+#[cfg(windows)]
 #[test]
 fn authoritative_policy_context_unsupported_never_becomes_a_completed_policy_result() {
     let fixture = authoritative_review_admission_fixture_with_overrides(
         true,
-        &[7],
+        &[5],
         IdentityDependencyMode::Exact,
         AuthorityDependencyMode::Exact,
         AuthorityDependencyMode::Exact,
         ReviewAdmissionFixtureOverrides {
-            policy_context_id: Some(1),
+            policy_context_id: Some(5),
             ..Default::default()
         },
     );
@@ -2642,9 +2949,442 @@ fn authoritative_policy_context_unsupported_never_becomes_a_completed_policy_res
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn authoritative_store_fails_closed_without_mandatory_generation_protection() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RetainedGenerationProtectionUnavailable
+    );
+}
+
+// Disabled predecessor profile: terminal publication is fail-closed before generic Scope semantics.
+#[cfg(windows)]
+#[test]
+fn authoritative_replay_does_not_promote_locally_framed_terminal_admission_history() {
+    let fixture = authoritative_review_admission_fixture_with_overrides(
+        true,
+        &[5],
+        IdentityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        ReviewAdmissionFixtureOverrides {
+            policy_context_id: Some(5),
+            ..Default::default()
+        },
+    );
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let request = ReviewRequestRecord::decode_authoritative(&fixture.request_bytes).unwrap();
+    let admission = ReviewAdmissionRecord::new(ReviewAdmissionRecordInput {
+        disposition_id: 1,
+        review_request_ref: fixture.request_reference.clone(),
+        review_result_ref: fixture.result_reference.clone(),
+        policy_authority_ref: request.policy_authority_ref().clone(),
+        reason_codes: vec!["POLICY_SATISFIED".to_owned()],
+        operation_start_journal_ref: fixture.result_reference.clone(),
+    })
+    .unwrap();
+    let retained_head = fixture.journal.current_head_reference();
+    let retained_entry = fixture.journal.resolve_reference(&retained_head).unwrap();
+    let terminal = ReviewAdmissionJournalEntry::new(ReviewAdmissionJournalEntryInput {
+        registry_id: retained_head.registry_id(),
+        entry_index: JournalEntryIndex::try_from(6_u64).unwrap(),
+        previous_entry_hash: retained_head.entry_hash(),
+        admission: admission.clone(),
+        storage_capability_class_id: retained_entry.storage_capability_class_id(),
+        environment_observation_id: retained_entry.environment_observation_id(),
+    })
+    .unwrap();
+    fs::write(
+        store_dir
+            .path
+            .join("records")
+            .join(record_filename(admission.record_id())),
+        admission.authoritative_cbor(),
+    )
+    .unwrap();
+    fs::write(
+        store_dir.path.join("journal/00000000000000000006.cbor"),
+        terminal.authoritative_cbor(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_replay_does_not_claim_disposition_without_frozen_scope_applicability() {
+    let fixture = authoritative_review_admission_fixture(false);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let request = ReviewRequestRecord::decode_authoritative(&fixture.request_bytes).unwrap();
+    let admission = ReviewAdmissionRecord::new(ReviewAdmissionRecordInput {
+        disposition_id: 1,
+        review_request_ref: fixture.request_reference.clone(),
+        review_result_ref: fixture.result_reference.clone(),
+        policy_authority_ref: request.policy_authority_ref().clone(),
+        reason_codes: vec!["POLICY_SATISFIED".to_owned()],
+        operation_start_journal_ref: fixture.result_reference.clone(),
+    })
+    .unwrap();
+    let retained_head = fixture.journal.current_head_reference();
+    let retained_entry = fixture.journal.resolve_reference(&retained_head).unwrap();
+    let terminal = ReviewAdmissionJournalEntry::new(ReviewAdmissionJournalEntryInput {
+        registry_id: retained_head.registry_id(),
+        entry_index: JournalEntryIndex::try_from(6_u64).unwrap(),
+        previous_entry_hash: retained_head.entry_hash(),
+        admission: admission.clone(),
+        storage_capability_class_id: retained_entry.storage_capability_class_id(),
+        environment_observation_id: retained_entry.environment_observation_id(),
+    })
+    .unwrap();
+    fs::write(
+        store_dir
+            .path
+            .join("records")
+            .join(record_filename(admission.record_id())),
+        admission.authoritative_cbor(),
+    )
+    .unwrap();
+    fs::write(
+        store_dir.path.join("journal/00000000000000000006.cbor"),
+        terminal.authoritative_cbor(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_replay_rejects_freeze_start_record_root_mismatch_before_later_semantics() {
+    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            freeze_start_record_intended_root: Some(id(0x33)),
+            ..Default::default()
+        },
+    );
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_replay_rejects_start_only_prefix_without_freeze_commit_policy_context() {
+    let mut fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            freeze_policy_context_id: Some(3),
+            ..Default::default()
+        },
+    );
+    fixture.journal_entry_bytes.truncate(2);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_replay_accepts_valid_multi_context_policy_topology() {
+    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            policy_includes_verification_requirement: true,
+            ..Default::default()
+        },
+    );
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+
+    assert!(AuthoritativeRegistryStore::open(&store_dir.path).is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_replay_rejects_duplicate_manifest_paths_before_freeze_authority() {
+    let mut manifest = hex_bytes(MANIFEST_RECORD_HEX);
+    let fields = manifest
+        .windows(8)
+        .position(|window| window == [0x11, 0x01, 0x12, 0x01, 0x13, 0x01, 0x14, 0x81])
+        .unwrap();
+    manifest[fields + 1] = 0x02;
+    manifest[fields + 7] = 0x82;
+    let artifact = manifest[fields + 8..].to_vec();
+    manifest.extend_from_slice(&artifact);
+    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+        ReviewAdmissionFixtureOverrides {
+            manifest_bytes: Some(manifest),
+            ..Default::default()
+        },
+    );
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_replay_rejects_review_request_outside_policy_selector_set() {
+    let fixture = authoritative_review_admission_fixture_with_roles(true, &[4]);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+    );
+}
+
+#[test]
+fn authoritative_store_rejects_oversized_retained_objects_before_reading_them() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let auxiliary_record = ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
+        .unwrap()
+        .manifest_id();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(
+            store_dir
+                .path
+                .join("records")
+                .join(record_filename(auxiliary_record)),
+        )
+        .unwrap();
+    file.set_len(u64::try_from(AUTHORITATIVE_STORE_MAX_OBJECT_BYTES + 1).unwrap())
+        .unwrap();
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit,
+    );
+}
+
+#[test]
+fn authoritative_store_rejects_hardlinked_namespace_objects() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let request_path = store_dir.path.join("records").join(record_filename(
+        ReviewRequestRecord::decode_authoritative(&fixture.request_bytes)
+            .unwrap()
+            .record_id(),
+    ));
+    let alias = store_dir.path.join("request-record-alias.cbor");
+    fs::hard_link(&request_path, &alias).unwrap();
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_store_open_holds_retained_authority_bytes_against_in_place_writes() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let result_id = StrictRecordFrame::decode_authoritative(&fixture.result_bytes)
+        .unwrap()
+        .record_id();
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let result_path = store_dir
+        .path
+        .join("records")
+        .join(record_filename(result_id));
+    let store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&result_path)
+            .is_err(),
+        "a positive store must retain a write-denying lease over every authority file"
+    );
+
+    drop(store);
+    assert!(fs::OpenOptions::new().write(true).open(result_path).is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_store_holds_namespace_directories_against_replacement() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    let records = store_dir.path.join("records");
+    let replacement = store_dir.path.join("records-replaced");
+
+    let rename = fs::rename(&records, &replacement);
+    if rename.is_ok() {
+        fs::rename(&replacement, &records).unwrap();
+    }
+    assert!(
+        rename.is_err(),
+        "a live authoritative store must hold its namespace"
+    );
+    assert_eq!(store.root(), store_dir.path.canonicalize().unwrap());
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_open_tolerates_bounded_publication_temp_residue_without_stealing_it() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let residue = store_dir
+        .path
+        .join("records/.evidence-registry-publish-4294967295-1.tmp");
+    fs::write(&residue, b"crash residue").unwrap();
+
+    let store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    assert_eq!(
+        store.retained_journal().current_head_reference(),
+        fixture.result_reference
+    );
+    assert!(
+        residue.exists(),
+        "opening must not delete a possibly live concurrent publisher's temp"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_open_recovers_the_hardlink_publish_crash_window() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let request_record = ReviewRequestRecord::decode_authoritative(&fixture.request_bytes).unwrap();
+    let record_path = store_dir
+        .path
+        .join("records")
+        .join(record_filename(request_record.record_id()));
+    let record_temp = store_dir
+        .path
+        .join("records/.evidence-registry-publish-700-1.tmp");
+    fs::hard_link(&record_path, &record_temp).unwrap();
+
+    let journal_path = store_dir.path.join("journal/00000000000000000005.cbor");
+    let journal_temp = store_dir
+        .path
+        .join("journal/.evidence-registry-publish-700-2.tmp");
+    fs::hard_link(&journal_path, &journal_temp).unwrap();
+
+    let reopened = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    assert_eq!(
+        reopened.retained_journal().current_head_reference(),
+        fixture.result_reference
+    );
+    assert!(record_temp.exists());
+    assert!(journal_temp.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_runtime_keeps_policy_context_unsupported_preterminal_and_unpublished() {
+    let fixture = authoritative_review_admission_fixture_with_overrides(
+        true,
+        &[5],
+        IdentityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        AuthorityDependencyMode::Exact,
+        ReviewAdmissionFixtureOverrides {
+            policy_context_id: Some(5),
+            ..Default::default()
+        },
+    );
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    let accepted = store
+        .accept_authoritative_review_admission(
+            fixture.request_reference,
+            &fixture.request_bytes,
+            fixture.result_reference.clone(),
+            &fixture.result_bytes,
+        )
+        .unwrap();
+    let outcome = store
+        .complete_authoritative_review_admission(accepted)
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
+            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
+                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
+                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported
+                )
+            )
+        )
+    ));
+    assert_eq!(
+        store.retained_journal().current_head_reference(),
+        fixture.result_reference
+    );
+    assert!(!store_dir
+        .path
+        .join("journal/00000000000000000006.cbor")
+        .exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn authoritative_runtime_does_not_promote_unfrozen_generic_gate_scope_semantics() {
+    let fixture = authoritative_review_admission_fixture(true);
+    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
+        .unwrap()
+        .count();
+    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    let accepted = store
+        .accept_authoritative_review_admission(
+            fixture.request_reference,
+            &fixture.request_bytes,
+            fixture.result_reference.clone(),
+            &fixture.result_bytes,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .complete_authoritative_review_admission(accepted)
+            .unwrap(),
+        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
+            evidence_registry::AuthoritativeReviewAdmissionSection82Error::FreezeAuthority(
+                evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
+            )
+        )
+    );
+    assert_eq!(
+        store.retained_journal().current_head_reference(),
+        fixture.result_reference
+    );
+    assert!(!store_dir
+        .path
+        .join("journal/00000000000000000006.cbor")
+        .exists());
+    assert_eq!(
+        fs::read_dir(store_dir.path.join("records"))
+            .unwrap()
+            .count(),
+        retained_record_count
+    );
+}
+
 #[test]
 fn evaluator_1001_is_not_invoked_without_authoritative_source_provenance() {
-    let mut fixture = authoritative_review_admission_fixture_with_roles(true, &[6, 7]);
+    let mut fixture = authoritative_review_admission_fixture_with_roles(true, &[4, 5]);
     let opening_head = fixture.journal.current_head_reference();
     let accepted = fixture
         .journal
@@ -2762,7 +3502,7 @@ fn intervening_appends_do_not_refresh_operation_start_before_preterminal_stop() 
 }
 
 #[test]
-fn evaluator_1015_failure_is_not_invoked_without_authoritative_source_provenance() {
+fn generic_gate_scope_mismatch_does_not_cross_the_preterminal_authority_boundary() {
     let mut fixture = authoritative_review_admission_fixture(false);
     let opening_head = fixture.journal.current_head_reference();
     let accepted = fixture
@@ -2848,7 +3588,7 @@ fn request_and_result_require_exact_identity_and_authority_dependency_sets() {
         let mut fixture =
             authoritative_review_admission_fixture_with_roles_and_authority_dependencies(
                 true,
-                &[7],
+                &[5],
                 identity_mode,
                 request_mode,
                 result_mode,
@@ -2877,6 +3617,158 @@ fn request_and_result_require_exact_identity_and_authority_dependency_sets() {
 
         assert_eq!(actual_error, expected_error);
         assert_eq!(fixture.journal.current_head_reference(), opening_head);
+    }
+}
+
+#[test]
+fn authoritative_replay_rejects_inexact_request_and_result_dependency_contracts() {
+    for (request_identities, request_authorities, result_authorities, result_identities) in [
+        (
+            IdentityDependencyMode::Missing,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            IdentityDependencyMode::Exact,
+        ),
+        (
+            IdentityDependencyMode::Extra,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            IdentityDependencyMode::Exact,
+        ),
+        (
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Missing,
+            AuthorityDependencyMode::Exact,
+            IdentityDependencyMode::Exact,
+        ),
+        (
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Extra,
+            AuthorityDependencyMode::Exact,
+            IdentityDependencyMode::Exact,
+        ),
+        (
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Missing,
+            IdentityDependencyMode::Exact,
+        ),
+        (
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Extra,
+            IdentityDependencyMode::Exact,
+        ),
+        (
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            IdentityDependencyMode::Missing,
+        ),
+        (
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            IdentityDependencyMode::Extra,
+        ),
+    ] {
+        let fixture = authoritative_review_admission_fixture_with_overrides(
+            true,
+            &[5],
+            request_identities,
+            request_authorities,
+            result_authorities,
+            ReviewAdmissionFixtureOverrides {
+                result_identities: Some(result_identities),
+                ..Default::default()
+            },
+        );
+        let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+        assert_eq!(
+            AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+            evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+        );
+    }
+}
+
+#[test]
+fn authoritative_replay_rejects_result_request_continuity_mismatch_without_terminal_event() {
+    let baseline = authoritative_review_admission_fixture(true);
+    let start_bytes = &baseline.journal_entry_bytes[1];
+    let start_id = baseline
+        .resolver
+        .0
+        .iter()
+        .find_map(|(record_id, bytes)| {
+            (StrictRecordFrame::decode_authoritative(bytes)
+                .ok()?
+                .record_type_id()
+                .value()
+                == 3)
+                .then_some(*record_id)
+        })
+        .unwrap();
+    let start_reference = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(1_u64).unwrap(),
+        JournalEntryHash::try_from(Sha256::digest(start_bytes).as_slice()).unwrap(),
+        evidence_registry::EventTypeId::try_from(100_u64).unwrap(),
+        EventRecordId::try_from(start_id.as_bytes().as_slice()).unwrap(),
+    );
+    let policy_reference = ReviewRequestRecord::decode_authoritative(&baseline.request_bytes)
+        .unwrap()
+        .policy_authority_ref()
+        .clone();
+    let mismatches = [
+        ReviewAdmissionFixtureOverrides {
+            request_freeze_authority: Some(start_reference.clone()),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_request_authority: Some(policy_reference),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_freeze_authority: Some(start_reference),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_manifest_id: Some(RecordId::try_from(id(0x91).as_slice()).unwrap()),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_review_role_id: Some(4),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_scope_ref: Some(RecordId::try_from(id(0x92).as_slice()).unwrap()),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_method_ref: Some(RecordId::try_from(id(0x93).as_slice()).unwrap()),
+            ..Default::default()
+        },
+        ReviewAdmissionFixtureOverrides {
+            result_package_anchor_id: Some(id(0x94)),
+            ..Default::default()
+        },
+    ];
+
+    for overrides in mismatches {
+        let fixture = authoritative_review_admission_fixture_with_overrides(
+            true,
+            &[5],
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            overrides,
+        );
+        let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
+        assert_eq!(
+            AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+            evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+            "event 300/301 authority roles and redundant fields must bind before a terminal event",
+        );
     }
 }
 

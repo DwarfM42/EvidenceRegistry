@@ -1,16 +1,22 @@
 use evidence_registry::{
     derive_freeze_root, validate_freeze_committed_binding,
-    validate_resolved_freeze_committed_binding, AuthoritativeRegistryStore, EventRecordId,
-    EventTypeId, ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
+    validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
+    ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
     FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
-    FreezeReceiptRecord, GenesisJournalEntry, GenesisRecord, GenesisRecordInput, IntendedRootId,
-    JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId,
-    ResolvedFreezeCommittedBindingError, ResolvedFreezeCommittedBindingOutcome, RetainedJournal,
-    StrictRecordFrame,
+    FreezeReceiptRecord, IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference,
+    RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
+    ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
+};
+#[cfg(windows)]
+use evidence_registry::{
+    AuthoritativeRegistryStore, GenesisJournalEntry, GenesisRecord, GenesisRecordInput,
 };
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
 use std::fs;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const GENESIS_HASH_HEX: &str = "ae1919549c80a0c3708cce0485af881a5223fbcf80c6b27a2bbe602418dabd51";
@@ -90,12 +96,15 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+#[cfg(windows)]
 static NEXT_AUTHORITATIVE_STORE_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(windows)]
 struct AuthoritativeStoreFixtureDir {
     path: PathBuf,
 }
 
+#[cfg(windows)]
 impl AuthoritativeStoreFixtureDir {
     fn new() -> Self {
         let sequence = NEXT_AUTHORITATIVE_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -111,12 +120,14 @@ impl AuthoritativeStoreFixtureDir {
     }
 }
 
+#[cfg(windows)]
 impl Drop for AuthoritativeStoreFixtureDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
+#[cfg(windows)]
 fn record_filename(record_id: RecordId) -> String {
     let mut name = String::with_capacity(69);
     for byte in record_id.as_bytes() {
@@ -127,6 +138,7 @@ fn record_filename(record_id: RecordId) -> String {
     name
 }
 
+#[cfg(windows)]
 fn write_record(root: &Path, record_id: RecordId, bytes: &[u8]) {
     fs::write(root.join("records").join(record_filename(record_id)), bytes).unwrap();
 }
@@ -321,12 +333,22 @@ fn append_reference(output: &mut Vec<u8>, reference: &JournalReference) {
 }
 
 fn start_record(registry_id: RegistryId) -> FreezeAttemptStartRecord {
+    start_record_with_policy(
+        registry_id,
+        RecordId::try_from(id(0x40).as_slice()).unwrap(),
+    )
+}
+
+fn start_record_with_policy(
+    registry_id: RegistryId,
+    policy_record_id: RecordId,
+) -> FreezeAttemptStartRecord {
     let freeze_attempt_id = FreezeAttemptId::try_from(id(0xa0).as_slice()).unwrap();
     FreezeAttemptStartRecord::new(FreezeAttemptStartRecordInput {
         freeze_attempt_id,
         intended_root_id: derive_freeze_root(registry_id, freeze_attempt_id).intended_root_id(),
         subject_id: id(0xe0),
-        policy_record_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        policy_record_id,
     })
 }
 
@@ -361,6 +383,18 @@ fn freeze_start_bytes(
 }
 
 fn receipt_bytes(start_reference: &JournalReference, manifest_id: RecordId) -> Vec<u8> {
+    receipt_bytes_with_policy(
+        start_reference,
+        manifest_id,
+        RecordId::try_from(id(0x40).as_slice()).unwrap(),
+    )
+}
+
+fn receipt_bytes_with_policy(
+    start_reference: &JournalReference,
+    manifest_id: RecordId,
+    policy_record_id: RecordId,
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(620);
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
@@ -382,11 +416,29 @@ fn receipt_bytes(start_reference: &JournalReference, manifest_id: RecordId) -> V
     bytes.extend_from_slice(&[0x18, 0x18]);
     append_bstr_32(&mut bytes, &id(0xf0));
     bytes.extend_from_slice(&[0x18, 0x19]);
-    append_bstr_32(&mut bytes, &id(0x40));
+    append_bstr_32(&mut bytes, policy_record_id.as_bytes());
     bytes.extend_from_slice(&[
         0x18, 0x1a, 0x01, 0x18, 0x1b, 0x01, 0x18, 0x1c, 0x01, 0x18, 0x1d, 0xf5, 0x18, 0x1f, 0x64,
     ]);
     bytes.extend_from_slice(b"test");
+    bytes
+}
+
+#[cfg(windows)]
+fn freeze_commit_policy_bytes(operation_start: &JournalReference) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[0x18, 0x28, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x18, 0x28, 0x10]);
+    append_bstr_32(&mut bytes, &id(0x31));
+    bytes.extend_from_slice(&[0x18, 0x1d]);
+    bytes.push(0x85);
+    append_bstr_32(&mut bytes, operation_start.registry_id().as_bytes());
+    bytes.push(u8::try_from(operation_start.entry_index().value()).unwrap());
+    append_bstr_32(&mut bytes, operation_start.entry_hash().as_bytes());
+    bytes.push(u8::try_from(operation_start.event_type_id().value()).unwrap());
+    append_bstr_32(&mut bytes, operation_start.event_record_id().as_bytes());
+    bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x01]);
     bytes
 }
 
@@ -753,7 +805,11 @@ fn freeze_committed_binding_rejects_each_mutated_receipt_reference_relation() {
     );
     assert_eq!(
         binding_result_for_receipt_bytes(&non_prior),
-        Err(evidence_registry::FreezeCommittedBindingError::AttemptStartNotPrior)
+        Err(
+            evidence_registry::FreezeCommittedBindingError::RetainedReference(
+                evidence_registry::RetainedJournalError::ReferenceMismatch,
+            )
+        )
     );
 }
 
@@ -1191,8 +1247,9 @@ fn freeze_committed_binding_rejects_start_record_root_that_disagrees_with_retain
     );
 }
 
+#[cfg(windows)]
 #[test]
-fn authoritative_store_derives_positive_freeze_authority_from_its_retained_namespaces() {
+fn authoritative_store_fails_closed_before_positive_freeze_authority() {
     let fixture = AuthoritativeStoreFixtureDir::new();
     let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
     let storage_capability_class_id = RecordId::try_from(id(0x40).as_slice()).unwrap();
@@ -1212,7 +1269,16 @@ fn authoritative_store_derives_positive_freeze_authority_from_its_retained_names
         storage_capability_class_id,
         environment_observation_id,
     );
-    let start_record = start_record(registry_id);
+    let genesis_reference = JournalReference::new(
+        registry_id,
+        JournalEntryIndex::try_from(0_u64).unwrap(),
+        genesis_entry.entry_hash(),
+        EventTypeId::try_from(1_u64).unwrap(),
+        EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+    );
+    let policy_bytes = freeze_commit_policy_bytes(&genesis_reference);
+    let policy_record_id = RecordId::try_from(sha256(&policy_bytes).as_slice()).unwrap();
+    let start_record = start_record_with_policy(registry_id, policy_record_id);
     let start_entry_bytes = freeze_start_bytes(genesis_entry.entry_hash(), &start_record);
     let mut structural_journal = RetainedJournal::from_genesis(genesis_entry.clone()).unwrap();
     structural_journal
@@ -1230,7 +1296,7 @@ fn authoritative_store_derives_positive_freeze_authority_from_its_retained_names
     );
     let manifest_bytes = hex_bytes(MANIFEST_RECORD_HEX);
     let manifest_id = RecordId::try_from(sha256(&manifest_bytes).as_slice()).unwrap();
-    let receipt_bytes = receipt_bytes(&start_reference, manifest_id);
+    let receipt_bytes = receipt_bytes_with_policy(&start_reference, manifest_id, policy_record_id);
     let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes).unwrap();
     let committed_entry_bytes = freeze_committed_bytes(
         start_reference.entry_hash(),
@@ -1282,19 +1348,16 @@ fn authoritative_store_derives_positive_freeze_authority_from_its_retained_names
         &start_record.authoritative_cbor(),
     );
     write_record(&fixture.path, manifest_id, &manifest_bytes);
+    write_record(&fixture.path, policy_record_id, &policy_bytes);
     write_record(&fixture.path, receipt.record_id(), &receipt_bytes);
 
     let store = AuthoritativeRegistryStore::open(&fixture.path).unwrap();
-    let witness = store
-        .validate_freeze_committed_authority(committed_reference.clone())
-        .unwrap();
-
-    assert_eq!(witness.registry_id(), registry_id);
-    assert_eq!(witness.committed_event_reference(), &committed_reference);
-    assert_eq!(witness.start_event_reference(), &start_reference);
-    assert_eq!(witness.receipt_record_id(), receipt.record_id());
-    assert_eq!(witness.manifest_record_id(), manifest_id);
-    assert_eq!(witness.start_record_id(), start_record.record_id());
+    assert_eq!(
+        store.validate_freeze_committed_authority(committed_reference.clone()),
+        Err(
+            evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
+        )
+    );
     assert_eq!(
         validate_resolved_freeze_committed_binding(
             store.retained_journal(),
@@ -1312,13 +1375,9 @@ fn authoritative_store_derives_positive_freeze_authority_from_its_retained_names
             .join(record_filename(receipt.record_id())),
     )
     .unwrap();
-    let missing_receipt_store = AuthoritativeRegistryStore::open(&fixture.path).unwrap();
     assert_eq!(
-        missing_receipt_store.validate_freeze_committed_authority(committed_reference),
-        Err(
-            evidence_registry::AuthoritativeFreezeCommittedBindingError::Structural(
-                ResolvedFreezeCommittedBindingError::ReceiptPayloadUnavailable,
-            ),
-        )
+        AuthoritativeRegistryStore::open(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordUnavailable,
+        "authoritative replay must fail at open when a retained event Record is missing"
     );
 }

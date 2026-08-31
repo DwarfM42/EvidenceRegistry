@@ -152,7 +152,12 @@ No current runtime path may return a successful semantic-MANIFEST or
 Receipt-to-Manifest continuity result by selecting an unstated profile mapping or
 by treating bytewise parsing as the selected-profile validation. This does not
 weaken the independent requirement that every successful Freeze continuity check
-uses exact identities where the frozen rules do define them.
+uses exact identities where the frozen rules do define them. Exact duplicate raw
+path-component sequences are rejected as a profile-independent local contradiction,
+but that narrow check does not establish selected-profile ordering, equivalence, or
+canonicality. Positive Freeze authority remains unavailable until both the selected
+Manifest-profile semantics and SG-005's generic Policy gate-Scope relation are
+frozen and implemented.
 
 ## SG-004 — Runtime Record-byte resolver contract
 
@@ -256,3 +261,101 @@ The runtime may check only explicit caller-supplied Policy-context membership as
 separate prerequisite. A positive membership result does not resolve this gap and
 must not be reported as Scope coverage, Policy applicability or satisfaction,
 authority, Admission, lifecycle truth, custody, durability, or external trust.
+
+## SG-006 — Fresh capability-observation replay authentication
+
+**Affected lane:** authoritative replay of event 801
+`ASSUMPTION_ESTABLISHMENT_RECORDED` when Record key 25
+`capability_observation_provenance_ref` is absent. This does not affect strict
+type-81 framing or cached observations carrying an exact type-63 provenance Record.
+
+### Frozen authority and gap
+
+- Record Schema v0.3 §87 makes key 25 context-required: cached capability Evidence
+  requires it, while fresh noncached capability Evidence forbids it
+  (`docs/RECORD-SCHEMA-v0.3.md:3274-3301`).
+- The referenced type-63 Record explicitly carries `cache_reused` together with the
+  storage and environment observation identities
+  (`docs/RECORD-SCHEMA-v0.3.md:3016-3033`).
+- Lifecycle v0.10.2 §112 defines the permitted cache scope and §112.1 bounds what
+  cache reuse proves (`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:3738-3789`).
+
+The frozen replay inputs contain no independent field or retained authority that
+authenticates the operation-time assertion that an omitted key 25 means a fresh,
+noncached observation. Treating omission itself as proof of freshness is circular;
+it verifies only the producer's encoding choice.
+
+### Competing outcomes
+
+1. **Infer freshness from key-25 absence:** this promotes structural omission into
+   an authenticated operation-time fact and is rejected.
+2. **Accept cached observations only:** require exact type-63 provenance with
+   `cache_reused = true` and matching storage/environment identities; fail closed
+   for the otherwise valid fresh-observation form at authoritative replay.
+3. **Add an authenticated fresh-observation witness in a frozen successor:** define
+   the authority, identity, and replay relation that distinguishes fresh from cached
+   observation without circular inference.
+
+### Current bounded disposition
+
+Authoritative replay uses outcome 2. A type-81 Record with absent key 25 remains
+structurally decodable but cannot enter the current authoritative replay lane.
+This local fail-closed restriction is not claimed as a frozen format rule and does
+not establish capability truth, continuous durability, Policy satisfaction,
+Admission, or external trust.
+
+## SG-007 — REVIEW_ADMISSION Policy outcome to terminal-event direction
+
+**Affected lane:** authoritative recovery or publication of terminal events 302 and
+303. This does not affect strict type-32 Record framing, Request/Result continuity,
+or structural Journal dependency checks.
+
+### Frozen authority and gap
+
+- Lifecycle v0.10.2 §83 assigns accepted and rejected terminal events, but does not
+  map the Record Schema Policy outcomes `SATISFIED`, `GATE_UNSATISFIED`, or
+  `GATE_INDETERMINATE` to event 302 versus 303
+  (`docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md:2842-2884`).
+- Record Schema v0.3 requires explicit context support, every applicable registered
+  evaluator, and logical-AND composition
+  (`docs/RECORD-SCHEMA-v0.3.md:1448-1468`,
+  `docs/RECORD-SCHEMA-v0.3.md:2025-2056`), but its frozen evaluator registry does
+  not include the prospective generic Review-Admission gate-Scope evaluator.
+- SG-005 separately records why exact SCOPE resolution does not establish generic
+  operation applicability.
+
+The frozen baseline therefore does not uniquely authorize rederiving either
+terminal direction from retained Request, Result, Policy, SCOPE, and event bytes.
+
+### Current bounded disposition
+
+Terminal Review-Admission history may pass every decidable local, identity,
+dependency, chronology, and Request/Result continuity check, but authoritative
+store-open still fails closed with semantic authority unavailable. It is neither
+promoted to accepted/rejected authority nor reclassified as definitively invalid.
+A future frozen successor must define the missing evaluator/applicability relation
+and exact outcome-to-event mapping before positive terminal replay or publication.
+
+## SG-008 — Capability-transition Record semantics
+
+**Affected lane:** authoritative replay of event 600
+`STORAGE_CAPABILITY_CHANGED`. This does not affect exact predecessor-hash continuity,
+the prior/new IDs carried by the event Record, or the new IDs duplicated in the
+Journal common fields.
+
+### Frozen authority and gap
+
+The frozen event/Record shape carries prior and new storage/environment capability
+identities and material-change collections, but the baseline does not assign a
+complete type/profile registry and evaluation relation that proves each listed
+material transition as a PRESENT-to-ABSENT or ABSENT-to-PRESENT fact. Exact ID
+continuity alone does not authenticate those capability semantics.
+
+### Current bounded disposition
+
+Replay first validates the exact immediate predecessor, previous-entry hash,
+prior/new capability IDs, local Record grammar, and other decidable bindings. A
+structurally complete event 600 then fails closed before positive authoritative
+store-open. A future frozen successor must assign the referenced capability Record
+types/profiles and the transition-evaluation rule before this lane can return
+positive semantic authority.

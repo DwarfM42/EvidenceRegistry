@@ -1,13 +1,12 @@
 use evidence_registry::{
-    check_review_admission_policy_context, evaluate_review_admission_gate_scope_1015,
-    policy_evaluator_registry, resolve_review_admission_exact_scope_profile,
+    check_review_admission_policy_context, policy_evaluator_registry,
+    resolve_review_admission_exact_scope_profile,
     validate_review_admission_policy_context_prerequisites,
     validate_review_admission_policy_recorded_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, GenesisJournalEntry, JournalEntryHash, JournalEntryIndex,
     JournalReference, PolicyEvaluationContext, RecordId, RegistryId, RetainedJournal,
-    ReviewAdmissionCommonRequestResultError, ReviewAdmissionGateScope1015Result,
-    ReviewAdmissionPolicyContextDeclaration, ReviewAdmissionPolicyContextPrerequisitesError,
-    ReviewAdmissionPolicyRecord, StrictRecordFrame,
+    ReviewAdmissionCommonRequestResultError, ReviewAdmissionPolicyContextDeclaration,
+    ReviewAdmissionPolicyContextPrerequisitesError, ReviewAdmissionPolicyRecord, StrictRecordFrame,
 };
 use sha2::{Digest, Sha256};
 
@@ -42,7 +41,7 @@ fn independently_construct_review_admission_policy(
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
     bytes.extend_from_slice(&[0x18, 40, 0x01, 0xa9, 0x00, 0x01, 0x01, 0x18, 40, 0x10]);
     append_bstr_32(&mut bytes, *scope_ref.as_bytes());
-    bytes.extend_from_slice(&[0x11, 0x81, 0xa5, 0x00, 0x07, 0x01]);
+    bytes.extend_from_slice(&[0x11, 0x81, 0xa5, 0x00, 0x01, 0x01]);
     append_bstr_32(&mut bytes, *scope_ref.as_bytes());
     bytes.push(0x02);
     append_bstr_32(&mut bytes, id(0xe0));
@@ -120,11 +119,11 @@ fn independently_construct_review_request_with_scope(scope_ref: RecordId) -> Vec
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
-    bytes.extend_from_slice(&[0x18, 30, 0x01, 0xac, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
+    bytes.extend_from_slice(&[0x18, 30, 0x01, 0xab, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
     append_journal_reference(&mut bytes, &synthetic_reference(0, 101, 0x20));
     bytes.push(0x11);
     append_bstr_32(&mut bytes, id(0x80));
-    bytes.extend_from_slice(&[0x12, 0x07, 0x13]);
+    bytes.extend_from_slice(&[0x12, 0x01, 0x13]);
     append_bstr_32(&mut bytes, id(0xa0));
     bytes.push(0x14);
     append_journal_reference(&mut bytes, &synthetic_reference(1, 400, 0x40));
@@ -136,7 +135,6 @@ fn independently_construct_review_request_with_scope(scope_ref: RecordId) -> Vec
     append_bstr_32(&mut bytes, id(0x10));
     bytes.extend_from_slice(&[0x18, 0x18]);
     append_journal_reference(&mut bytes, &synthetic_reference(2, 300, 0x60));
-    bytes.extend_from_slice(&[0x18, 0x19, 0x01]);
     bytes
 }
 
@@ -144,13 +142,13 @@ fn independently_construct_review_result_with_scope(scope_ref: RecordId) -> Vec<
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
-    bytes.extend_from_slice(&[0x18, 31, 0x01, 0xaf, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
+    bytes.extend_from_slice(&[0x18, 31, 0x01, 0xae, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
     append_journal_reference(&mut bytes, &synthetic_reference(1, 300, 0x20));
     bytes.push(0x11);
     append_journal_reference(&mut bytes, &synthetic_reference(0, 101, 0x20));
     bytes.push(0x12);
     append_bstr_32(&mut bytes, id(0x80));
-    bytes.extend_from_slice(&[0x13, 0x07, 0x14]);
+    bytes.extend_from_slice(&[0x13, 0x01, 0x14]);
     append_bstr_32(&mut bytes, *scope_ref.as_bytes());
     bytes.push(0x15);
     append_bstr_32(&mut bytes, id(0xe0));
@@ -160,7 +158,6 @@ fn independently_construct_review_result_with_scope(scope_ref: RecordId) -> Vec<
     append_bstr_32(&mut bytes, id(0x10));
     bytes.extend_from_slice(&[0x18, 0x1c]);
     append_journal_reference(&mut bytes, &synthetic_reference(2, 300, 0x60));
-    bytes.extend_from_slice(&[0x18, 0x1d, 0x01]);
     bytes
 }
 
@@ -284,7 +281,7 @@ fn review_admission_policy_context_prerequisites_stop_at_common_request_result_f
 }
 
 #[test]
-fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes_and_evaluator_1015_accepts(
+fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes_without_inferring_applicability(
 ) {
     let genesis = genesis();
     let scope_bytes = independently_construct_exact_review_admission_scope();
@@ -320,10 +317,6 @@ fn review_admission_policy_context_prerequisites_resolve_both_exact_typed_scopes
     assert_eq!(prerequisites.policy_record_id(), policy_record_id);
     assert_eq!(prerequisites.gate_scope_ref(), scope_id);
     assert_eq!(prerequisites.common_review_scope_ref(), scope_id);
-    assert_eq!(
-        evaluate_review_admission_gate_scope_1015(prerequisites),
-        ReviewAdmissionGateScope1015Result::Pass,
-    );
 }
 
 #[test]
@@ -333,12 +326,23 @@ fn review_admission_policy_preserves_context_unsupported_before_requirement_eval
         &genesis_reference(&genesis),
         RecordId::try_from(id(0xc0).as_slice()).unwrap(),
     );
+    let map_length = policy_bytes
+        .windows(4)
+        .position(|window| window == [0x18, 40, 0x01, 0xa9])
+        .unwrap()
+        + 3;
+    policy_bytes[map_length] = 0xa8;
+    let anchor_requirement = policy_bytes
+        .windows(9)
+        .position(|window| window == [0x18, 0x18, 0xa1, 0x00, 0x82, 0x01, 0x02, 0x18, 0x1d])
+        .unwrap();
+    policy_bytes.drain(anchor_requirement..anchor_requirement + 7);
     let context_offset = policy_bytes
         .windows(3)
         .position(|window| window == [0x18, 0x1e, 0x81])
         .unwrap()
         + 3;
-    policy_bytes[context_offset] = 1;
+    policy_bytes[context_offset] = 3;
     let policy = ReviewAdmissionPolicyRecord::decode_authoritative(&policy_bytes).unwrap();
 
     assert_eq!(
@@ -348,7 +352,7 @@ fn review_admission_policy_preserves_context_unsupported_before_requirement_eval
 }
 
 #[test]
-fn review_admission_policy_requires_the_exact_single_review_admission_context_for_profile_1015() {
+fn review_admission_policy_allows_other_declared_contexts_without_inference() {
     let genesis = genesis();
     let mut policy_bytes = independently_construct_review_admission_policy(
         &genesis_reference(&genesis),
@@ -364,12 +368,12 @@ fn review_admission_policy_requires_the_exact_single_review_admission_context_fo
 
     assert_eq!(
         check_review_admission_policy_context(&policy),
-        ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported,
+        ReviewAdmissionPolicyContextDeclaration::Declared,
     );
 }
 
 #[test]
-fn evaluator_1015_is_exactly_registered_and_returns_only_its_individual_scope_result() {
+fn unassigned_evaluator_1015_is_absent_and_distinct_scope_identities_remain_structural() {
     let genesis = genesis();
     let common_scope_bytes = independently_construct_exact_review_admission_scope();
     let common_scope_id =
@@ -415,12 +419,9 @@ fn evaluator_1015_is_exactly_registered_and_returns_only_its_individual_scope_re
     )
     .unwrap();
 
-    assert!(policy_evaluator_registry().iter().any(|registration| {
-        registration.id == 1015
-            && registration.name == "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING"
-    }));
-    assert_eq!(
-        evaluate_review_admission_gate_scope_1015(prerequisites),
-        ReviewAdmissionGateScope1015Result::Fail,
-    );
+    assert!(policy_evaluator_registry()
+        .iter()
+        .all(|registration| registration.id != 1015));
+    assert_eq!(prerequisites.gate_scope_ref(), gate_scope_id);
+    assert_eq!(prerequisites.common_review_scope_ref(), common_scope_id);
 }
