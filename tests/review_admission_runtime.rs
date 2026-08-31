@@ -1777,7 +1777,10 @@ fn authoritative_store_open_evaluates_freeze_minimum_durability() {
     };
 
     let satisfied = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(1));
-    assert!(AuthoritativeRegistryStore::open(&satisfied.path).is_ok());
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&satisfied.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
 
     let unsatisfied = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(2));
     assert_eq!(
@@ -1832,7 +1835,10 @@ fn authoritative_store_projects_repeated_result_findings_into_one_identity_set_m
     );
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
 
-    assert!(AuthoritativeRegistryStore::open(&store_dir.path).is_ok());
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
 }
 
 #[test]
@@ -2867,47 +2873,12 @@ fn structurally_complete_inputs_without_authoritative_store_provenance_remain_pr
 
 #[cfg(windows)]
 #[test]
-fn authoritative_store_keeps_section_82_preterminal_without_freeze_semantic_authority() {
+fn authoritative_store_blocks_review_request_before_section_82_without_freeze_semantic_authority() {
     let fixture = authoritative_review_admission_fixture(true);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
     assert_eq!(
-        accepted.operation_start_journal_ref(),
-        &fixture.result_reference
-    );
-
-    assert_eq!(
-        store.complete_authoritative_review_admission_section_82(accepted),
-        Err(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::FreezeAuthority(
-                evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
-            )
-        )
-    );
-
-    let mut caller_substitution = fixture.request_bytes.clone();
-    *caller_substitution.last_mut().unwrap() ^= 1;
-    let substituted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &caller_substitution,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-    assert_eq!(
-        store.complete_authoritative_review_admission_section_82(substituted),
-        Err(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::PresentedRequestMismatch
-        )
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
 }
 
@@ -2927,32 +2898,17 @@ fn authoritative_policy_context_unsupported_never_becomes_a_completed_policy_res
         },
     );
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference,
-            &fixture.request_bytes,
-            fixture.result_reference,
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
     assert_eq!(
-        store.complete_authoritative_review_admission_section_82(accepted),
-        Err(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
-                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
-                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported,
-                ),
-            ),
-        )
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
 }
 
 #[cfg(not(windows))]
 #[test]
 fn authoritative_store_fails_closed_without_mandatory_generation_protection() {
-    let fixture = authoritative_review_admission_fixture(true);
+    let mut fixture = authoritative_review_admission_fixture(true);
+    fixture.journal_entry_bytes.truncate(4);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
     assert_eq!(
         AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
@@ -3100,16 +3056,20 @@ fn authoritative_replay_rejects_start_only_prefix_without_freeze_commit_policy_c
 
 #[cfg(windows)]
 #[test]
-fn authoritative_replay_accepts_valid_multi_context_policy_topology() {
-    let fixture = authoritative_review_admission_fixture_with_test_overrides(
+fn authoritative_replay_validates_multi_context_request_before_semantic_authority_unavailable() {
+    let mut fixture = authoritative_review_admission_fixture_with_test_overrides(
         ReviewAdmissionFixtureOverrides {
             policy_includes_verification_requirement: true,
             ..Default::default()
         },
     );
+    fixture.journal_entry_bytes.truncate(5);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
 
-    assert!(AuthoritativeRegistryStore::open(&store_dir.path).is_ok());
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
 }
 
 #[cfg(windows)]
@@ -3196,7 +3156,8 @@ fn authoritative_store_rejects_hardlinked_namespace_objects() {
 #[cfg(windows)]
 #[test]
 fn authoritative_store_open_holds_retained_authority_bytes_against_in_place_writes() {
-    let fixture = authoritative_review_admission_fixture(true);
+    let mut fixture = authoritative_review_admission_fixture(true);
+    fixture.journal_entry_bytes.truncate(4);
     let result_id = StrictRecordFrame::decode_authoritative(&fixture.result_bytes)
         .unwrap()
         .record_id();
@@ -3222,7 +3183,8 @@ fn authoritative_store_open_holds_retained_authority_bytes_against_in_place_writ
 #[cfg(windows)]
 #[test]
 fn authoritative_store_holds_namespace_directories_against_replacement() {
-    let fixture = authoritative_review_admission_fixture(true);
+    let mut fixture = authoritative_review_admission_fixture(true);
+    fixture.journal_entry_bytes.truncate(4);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
     let store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
     let records = store_dir.path.join("records");
@@ -3249,10 +3211,9 @@ fn authoritative_open_tolerates_bounded_publication_temp_residue_without_stealin
         .join("records/.evidence-registry-publish-4294967295-1.tmp");
     fs::write(&residue, b"crash residue").unwrap();
 
-    let store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
     assert_eq!(
-        store.retained_journal().current_head_reference(),
-        fixture.result_reference
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
     assert!(
         residue.exists(),
@@ -3281,10 +3242,9 @@ fn authoritative_open_recovers_the_hardlink_publish_crash_window() {
         .join("journal/.evidence-registry-publish-700-2.tmp");
     fs::hard_link(&journal_path, &journal_temp).unwrap();
 
-    let reopened = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
     assert_eq!(
-        reopened.retained_journal().current_head_reference(),
-        fixture.result_reference
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
     assert!(record_temp.exists());
     assert!(journal_temp.exists());
@@ -3305,32 +3265,9 @@ fn authoritative_runtime_keeps_policy_context_unsupported_preterminal_and_unpubl
         },
     );
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference,
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-    let outcome = store
-        .complete_authoritative_review_admission(accepted)
-        .unwrap();
-
-    assert!(matches!(
-        outcome,
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
-                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
-                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported
-                )
-            )
-        )
-    ));
     assert_eq!(
-        store.retained_journal().current_head_reference(),
-        fixture.result_reference
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
     assert!(!store_dir
         .path
@@ -3346,29 +3283,9 @@ fn authoritative_runtime_does_not_promote_unfrozen_generic_gate_scope_semantics(
     let retained_record_count = fs::read_dir(store_dir.path.join("records"))
         .unwrap()
         .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference,
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
     assert_eq!(
-        store
-            .complete_authoritative_review_admission(accepted)
-            .unwrap(),
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::FreezeAuthority(
-                evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
-            )
-        )
-    );
-    assert_eq!(
-        store.retained_journal().current_head_reference(),
-        fixture.result_reference
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
     assert!(!store_dir
         .path

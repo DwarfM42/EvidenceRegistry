@@ -3965,17 +3965,31 @@ fn validate_exact_authority_dependencies(
     entry: &RetainedJournalEntry,
     expected: &[JournalReference],
 ) -> Result<(), RecordDecodeError> {
-    if !expected
-        .iter()
-        .all(|reference| entry.authority_dependencies().contains(reference))
-        || !entry
-            .authority_dependencies()
-            .iter()
-            .all(|reference| expected.contains(reference))
-    {
-        return Err(RecordDecodeError);
+    let actual = entry.authority_dependencies();
+    let mut matched = Vec::new();
+    matched
+        .try_reserve_exact(actual.len())
+        .map_err(|_| RecordDecodeError)?;
+    matched.resize(actual.len(), false);
+    for expected_reference in expected {
+        let index = actual
+            .binary_search_by(|candidate| {
+                (candidate.entry_index(), candidate.entry_hash()).cmp(&(
+                    expected_reference.entry_index(),
+                    expected_reference.entry_hash(),
+                ))
+            })
+            .map_err(|_| RecordDecodeError)?;
+        if actual[index] != *expected_reference {
+            return Err(RecordDecodeError);
+        }
+        matched[index] = true;
     }
-    Ok(())
+    if matched.iter().all(|matched| *matched) {
+        Ok(())
+    } else {
+        Err(RecordDecodeError)
+    }
 }
 
 fn validate_resolved_prior_reference(
@@ -4574,9 +4588,6 @@ fn validate_event_record_reference_bindings(
         {
             return Err(RecordDecodeError);
         }
-        if capability_provenance.is_none() {
-            return Err(RecordDecodeError);
-        }
     }
     if let Some(provenance_id) = capability_provenance {
         let provenance_bytes = records
@@ -5137,6 +5148,7 @@ fn validate_authoritative_event_records(
     retained_journal: &RetainedJournal,
     records: &[(RecordId, Vec<u8>)],
 ) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+    let mut semantic_authority_unavailable = false;
     for entry in &retained_journal.entries {
         let event_reference = JournalReference::new(
             entry.registry_id(),
@@ -5268,21 +5280,29 @@ fn validate_authoritative_event_records(
         if event_semantic_authority_is_unavailable(entry.event_type_id().value(), record_bytes)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
         {
-            return Err(AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable);
+            semantic_authority_unavailable = true;
         }
     }
-    Ok(())
+    if semantic_authority_unavailable {
+        Err(AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable)
+    } else {
+        Ok(())
+    }
 }
 
 fn event_semantic_authority_is_unavailable(
     event_type: u16,
     record_bytes: &[u8],
 ) -> Result<bool, RecordDecodeError> {
-    if matches!(event_type, 200 | 302 | 303 | 500 | 501 | 600 | 700) {
+    if matches!(
+        event_type,
+        200 | 300 | 301 | 302 | 303 | 500 | 501 | 600 | 700
+    ) {
         // The retained inputs do not uniquely re-establish all frozen contextual semantics for
         // these families: Verification-to-Freeze/Manifest continuity remains incomplete; generic
-        // Review Admission and Closeout Policy satisfaction require an unassigned generic
-        // gate-Scope relation; capability transition sets lack a frozen capability-ID mapping; and
+        // Review Request, Review Result, Review Admission, and Closeout Policy satisfaction require
+        // an unassigned generic gate-Scope relation; Review Request also lacks positive Freeze
+        // authority; capability transition sets lack a frozen capability-ID mapping; and
         // Manifest-relative eviction Scope validation lacks assigned selected-profile semantics.
         // Type-local, event/body, dependency, and otherwise decidable contextual checks run before
         // this gate so malformed histories retain their more precise classification. A locally
@@ -5354,6 +5374,70 @@ fn record_id_from_event_reference(reference: &JournalReference) -> RecordId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_authority_dependency_validation_has_a_bounded_comparison_topology() {
+        const DEPENDENCY_COUNT: u64 = 256;
+
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let containing_entry_index = JournalEntryIndex::try_from(DEPENDENCY_COUNT + 1).unwrap();
+        let mut expected = Vec::new();
+        for index in 1..=DEPENDENCY_COUNT {
+            let mut hash = [0_u8; ID_LENGTH];
+            hash[..8].copy_from_slice(&index.to_be_bytes());
+            let mut record_id = [0_u8; ID_LENGTH];
+            record_id[..8].copy_from_slice(&index.to_le_bytes());
+            expected.push(JournalReference::new(
+                registry_id,
+                JournalEntryIndex::try_from(index).unwrap(),
+                JournalEntryHash::try_from(hash.as_slice()).unwrap(),
+                EventTypeId::try_from(808).unwrap(),
+                EventRecordId::try_from(record_id.as_slice()).unwrap(),
+            ));
+        }
+        let authority_dependencies =
+            AuthorityDependencyCollection::from_authoritative_ordered_elements(
+                AuthorityDependencyContext::new(registry_id, containing_entry_index),
+                expected.clone(),
+            )
+            .unwrap();
+        let entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: containing_entry_index,
+            previous_entry_hash: JournalEntryHash::try_from([0x20; ID_LENGTH].as_slice()).unwrap(),
+            event_type_id: EventTypeId::try_from(808).unwrap(),
+            event_record_id: EventRecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap(),
+            storage_capability_class_id: RecordId::try_from([0x40; ID_LENGTH].as_slice()).unwrap(),
+            environment_observation_id: RecordId::try_from([0x50; ID_LENGTH].as_slice()).unwrap(),
+            lifecycle_object_kind: LifecycleObjectKind::FormalFindingClassification,
+            lifecycle_object_id: [0x60; ID_LENGTH],
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authority_dependencies,
+            authoritative_bytes: Vec::new(),
+        });
+
+        expected.reverse();
+        crate::JOURNAL_REFERENCE_EQUALITY_COMPARISONS.with(|comparisons| comparisons.set(0));
+        assert_eq!(
+            validate_exact_authority_dependencies(&entry, &expected),
+            Ok(())
+        );
+        let comparisons =
+            crate::JOURNAL_REFERENCE_EQUALITY_COMPARISONS.with(|comparisons| comparisons.get());
+        assert!(
+            comparisons > 0,
+            "the equality-comparison probe was bypassed"
+        );
+
+        assert!(
+            comparisons <= expected.len() * 16,
+            "exact dependency validation used {comparisons} reference comparisons for {} dependencies",
+            expected.len()
+        );
+    }
 
     #[cfg(not(windows))]
     #[test]
@@ -6861,7 +6945,7 @@ mod tests {
 
     #[test]
     fn unsupported_contextual_event_semantics_fail_closed_before_positive_replay() {
-        for event_type in [200, 302, 303, 500, 501, 600, 700] {
+        for event_type in [200, 300, 301, 302, 303, 500, 501, 600, 700] {
             assert_eq!(
                 event_semantic_authority_is_unavailable(event_type, &[]),
                 Ok(true)
@@ -6956,10 +7040,18 @@ mod tests {
         let method = RecordId::try_from([0x21; ID_LENGTH].as_slice()).unwrap();
         let evidence = RecordId::try_from([0x22; ID_LENGTH].as_slice()).unwrap();
 
-        let check = |provenance_cache_reused: Option<bool>, capability_epoch: &JournalReference| {
-            let provenance_bytes = provenance_cache_reused.map(|cache_reused| {
-                capability_observation_provenance_record(storage, environment, cache_reused, true)
-            });
+        let check = |provenance: Option<(bool, RecordId, RecordId, bool)>,
+                     capability_epoch: &JournalReference| {
+            let provenance_bytes = provenance.map(
+                |(cache_reused, provenance_storage, provenance_environment, _)| {
+                    capability_observation_provenance_record(
+                        provenance_storage,
+                        provenance_environment,
+                        cache_reused,
+                        true,
+                    )
+                },
+            );
             let provenance_id = provenance_bytes.as_ref().map(|bytes| {
                 StrictRecordFrame::decode_authoritative(bytes)
                     .unwrap()
@@ -7032,29 +7124,203 @@ mod tests {
                 },
                 authoritative_bytes: Vec::new(),
             });
-            let mut records = provenance_id
-                .zip(provenance_bytes)
-                .into_iter()
-                .collect::<Vec<_>>();
+            let exact_provenance_available = provenance
+                .map(|(_, _, _, exact_provenance_available)| exact_provenance_available)
+                .unwrap_or(false);
+            let mut records = if exact_provenance_available {
+                provenance_id
+                    .zip(provenance_bytes)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
             validate_event_record_reference_bindings(&journal, &entry, &record_bytes, &records)
         };
 
-        assert_eq!(check(None, &genesis_reference), Err(RecordDecodeError));
+        assert_eq!(check(None, &current_epoch), Ok(()));
         assert_eq!(
-            check(Some(true), &genesis_reference),
+            check(
+                Some((true, storage, environment, true)),
+                &genesis_reference
+            ),
             Err(RecordDecodeError),
             "GENESIS is stale after the first material capability change even when later facts return"
         );
-        assert_eq!(check(Some(true), &current_epoch), Ok(()));
         assert_eq!(
-            check(Some(true), &definition),
+            check(Some((true, storage, environment, true)), &current_epoch),
+            Ok(())
+        );
+        assert_eq!(
+            check(Some((true, storage, environment, true)), &definition),
             Err(RecordDecodeError),
             "an arbitrary prior event is not the capability epoch"
         );
         assert_eq!(
-            check(Some(false), &genesis_reference),
-            Err(RecordDecodeError)
+            check(Some((false, storage, environment, true)), &current_epoch),
+            Err(RecordDecodeError),
+            "asserted cache reuse requires provenance that records cache_reused=true"
+        );
+        assert_eq!(
+            check(
+                Some((true, changed_storage, environment, true)),
+                &current_epoch
+            ),
+            Err(RecordDecodeError),
+            "cache provenance must bind the exact current storage capability"
+        );
+        assert_eq!(
+            check(
+                Some((true, storage, changed_environment, true)),
+                &current_epoch
+            ),
+            Err(RecordDecodeError),
+            "cache provenance must bind the exact current environment observation"
+        );
+        assert_eq!(
+            check(Some((true, storage, environment, false)), &current_epoch),
+            Err(RecordDecodeError),
+            "key 25 requires the exact referenced provenance Record bytes"
+        );
+    }
+
+    #[test]
+    fn fresh_event_801_reaches_the_production_semantic_authority_boundary() {
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment = RecordId::try_from([0x21; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id: storage,
+            environment_observation_id: environment,
+            created_by_tool_version: "fresh-event-801-production-test".to_owned(),
+        })
+        .unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage,
+            environment,
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+        let genesis_reference = journal.current_head_reference();
+        let scope = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let method = RecordId::try_from([0x31; ID_LENGTH].as_slice()).unwrap();
+        let evidence = RecordId::try_from([0x32; ID_LENGTH].as_slice()).unwrap();
+
+        let mut definition_bytes = Vec::new();
+        definition_bytes.push(0x84);
+        encode_text(&mut definition_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut definition_bytes, 80);
+        encode_uint(&mut definition_bytes, 1);
+        definition_bytes.push(0xa8);
+        definition_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 80, 0x10]);
+        encode_text(&mut definition_bytes, "test-definition");
+        definition_bytes.extend_from_slice(&[0x11, 0x01, 0x12]);
+        encode_text(&mut definition_bytes, "test-definition-v1");
+        definition_bytes.push(0x13);
+        encode_bstr_32(&mut definition_bytes, scope.as_bytes());
+        definition_bytes.push(0x14);
+        encode_bstr_32(&mut definition_bytes, method.as_bytes());
+        definition_bytes.push(0x15);
+        definition_bytes.extend_from_slice(&genesis_reference.authoritative_cbor());
+        let definition_id = StrictRecordFrame::decode_authoritative(&definition_bytes)
+            .unwrap()
+            .record_id();
+        let definition_entry = RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+            registry_id,
+            entry_index: JournalEntryIndex::try_from(1).unwrap(),
+            previous_entry_hash: genesis_reference.entry_hash(),
+            event_type_id: EventTypeId::try_from(800).unwrap(),
+            event_record_id: EventRecordId::try_from(definition_id.as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id: storage,
+            environment_observation_id: environment,
+            lifecycle_object_kind: EventTypeId::try_from(800).unwrap().lifecycle_object_kind(),
+            lifecycle_object_id: *definition_id.as_bytes(),
+            freeze_attempt_intended_root_id: None,
+            identity_dependencies: IdentityDependencyCollection {
+                elements: vec![
+                    IdentityDependency::RecordId(scope),
+                    IdentityDependency::RecordId(method),
+                ],
+            },
+            authority_dependencies: AuthorityDependencyCollection {
+                elements: Vec::new(),
+            },
+            authoritative_bytes: b"definition entry".to_vec(),
+        });
+        journal.entries.push(definition_entry);
+        let definition_reference = journal.current_head_reference();
+
+        let mut fresh_bytes = Vec::new();
+        fresh_bytes.push(0x84);
+        encode_text(&mut fresh_bytes, "EvidenceRegistry.Record.v1");
+        encode_uint(&mut fresh_bytes, 81);
+        encode_uint(&mut fresh_bytes, 1);
+        fresh_bytes.push(0xae);
+        fresh_bytes.extend_from_slice(&[0x00, 0x01, 0x01, 0x18, 81, 0x10]);
+        fresh_bytes.extend_from_slice(&definition_reference.authoritative_cbor());
+        fresh_bytes.push(0x11);
+        encode_bstr_32(&mut fresh_bytes, scope.as_bytes());
+        fresh_bytes.push(0x12);
+        encode_bstr_32(&mut fresh_bytes, method.as_bytes());
+        fresh_bytes.extend_from_slice(&[0x13, 0x01, 0x14, 0x01, 0x15, 0x81]);
+        encode_bstr_32(&mut fresh_bytes, evidence.as_bytes());
+        fresh_bytes.push(0x16);
+        encode_bstr_32(&mut fresh_bytes, storage.as_bytes());
+        fresh_bytes.push(0x17);
+        encode_bstr_32(&mut fresh_bytes, environment.as_bytes());
+        fresh_bytes.extend_from_slice(&[0x18, 0x18]);
+        fresh_bytes.extend_from_slice(&genesis_reference.authoritative_cbor());
+        fresh_bytes.extend_from_slice(&[0x18, 0x1a, 0x80, 0x18, 0x1c]);
+        fresh_bytes.extend_from_slice(&genesis_reference.authoritative_cbor());
+        fresh_bytes.extend_from_slice(&[0x18, 0x1d, 0x80]);
+        let fresh_id = StrictRecordFrame::decode_authoritative(&fresh_bytes)
+            .unwrap()
+            .record_id();
+        journal
+            .entries
+            .push(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                registry_id,
+                entry_index: JournalEntryIndex::try_from(2).unwrap(),
+                previous_entry_hash: definition_reference.entry_hash(),
+                event_type_id: EventTypeId::try_from(801).unwrap(),
+                event_record_id: EventRecordId::try_from(fresh_id.as_bytes().as_slice()).unwrap(),
+                storage_capability_class_id: storage,
+                environment_observation_id: environment,
+                lifecycle_object_kind: EventTypeId::try_from(801).unwrap().lifecycle_object_kind(),
+                lifecycle_object_id: *fresh_id.as_bytes(),
+                freeze_attempt_intended_root_id: None,
+                identity_dependencies: IdentityDependencyCollection {
+                    elements: vec![
+                        IdentityDependency::RecordId(storage),
+                        IdentityDependency::RecordId(environment),
+                        IdentityDependency::RecordId(scope),
+                        IdentityDependency::RecordId(method),
+                        IdentityDependency::RecordId(evidence),
+                    ],
+                },
+                authority_dependencies: AuthorityDependencyCollection {
+                    elements: vec![definition_reference],
+                },
+                authoritative_bytes: b"fresh establishment entry".to_vec(),
+            }));
+        let mut records = vec![
+            (
+                genesis_record.record_id(),
+                genesis_record.authoritative_cbor(),
+            ),
+            (definition_id, definition_bytes),
+            (fresh_id, fresh_bytes),
+        ];
+        records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+
+        assert_eq!(
+            validate_authoritative_event_records(&journal, &records),
+            Err(AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable)
         );
     }
 

@@ -5,7 +5,7 @@
 //! FreezeRoot tuple, rather than a generic identity envelope.
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -26,13 +26,32 @@ pub use authoritative_store::{
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
 const ID_LENGTH: usize = 32;
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static JOURNAL_REFERENCE_EQUALITY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIFECYCLE_KIND_EQUALITY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FREEZE_ATTEMPT_ID_EQUALITY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A Registry identity represented in its authoritative 32-byte form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegistryId([u8; ID_LENGTH]);
 
 /// A Freeze attempt identity represented in its authoritative 32-byte form.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct FreezeAttemptId([u8; ID_LENGTH]);
+
+impl PartialEq for FreezeAttemptId {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        FREEZE_ATTEMPT_ID_EQUALITY_COMPARISONS.with(|comparisons| {
+            comparisons.set(comparisons.get().saturating_add(1));
+        });
+        self.0 == other.0
+    }
+}
+
+impl Eq for FreezeAttemptId {}
 
 /// A derived FreezeRoot identity represented in its authoritative 32-byte form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +199,7 @@ impl JournalEntryIndex {
 }
 
 /// A v0.x lifecycle object kind from Identity Format v0.3 §29.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum LifecycleObjectKind {
     /// Numeric kind 1.
     Registry,
@@ -219,6 +238,18 @@ pub enum LifecycleObjectKind {
     /// Numeric kind 18.
     FormalFindingClassification,
 }
+
+impl PartialEq for LifecycleObjectKind {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        LIFECYCLE_KIND_EQUALITY_COMPARISONS.with(|comparisons| {
+            comparisons.set(comparisons.get().saturating_add(1));
+        });
+        self.value() == other.value()
+    }
+}
+
+impl Eq for LifecycleObjectKind {}
 
 /// A numeric lifecycle object kind outside the frozen v0.x registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -786,7 +817,7 @@ pub fn validate_state_only_legal_transition(
 }
 
 /// The structural JournalReference from Identity Format v0.3 §51.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct JournalReference {
     registry_id: RegistryId,
     entry_index: JournalEntryIndex,
@@ -794,6 +825,22 @@ pub struct JournalReference {
     event_type_id: EventTypeId,
     event_record_id: EventRecordId,
 }
+
+impl PartialEq for JournalReference {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        JOURNAL_REFERENCE_EQUALITY_COMPARISONS.with(|comparisons| {
+            comparisons.set(comparisons.get().saturating_add(1));
+        });
+        self.registry_id == other.registry_id
+            && self.entry_index == other.entry_index
+            && self.entry_hash == other.entry_hash
+            && self.event_type_id == other.event_type_id
+            && self.event_record_id == other.event_record_id
+    }
+}
+
+impl Eq for JournalReference {}
 
 impl JournalReference {
     /// Constructs a reference whose field widths, index range, and event type are already validated.
@@ -1346,6 +1393,12 @@ pub struct RetainedJournal {
     live_instance_identity: Arc<RetainedJournalInstanceIdentity>,
     registry_id: RegistryId,
     entries: Vec<RetainedJournalEntry>,
+    current_states: BTreeMap<(u8, [u8; ID_LENGTH]), LifecycleObjectState>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RETAINED_REPLAY_ENTRY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug)]
@@ -1512,6 +1565,7 @@ impl RetainedJournal {
             }),
             registry_id,
             entries: Vec::new(),
+            current_states: BTreeMap::new(),
         };
         journal.append_genesis(genesis)?;
         Ok(journal)
@@ -2005,11 +2059,13 @@ impl RetainedJournal {
         for reference in &common.authority_dependencies.elements {
             self.resolve_reference(reference)?;
         }
-        let reconstructed = self
-            .reconstruct_state()
-            .map_err(|_| RetainedJournalError::LifecycleTransition)?;
-        let before = reconstructed
-            .state_for(common.lifecycle_object_kind, &common.lifecycle_object_id)
+        let before = self
+            .current_states
+            .get(&(
+                common.lifecycle_object_kind.value(),
+                common.lifecycle_object_id,
+            ))
+            .copied()
             .unwrap_or_else(|| absent_state_for_kind(common.lifecycle_object_kind));
         let after = common
             .event_type_id
@@ -2063,11 +2119,16 @@ impl RetainedJournal {
     /// Replays every supported retained Entry from GENESIS.
     pub fn reconstruct_state(&self) -> Result<ReconstructedJournalState, RetainedJournalError> {
         let mut registry_state = RegistryLifecycleState::Absent;
-        let mut states = Vec::new();
+        let mut states: Vec<(LifecycleObjectKind, [u8; ID_LENGTH], LifecycleObjectState)> =
+            Vec::new();
+        let mut state_indices: BTreeMap<(u8, [u8; ID_LENGTH]), usize> = BTreeMap::new();
         let mut freeze_attempts = Vec::new();
+        let mut freeze_attempt_indices: BTreeMap<[u8; ID_LENGTH], usize> = BTreeMap::new();
         let mut capability_epochs = Vec::with_capacity(self.entries.len());
         let mut authority_dependency_edges = Vec::new();
         for entry in &self.entries {
+            #[cfg(test)]
+            RETAINED_REPLAY_ENTRY_VISITS.with(|visits| visits.set(visits.get() + 1));
             capability_epochs.push(ReconstructedCapabilityEpoch {
                 entry_index: entry.entry_index(),
                 storage_capability_class_id: entry.storage_capability_class_id(),
@@ -2088,9 +2149,7 @@ impl RetainedJournal {
             }
             let kind = entry.lifecycle_object_kind();
             let object_id = entry.lifecycle_object_id();
-            let state_index = states.iter().position(|(stored_kind, stored_id, _)| {
-                *stored_kind == kind && *stored_id == object_id
-            });
+            let state_index = state_indices.get(&(kind.value(), object_id)).copied();
             let before = state_index
                 .map(|index| states[index].2)
                 .unwrap_or_else(|| absent_state_for_kind(kind));
@@ -2103,6 +2162,7 @@ impl RetainedJournal {
             if let Some(index) = state_index {
                 states[index].2 = after;
             } else {
+                state_indices.insert((kind.value(), object_id), states.len());
                 states.push((kind, object_id, after));
             }
             if let LifecycleObjectState::Registry(state) = after {
@@ -2116,6 +2176,8 @@ impl RetainedJournal {
                         let intended_root_id = entry
                             .freeze_attempt_intended_root_id()
                             .ok_or(RetainedJournalError::DecodeError)?;
+                        freeze_attempt_indices
+                            .insert(*freeze_attempt_id.as_bytes(), freeze_attempts.len());
                         freeze_attempts.push(ReconstructedFreezeAttempt {
                             freeze_attempt_id,
                             intended_root_id,
@@ -2123,11 +2185,11 @@ impl RetainedJournal {
                         });
                     }
                     101..=103 => {
-                        let attempt = freeze_attempts
-                            .iter_mut()
-                            .find(|attempt| attempt.freeze_attempt_id == freeze_attempt_id)
+                        let attempt_index = freeze_attempt_indices
+                            .get(freeze_attempt_id.as_bytes())
+                            .copied()
                             .ok_or(RetainedJournalError::LifecycleTransition)?;
-                        attempt.state = state;
+                        freeze_attempts[attempt_index].state = state;
                     }
                     _ => {}
                 }
@@ -2168,21 +2230,23 @@ impl RetainedJournal {
         for reference in entry.authority_dependencies() {
             self.resolve_reference(reference)?;
         }
-        if !self.entries.is_empty() {
-            let reconstructed = self
-                .reconstruct_state()
-                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
-            let before = reconstructed
-                .state_for(entry.lifecycle_object_kind(), &entry.lifecycle_object_id())
-                .unwrap_or_else(|| absent_state_for_kind(entry.lifecycle_object_kind()));
-            let after = entry
-                .event_type_id()
-                .resulting_state(before)
-                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
-            validate_state_only_legal_transition(entry.event_type_id(), before, after)
-                .map_err(|_| RetainedJournalError::LifecycleTransition)?;
-        }
+        let lifecycle_key = (
+            entry.lifecycle_object_kind().value(),
+            entry.lifecycle_object_id(),
+        );
+        let before = self
+            .current_states
+            .get(&lifecycle_key)
+            .copied()
+            .unwrap_or_else(|| absent_state_for_kind(entry.lifecycle_object_kind()));
+        let after = entry
+            .event_type_id()
+            .resulting_state(before)
+            .map_err(|_| RetainedJournalError::LifecycleTransition)?;
+        validate_state_only_legal_transition(entry.event_type_id(), before, after)
+            .map_err(|_| RetainedJournalError::LifecycleTransition)?;
         self.entries.push(entry);
+        self.current_states.insert(lifecycle_key, after);
         Ok(())
     }
 
@@ -7087,6 +7151,157 @@ fn validate_authority_dependency_indices(
 #[cfg(test)]
 mod construction_order_tests {
     use super::*;
+
+    #[test]
+    fn retained_append_does_not_replay_the_complete_prefix() {
+        const APPEND_COUNT: usize = 128;
+
+        let registry_id = RegistryId::try_from([0x11; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x22; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x33; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x44; ID_LENGTH].as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+        RETAINED_REPLAY_ENTRY_VISITS.with(|visits| visits.set(0));
+
+        for offset in 0..APPEND_COUNT {
+            let index = u64::try_from(offset + 1).unwrap();
+            let mut object_id = [0_u8; ID_LENGTH];
+            object_id[..8].copy_from_slice(&index.to_be_bytes());
+            let previous_entry_hash = journal.current_head_reference().entry_hash();
+            journal
+                .append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                    registry_id,
+                    entry_index: JournalEntryIndex::try_from(index).unwrap(),
+                    previous_entry_hash,
+                    event_type_id: EventTypeId::try_from(300).unwrap(),
+                    event_record_id: EventRecordId::try_from(object_id.as_slice()).unwrap(),
+                    storage_capability_class_id,
+                    environment_observation_id,
+                    lifecycle_object_kind: LifecycleObjectKind::ReviewRequest,
+                    lifecycle_object_id: object_id,
+                    freeze_attempt_intended_root_id: None,
+                    identity_dependencies: IdentityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authority_dependencies: AuthorityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authoritative_bytes: index.to_be_bytes().to_vec(),
+                }))
+                .unwrap();
+        }
+
+        let replay_entry_visits = RETAINED_REPLAY_ENTRY_VISITS.with(std::cell::Cell::get);
+        assert!(
+            replay_entry_visits <= APPEND_COUNT,
+            "append replayed {replay_entry_visits} retained entries while adding {APPEND_COUNT} independent objects"
+        );
+    }
+
+    #[test]
+    fn retained_reconstruction_uses_indexed_state_and_freeze_attempt_lookups() {
+        const ATTEMPT_COUNT: usize = 96;
+
+        let registry_id = RegistryId::try_from([0x51; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x52; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x53; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from([0x54; ID_LENGTH].as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        let mut journal = RetainedJournal::from_genesis(genesis).unwrap();
+
+        for offset in 0..ATTEMPT_COUNT {
+            let entry_index = u64::try_from(journal.entries.len()).unwrap();
+            let mut freeze_attempt_bytes = [0_u8; ID_LENGTH];
+            freeze_attempt_bytes[..8]
+                .copy_from_slice(&u64::try_from(offset + 1).unwrap().to_be_bytes());
+            let freeze_attempt_id =
+                FreezeAttemptId::try_from(freeze_attempt_bytes.as_slice()).unwrap();
+            let intended_root_id =
+                derive_freeze_root(registry_id, freeze_attempt_id).intended_root_id();
+            let previous_entry_hash = journal.current_head_reference().entry_hash();
+            journal
+                .append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                    registry_id,
+                    entry_index: JournalEntryIndex::try_from(entry_index).unwrap(),
+                    previous_entry_hash,
+                    event_type_id: EventTypeId::try_from(100).unwrap(),
+                    event_record_id: EventRecordId::try_from(freeze_attempt_bytes.as_slice())
+                        .unwrap(),
+                    storage_capability_class_id,
+                    environment_observation_id,
+                    lifecycle_object_kind: LifecycleObjectKind::FreezeAttempt,
+                    lifecycle_object_id: freeze_attempt_bytes,
+                    freeze_attempt_intended_root_id: Some(intended_root_id),
+                    identity_dependencies: IdentityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authority_dependencies: AuthorityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authoritative_bytes: entry_index.to_be_bytes().to_vec(),
+                }))
+                .unwrap();
+        }
+
+        for offset in 0..ATTEMPT_COUNT {
+            let entry_index = u64::try_from(journal.entries.len()).unwrap();
+            let mut freeze_attempt_bytes = [0_u8; ID_LENGTH];
+            freeze_attempt_bytes[..8]
+                .copy_from_slice(&u64::try_from(offset + 1).unwrap().to_be_bytes());
+            let mut event_record_bytes = freeze_attempt_bytes;
+            event_record_bytes[ID_LENGTH - 1] = 0xA5;
+            let previous_entry_hash = journal.current_head_reference().entry_hash();
+            journal
+                .append(RetainedJournalEntry::Common(CommonRetainedJournalEntry {
+                    registry_id,
+                    entry_index: JournalEntryIndex::try_from(entry_index).unwrap(),
+                    previous_entry_hash,
+                    event_type_id: EventTypeId::try_from(102).unwrap(),
+                    event_record_id: EventRecordId::try_from(event_record_bytes.as_slice())
+                        .unwrap(),
+                    storage_capability_class_id,
+                    environment_observation_id,
+                    lifecycle_object_kind: LifecycleObjectKind::FreezeAttempt,
+                    lifecycle_object_id: freeze_attempt_bytes,
+                    freeze_attempt_intended_root_id: None,
+                    identity_dependencies: IdentityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authority_dependencies: AuthorityDependencyCollection {
+                        elements: Vec::new(),
+                    },
+                    authoritative_bytes: entry_index.to_be_bytes().to_vec(),
+                }))
+                .unwrap();
+        }
+
+        LIFECYCLE_KIND_EQUALITY_COMPARISONS.with(|comparisons| comparisons.set(0));
+        FREEZE_ATTEMPT_ID_EQUALITY_COMPARISONS.with(|comparisons| comparisons.set(0));
+        let reconstructed = journal.reconstruct_state().unwrap();
+        let state_key_comparisons = LIFECYCLE_KIND_EQUALITY_COMPARISONS.with(std::cell::Cell::get);
+        let freeze_attempt_comparisons =
+            FREEZE_ATTEMPT_ID_EQUALITY_COMPARISONS.with(std::cell::Cell::get);
+
+        assert_eq!(reconstructed.freeze_attempts().len(), ATTEMPT_COUNT);
+        assert!(
+            state_key_comparisons <= journal.entries.len() * 4,
+            "state reconstruction used {state_key_comparisons} lifecycle-kind comparisons for {} entries",
+            journal.entries.len()
+        );
+        assert!(
+            freeze_attempt_comparisons <= ATTEMPT_COUNT * 4,
+            "state reconstruction used {freeze_attempt_comparisons} FreezeAttemptId comparisons for {ATTEMPT_COUNT} attempts"
+        );
+    }
 
     #[test]
     fn canonical_text_lengths_end_at_er_uint_max() {
