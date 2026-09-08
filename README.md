@@ -14,79 +14,7 @@ EvidenceRegistry lets you inspect exact Record bytes and replay a retained Journ
 
 ## Installation
 
-Use an available matching release asset from [Releases](https://github.com/DwarfM42/EvidenceRegistry/releases), following that release's verified download/checksum instructions. The asset naming convention is:
-
-| Platform | Asset filename (when available) |
-|---|---|
-| Windows x86_64 | `evidence-registry-windows-x86_64.exe` |
-| Linux x86_64 | `evidence-registry-linux-x86_64` |
-| macOS arm64 | `evidence-registry-macos-arm64` |
-
-If the selected release does not provide your asset and checksum inventory, use the source quick start below. Verify the original download filename against the release inventory before launch; checksum agreement is not build provenance or proof of safety. This naming table does not establish asset publication, signing, notarization, or a successful download verification.
-
-## Quick start from source
-
-Start in an authorized checkout's repository root with Rust/Cargo **1.97.1**, rustfmt, and the platform linker installed (MSVC C++ Build Tools on Windows). These commands use the existing Cargo dependency cache and keep build/temp output under `target/`. The Linux test suite additionally requires `python3`.
-
-### Windows PowerShell
-
-```powershell
-$env:RUSTUP_TOOLCHAIN = '1.97.1-x86_64-pc-windows-msvc'
-$env:RUSTUP_AUTO_INSTALL = '0'
-$env:CARGO_HOME = Join-Path $HOME '.cargo'
-$env:CARGO_TARGET_DIR = Join-Path $PWD.Path 'target'
-$env:TEMP = Join-Path $env:CARGO_TARGET_DIR 'tmp'
-$env:TMP = $env:TEMP
-$env:TMPDIR = $env:TEMP
-New-Item -ItemType Directory -Force $env:TEMP | Out-Null
-cargo build --release --locked
-if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-cargo run --example inspect_demo --locked
-if ($LASTEXITCODE -ne 0) { throw 'Demo refused or failed; inspect the error' }
-$er = '.\target\release\evidence-registry.exe'
-& $er journal verify --genesis '.\target\readme-demo\genesis-entry.cbor'
-$LASTEXITCODE
-```
-
-### Linux / macOS
-
-```sh
-export RUSTUP_TOOLCHAIN=1.97.1 RUSTUP_AUTO_INSTALL=0
-export CARGO_HOME="$HOME/.cargo" CARGO_TARGET_DIR="$PWD/target"
-export TMPDIR="$CARGO_TARGET_DIR/tmp" TEMP="$CARGO_TARGET_DIR/tmp" TMP="$CARGO_TARGET_DIR/tmp"
-mkdir -p "$TMPDIR"
-cargo build --release --locked || exit 1
-cargo run --example inspect_demo --locked || exit 1
-er=./target/release/evidence-registry
-"$er" journal verify --genesis ./target/readme-demo/genesis-entry.cbor
-status=$?
-printf 'exit=%s\n' "$status"
-```
-
-The [compiled example](examples/inspect_demo.rs) creates a **new** `target/readme-demo/` directory. Existing directories/files are refused, never replaced. For another run, pass a fresh leaf name: `cargo run --example inspect_demo --locked -- readme-demo-2`, then use that name in the verification path. Names use ASCII letters/digits, hyphens, or underscores and start with a letter/digit. Use a trusted local checkout, not a shared directory with hostile writers; this example is not a transactional or durability-guaranteed publisher. An interrupted run may leave partial files—inspect them rather than retrying over them.
-
-```text
-target/readme-demo/
-  genesis-record.cbor                    # typed Genesis Record
-  genesis-entry.cbor                     # Genesis Journal Entry referencing that Record
-  ordinary-verification-standalone.cbor   # independent index-24 vector; NOT a successor
-  SHA256SUMS.txt                         # hashes of the three CBOR files
-  DEMO.txt                              # synthetic inputs and explicit limits
-```
-
-The Genesis registry ID is `0x11` repeated 32 times. Its capability and environment IDs are respectively `0x22` and `0x33` repeated 32 times: **unresolved synthetic references**, not observed capabilities or environment evidence. The example neither opens nor mutates a live Registry and deliberately does not create a store namespace.
-
-The ordinary Verification file comes directly from the [independent vector](vectors/journal-ordinary-verification-v1.txt), checked against its retained digest and strict decoder without using the production encoder to establish expected bytes. Its index is **24**, with unresolved predecessor, dependencies, and Record payload. It is a standalone structural example, **never a Genesis-successor replay fixture**.
-
-## Sample output
-
-Actual stdout from the source-built Windows CLI on the generated Genesis Entry (exit `0`, empty stderr):
-
-```json
-{"output_schema_version":1,"operation":"journal verify","outcome":"JOURNAL_ONLY_REPLAY","structural_status":"VALID","authority_status":"UNAVAILABLE","admission_status":"UNAVAILABLE","entry_count":1,"journal_head_index":0,"journal_head_hash":"517a93f9463685e478ef1729d5b759eb903b6b82dbe1541fe977473848f27e5c"}
-```
-
-The head hash is SHA-256 of `genesis-entry.cbor`. This is a source-example execution, not a receipt for a published release binary or a new cross-platform qualification. The `VALID` field describes structural replay only; both authority and admission remain `UNAVAILABLE`.
+The first release uses exact tagged source from the [official GitHub repository](https://github.com/DwarfM42/EvidenceRegistry) and [GitHub Releases](https://github.com/DwarfM42/EvidenceRegistry/releases), deliberately not crates.io. Prebuilt binaries are outside this first release's distribution scope. Use the release's annotated tag and retain its commit identity; an unqualified moving branch is not a release identity.
 
 ## Read-only Journal verification CLI
 
@@ -114,12 +42,14 @@ Always interpret the JSON outcome and `error_class` together with the actual pro
 
 ## Rust library use
 
-Use a local path dependency from a neighboring Cargo project; there is no crates.io package installation route:
+Use a local path dependency; crates.io publication is intentionally outside the first-release scope. In this example, the consuming project's `Cargo.toml` is one directory below the common parent of that project and the EvidenceRegistry checkout:
 
 ```toml
 [dependencies]
 evidence-registry = { path = "../EvidenceRegistry" }
 ```
+
+Cargo resolves this path relative to the consuming manifest. Adjust it to the actual relationship between the two directories; neighboring directories and this checkout directory name are illustrative, not required.
 
 Start with [the executable example](examples/inspect_demo.rs) and [crate-root APIs](src/lib.rs): `GenesisRecord::new` / `decode_authoritative`, `StrictRecordFrame::decode_authoritative`, `GenesisJournalEntry`, `OrdinaryVerificationJournalEntry`, and `RetainedJournal`. `StrictRecordFrame` does **not** validate a type-local body schema; use the corresponding strict typed decoder where implemented. Neither layer resolves references or supplies semantic authority merely by decoding.
 
@@ -159,9 +89,103 @@ Section 83 maps **completed** `Satisfied` to accepted and **completed** `GateUns
 
 An agent can invoke the same read-only CLI and explain its JSON alongside the exact input bytes, hashes, order, and source/binary identity. Its narrative, charts, recommendations, or proposed next actions are **downstream interpretations**, not canonical evidence, completed Policy, or authorization. Keep `UNAVAILABLE` explicit rather than converting it to pass/fail. No AI adapter, external evidence collector, or automatic admission bridge is implemented.
 
+## For AI agents
+
+EvidenceRegistry is intended especially for evidence-sensitive, AI-agent-assisted workflows. The goal is not just to install it, but to retain which qualified release was used: a moving branch must not silently become the execution subject. The initial release deliberately favors inspectable, pinned GitHub source over package-registry convenience; crates.io publication is outside its scope. This is a project distribution choice, not a claim that crates.io lacks version identity or is unsafe. Technically experienced human users can follow the same workflow. **Exact release identity is not an authoritative EvidenceRegistry result.**
+
+Obtain the [official repository over HTTPS](https://github.com/DwarfM42/EvidenceRegistry) and select its [v0.1.0 release](https://github.com/DwarfM42/EvidenceRegistry/releases/tag/v0.1.0), once published. The commands below start at an existing checkout's repository root; no SSH credentials or private development setup are required. Stop if the checkout is dirty or in use by another process. Run each command separately and stop on any failure; do not force-replace an existing tag:
+
+```sh
+git status --short
+git fetch https://github.com/DwarfM42/EvidenceRegistry.git tag v0.1.0
+git checkout --detach v0.1.0
+git rev-parse "v0.1.0^{tag}" "v0.1.0^{commit}" HEAD
+```
+
+Compare the resolved commit and checked-out `HEAD` with the official release record. Retain the annotated tag object, release tag, and source commit. Then follow [Build a release binary](#build-a-release-binary) immediately below, including its `cargo build --release --locked` step, and retain the built binary hash. Use only the documented [read-only CLI](#read-only-journal-verification-cli) or [public Rust library](#rust-library-use); the demo below is not a live Registry.
+
+Retain the exact command, ordered input identities, raw stdout/stderr, exit code, and supported Record/Journal identities exposed by the operation (such as `journal_head_hash`). Report the release and source identity, the actual result, the bounded claim it establishes, and stronger claims left unestablished. Successful installation/build does not make a result trusted. CLI `JOURNAL_ONLY_REPLAY` with structural `VALID` does not establish terminal authority, Policy satisfaction, Review Admission, custody, or production trust: `authority_status` and `admission_status` remain `UNAVAILABLE`. An AI explanation is not authority.
+
+## Build a release binary
+
+From the EvidenceRegistry repository root, with Rust/Cargo **1.97.1**, rustfmt, and the platform linker installed (MSVC C++ Build Tools on Windows). Use your normal Cargo dependency configuration; Cargo may download locked dependencies if they are not cached. The commands keep build/temp output under repository-relative `target/`. The Linux test suite additionally requires `python3`.
+
+### Windows PowerShell
+
+```powershell
+$env:RUSTUP_TOOLCHAIN = '1.97.1-x86_64-pc-windows-msvc'
+$env:RUSTUP_AUTO_INSTALL = '0'
+$env:CARGO_TARGET_DIR = Join-Path $PWD.Path 'target'
+$env:TEMP = Join-Path $env:CARGO_TARGET_DIR 'tmp'
+$env:TMP = $env:TEMP
+$env:TMPDIR = $env:TEMP
+New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+cargo build --release --locked
+if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+cargo run --example inspect_demo --locked
+if ($LASTEXITCODE -ne 0) { throw 'Demo refused or failed; inspect the error' }
+$er = '.\target\release\evidence-registry.exe'
+& $er journal verify --genesis '.\target\readme-demo\genesis-entry.cbor'
+$LASTEXITCODE
+```
+
+### Windows Git Bash
+
+Use Git Bash's native Windows path form when setting environment variables for Cargo. From the repository root:
+
+```bash
+export RUSTUP_TOOLCHAIN=1.97.1-x86_64-pc-windows-msvc RUSTUP_AUTO_INSTALL=0
+export CARGO_TARGET_DIR="$(pwd -W)/target"
+export TMPDIR="$CARGO_TARGET_DIR/tmp" TEMP="$CARGO_TARGET_DIR/tmp" TMP="$CARGO_TARGET_DIR/tmp"
+mkdir -p "$TMPDIR"
+cargo build --release --locked || exit 1
+```
+
+The binary is `target/release/evidence-registry.exe`. For the demo, use the following Linux/macOS demo and verification commands with `er=./target/release/evidence-registry.exe`; do not apply that section's environment setup on Windows.
+
+### Linux / macOS
+
+```sh
+export RUSTUP_TOOLCHAIN=1.97.1 RUSTUP_AUTO_INSTALL=0
+export CARGO_TARGET_DIR="$PWD/target"
+export TMPDIR="$CARGO_TARGET_DIR/tmp" TEMP="$CARGO_TARGET_DIR/tmp" TMP="$CARGO_TARGET_DIR/tmp"
+mkdir -p "$TMPDIR"
+cargo build --release --locked || exit 1
+cargo run --example inspect_demo --locked || exit 1
+er=./target/release/evidence-registry
+"$er" journal verify --genesis ./target/readme-demo/genesis-entry.cbor
+status=$?
+printf 'exit=%s\n' "$status"
+```
+
+The [compiled example](examples/inspect_demo.rs) creates a **new** `target/readme-demo/` directory. Existing directories/files are refused, never replaced. For another run, pass a fresh leaf name: `cargo run --example inspect_demo --locked -- readme-demo-2`, then use that name in the verification path. Names use ASCII letters/digits, hyphens, or underscores and start with a letter/digit. Use a trusted local checkout, not a shared directory with hostile writers; this example is not a transactional or durability-guaranteed publisher. An interrupted run may leave partial files—inspect them rather than retrying over them.
+
+```text
+target/readme-demo/
+  genesis-record.cbor                    # typed Genesis Record
+  genesis-entry.cbor                     # Genesis Journal Entry referencing that Record
+  ordinary-verification-standalone.cbor   # independent index-24 vector; NOT a successor
+  SHA256SUMS.txt                         # hashes of the three CBOR files
+  DEMO.txt                              # synthetic inputs and explicit limits
+```
+
+The Genesis registry ID is `0x11` repeated 32 times. Its capability and environment IDs are respectively `0x22` and `0x33` repeated 32 times: **unresolved synthetic references**, not observed capabilities or environment evidence. The example neither opens nor mutates a live Registry and deliberately does not create a store namespace.
+
+The ordinary Verification file comes directly from the [independent vector](vectors/journal-ordinary-verification-v1.txt), checked against its retained digest and strict decoder without using the production encoder to establish expected bytes. Its index is **24**, with unresolved predecessor, dependencies, and Record payload. It is a standalone structural example, **never a Genesis-successor replay fixture**.
+
+## Sample output
+
+Actual stdout from the source-built Windows CLI on the generated Genesis Entry (exit `0`, empty stderr):
+
+```json
+{"output_schema_version":1,"operation":"journal verify","outcome":"JOURNAL_ONLY_REPLAY","structural_status":"VALID","authority_status":"UNAVAILABLE","admission_status":"UNAVAILABLE","entry_count":1,"journal_head_index":0,"journal_head_hash":"517a93f9463685e478ef1729d5b759eb903b6b82dbe1541fe977473848f27e5c"}
+```
+
+The head hash is SHA-256 of `genesis-entry.cbor`. This is a source-example execution, not a receipt for a published release binary or a new cross-platform qualification. The `VALID` field describes structural replay only; both authority and admission remain `UNAVAILABLE`.
+
 ## Verification
 
-From the repository root with the quick-start environment:
+From the repository root with the build environment above:
 
 ```bash
 cargo fmt --check
@@ -217,9 +241,11 @@ Later-numbered candidate documents are not automatically adopted authority. If t
 
 ## License and publication
 
-The crate is `UNLICENSED`, version `0.1.0`, and has `publish = false`. Source access does not grant an open-source license; this README does not change repository visibility. A GitHub release is not crates.io publication, a license grant, or permission to mutate a live Registry.
+EvidenceRegistry is licensed under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option (`MIT OR Apache-2.0`). Cargo version `0.1.0` retains `publish = false`: the first release is intentionally distributed through GitHub, not crates.io.
 
-Contributor storage note: `target/` is ignored. Historical frozen documents can retain old external paths; those are not operational dependencies. For this project's controlled workspace, `D:\AgentData` remains output-only, never a build/runtime input.
+This project license does not override, relicense, or replace third-party dependency, toolchain, or redistributed-component licenses. See [Third-party notices](THIRD-PARTY-NOTICES.md) for the locked dependency inventory, original notices, and source-versus-binary distribution boundary. Licensing changes distribution permissions, not frozen EvidenceRegistry semantics, runtime authority, or permission to mutate a live Registry.
+
+Build and demo outputs belong under the ignored, repository-relative `target/` directory. Historical frozen documents may retain archival paths; those paths are not installation or runtime requirements.
 
 ## Sources
 
