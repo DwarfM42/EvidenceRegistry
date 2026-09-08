@@ -6,6 +6,7 @@
 //! only the currently supported structural/state-only replay facts.
 
 use evidence_registry::{RetainedJournal, RetainedJournalError};
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -13,7 +14,7 @@ const OUTPUT_SCHEMA_VERSION: u8 = 1;
 const OPERATION: &str = "journal verify";
 
 fn main() -> ExitCode {
-    match parse_arguments(std::env::args().skip(1)) {
+    match parse_arguments(std::env::args_os().skip(1)) {
         Ok(input) => verify_journal(input),
         Err(()) => {
             print_unavailable("USAGE_ERROR", "INPUT_UNAVAILABLE");
@@ -27,10 +28,10 @@ struct JournalVerifyInput {
     entry_paths: Vec<PathBuf>,
 }
 
-fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<JournalVerifyInput, ()> {
+fn parse_arguments(arguments: impl Iterator<Item = OsString>) -> Result<JournalVerifyInput, ()> {
     let mut arguments = arguments;
-    if arguments.next().as_deref() != Some("journal")
-        || arguments.next().as_deref() != Some("verify")
+    if arguments.next().as_deref() != Some(OsStr::new("journal"))
+        || arguments.next().as_deref() != Some(OsStr::new("verify"))
     {
         return Err(());
     }
@@ -38,8 +39,8 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<JournalVer
     let mut genesis_path = None;
     let mut entry_paths = Vec::new();
     while let Some(option) = arguments.next() {
-        match option.as_str() {
-            "--genesis" => {
+        match option.as_os_str() {
+            option if option == OsStr::new("--genesis") => {
                 if genesis_path.is_some() {
                     return Err(());
                 }
@@ -48,7 +49,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<JournalVer
                     return Err(());
                 }
             }
-            "--entry" => {
+            option if option == OsStr::new("--entry") => {
                 let path = arguments.next().map(PathBuf::from).ok_or(())?;
                 entry_paths.push(path);
             }

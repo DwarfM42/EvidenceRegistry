@@ -7,16 +7,16 @@ use evidence_registry::{
     RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
     ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
 };
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
     AuthoritativeRegistryStore, GenesisJournalEntry, GenesisRecord, GenesisRecordInput,
 };
 use sha2::{Digest, Sha256};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::fs;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const GENESIS_HASH_HEX: &str = "ae1919549c80a0c3708cce0485af881a5223fbcf80c6b27a2bbe602418dabd51";
@@ -96,15 +96,15 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 static NEXT_AUTHORITATIVE_STORE_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 struct AuthoritativeStoreFixtureDir {
     path: PathBuf,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 impl AuthoritativeStoreFixtureDir {
     fn new() -> Self {
         let sequence = NEXT_AUTHORITATIVE_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -120,14 +120,14 @@ impl AuthoritativeStoreFixtureDir {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 impl Drop for AuthoritativeStoreFixtureDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn record_filename(record_id: RecordId) -> String {
     let mut name = String::with_capacity(69);
     for byte in record_id.as_bytes() {
@@ -138,7 +138,7 @@ fn record_filename(record_id: RecordId) -> String {
     name
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn write_record(root: &Path, record_id: RecordId, bytes: &[u8]) {
     fs::write(root.join("records").join(record_filename(record_id)), bytes).unwrap();
 }
@@ -424,7 +424,7 @@ fn receipt_bytes_with_policy(
     bytes
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn freeze_commit_policy_bytes(operation_start: &JournalReference) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
@@ -1247,7 +1247,7 @@ fn freeze_committed_binding_rejects_start_record_root_that_disagrees_with_retain
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_store_fails_closed_before_positive_freeze_authority() {
     let fixture = AuthoritativeStoreFixtureDir::new();
@@ -1327,6 +1327,24 @@ fn authoritative_store_fails_closed_before_positive_freeze_authority() {
         genesis_entry.authoritative_cbor(),
     )
     .unwrap();
+    write_record(
+        &fixture.path,
+        genesis_record.record_id(),
+        &genesis_record.authoritative_cbor(),
+    );
+    let mut live_store = AuthoritativeRegistryStore::open(&fixture.path).unwrap();
+    let accepted_old = live_store
+        .accept_authoritative_review_admission(
+            genesis_reference.clone(),
+            b"opaque-old",
+            genesis_reference.clone(),
+            b"opaque-old",
+        )
+        .unwrap();
+    assert_eq!(
+        accepted_old.operation_start_journal_ref(),
+        &genesis_reference
+    );
     fs::write(
         fixture.path.join("journal/00000000000000000001.cbor"),
         &start_entry_bytes,
@@ -1339,17 +1357,55 @@ fn authoritative_store_fails_closed_before_positive_freeze_authority() {
     .unwrap();
     write_record(
         &fixture.path,
-        genesis_record.record_id(),
-        &genesis_record.authoritative_cbor(),
-    );
-    write_record(
-        &fixture.path,
         start_record.record_id(),
         &start_record.authoritative_cbor(),
     );
     write_record(&fixture.path, manifest_id, &manifest_bytes);
     write_record(&fixture.path, policy_record_id, &policy_bytes);
     write_record(&fixture.path, receipt.record_id(), &receipt_bytes);
+
+    for _ in 0..2 {
+        let accepted = live_store
+            .accept_authoritative_review_admission(
+                genesis_reference.clone(),
+                &[],
+                genesis_reference.clone(),
+                &[],
+            )
+            .unwrap();
+        drop(accepted);
+    }
+    // Resolve against the same instance that adopted both repeated reloads.
+    assert_eq!(
+        live_store.validate_freeze_committed_authority(committed_reference.clone()),
+        Err(
+            evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
+        )
+    );
+    assert_eq!(
+        validate_resolved_freeze_committed_binding(
+            live_store.retained_journal(),
+            committed_reference.clone(),
+            &live_store,
+        ),
+        Ok(ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
+    );
+    let accepted_new = live_store
+        .accept_authoritative_review_admission(
+            committed_reference.clone(),
+            b"opaque-new",
+            committed_reference.clone(),
+            b"opaque-new",
+        )
+        .unwrap();
+    assert_eq!(
+        accepted_new.operation_start_journal_ref(),
+        &committed_reference
+    );
+    assert_eq!(
+        accepted_old.operation_start_journal_ref(),
+        &genesis_reference
+    );
 
     let store = AuthoritativeRegistryStore::open(&fixture.path).unwrap();
     assert_eq!(
@@ -1367,7 +1423,63 @@ fn authoritative_store_fails_closed_before_positive_freeze_authority() {
         Ok(ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable)
     );
 
+    #[cfg(target_os = "linux")]
+    {
+        fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+            fs::create_dir(destination).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        for component in [".", "registry", "journal", "records"] {
+            let sequence = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let case_root = std::env::temp_dir().join(format!(
+                "evidence-registry-public-generation-{component}-{sequence}-{}",
+                std::process::id()
+            ));
+            copy_tree(&fixture.path, &case_root);
+            let case_store = AuthoritativeRegistryStore::open(&case_root).unwrap();
+            assert_eq!(
+                case_store.validate_freeze_committed_authority(committed_reference.clone()),
+                Err(evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)
+            );
+            let target = if component == "." {
+                case_root.clone()
+            } else {
+                case_root.join(component)
+            };
+            let replacement = target.with_extension("replacement");
+            let displaced = target.with_extension("displaced");
+            copy_tree(&target, &replacement);
+            fs::rename(&target, &displaced).unwrap();
+            fs::rename(&replacement, &target).unwrap();
+            assert_eq!(
+                case_store.validate_freeze_committed_authority(committed_reference.clone()),
+                Err(evidence_registry::AuthoritativeFreezeCommittedBindingError::RetainedGenerationChanged),
+                "{component} coherent replacement must be observed by the public validator"
+            );
+            drop(case_store);
+            fs::remove_dir_all(case_root).unwrap();
+            if displaced.exists() {
+                fs::remove_dir_all(displaced).unwrap();
+            }
+        }
+    }
+
+    // Release all retained fixture handles before deliberately deleting a receipt.
     drop(store);
+    drop(accepted_new);
+    drop(accepted_old);
+    drop(live_store);
     fs::remove_file(
         fixture
             .path

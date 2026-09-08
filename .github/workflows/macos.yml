@@ -1,0 +1,43 @@
+name: Macos verification
+
+on:
+  push:
+    branches: [main, 'integration/**', 'cross-platform/**']
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-ci:
+    name: macos-ci
+    runs-on: macos-14
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: 1.97.1
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      TEMP: ${{ github.workspace }}/target/tmp
+      TMP: ${{ github.workspace }}/target/tmp
+      TMPDIR: ${{ github.workspace }}/target/tmp
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo build --release --locked
+      - run: cargo fmt --check
+      - run: cargo test --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --release --test review_admission_runtime --locked
+      - run: cargo test --release --test freeze_committed_binding --locked
+      - run: cargo test --doc --locked
+      - run: git diff --check
+      - name: Reject tracked source drift
+        run: git diff --exit-code
