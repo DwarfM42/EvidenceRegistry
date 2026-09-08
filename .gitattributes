@@ -1,3 +1,7 @@
+# Preserve committed evidence bytes regardless of host core.autocrlf.
+# Explicit source-format rules below remain LF on every platform.
+* -text
+
 docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md -text
 docs/FORMAL-VERIFICATION-IMPLEMENTATION-BOUNDARY-SPEC-v0.5.4.md -text
 docs/CROSS-REFERENCE-v0.3.md -text
