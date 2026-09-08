@@ -23,7 +23,7 @@ use evidence_registry::{
     StrictRecordFrame, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
     REVIEW_ADMISSION_MAX_OPAQUE_INPUT_BYTES, REVIEW_ADMISSION_MAX_OUTSTANDING_ACCEPTANCES,
 };
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
     ReviewAdmissionJournalEntry, ReviewAdmissionJournalEntryInput, ReviewAdmissionRecord,
     ReviewAdmissionRecordInput,
@@ -1715,7 +1715,7 @@ fn review_result_rejects_unassigned_method_status_and_finding_state() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_store_open_requires_the_exact_freeze_commit_policy_context() {
     let mut missing_policy = authoritative_review_admission_fixture(true);
@@ -1758,7 +1758,7 @@ fn authoritative_store_open_requires_the_exact_freeze_commit_policy_context() {
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_store_open_evaluates_freeze_minimum_durability() {
     let fixture = |file_content_flush_state| {
@@ -1818,7 +1818,7 @@ fn authoritative_store_open_rejects_unassigned_review_result_status_registries()
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_store_projects_repeated_result_findings_into_one_identity_set_member() {
     let finding = RecordId::try_from(id(0xf1).as_slice()).unwrap();
@@ -2871,7 +2871,7 @@ fn structurally_complete_inputs_without_authoritative_store_provenance_remain_pr
     assert_eq!(fixture.journal.current_head_reference(), opening_head);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_store_blocks_review_request_before_section_82_without_freeze_semantic_authority() {
     let fixture = authoritative_review_admission_fixture(true);
@@ -2883,7 +2883,7 @@ fn authoritative_store_blocks_review_request_before_section_82_without_freeze_se
 }
 
 // Disabled predecessor profile: governing v0.3 authority does not assign evaluator 1015.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_policy_context_unsupported_never_becomes_a_completed_policy_result() {
     let fixture = authoritative_review_admission_fixture_with_overrides(
@@ -2904,7 +2904,7 @@ fn authoritative_policy_context_unsupported_never_becomes_a_completed_policy_res
     );
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 #[test]
 fn authoritative_store_fails_closed_without_mandatory_generation_protection() {
     let mut fixture = authoritative_review_admission_fixture(true);
@@ -2917,7 +2917,7 @@ fn authoritative_store_fails_closed_without_mandatory_generation_protection() {
 }
 
 // Disabled predecessor profile: terminal publication is fail-closed before generic Scope semantics.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_replay_does_not_promote_locally_framed_terminal_admission_history() {
     let fixture = authoritative_review_admission_fixture_with_overrides(
@@ -2973,7 +2973,7 @@ fn authoritative_replay_does_not_promote_locally_framed_terminal_admission_histo
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_replay_does_not_claim_disposition_without_frozen_scope_applicability() {
     let fixture = authoritative_review_admission_fixture(false);
@@ -3019,7 +3019,7 @@ fn authoritative_replay_does_not_claim_disposition_without_frozen_scope_applicab
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_replay_rejects_freeze_start_record_root_mismatch_before_later_semantics() {
     let fixture = authoritative_review_admission_fixture_with_test_overrides(
@@ -3036,7 +3036,7 @@ fn authoritative_replay_rejects_freeze_start_record_root_mismatch_before_later_s
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_replay_rejects_start_only_prefix_without_freeze_commit_policy_context() {
     let mut fixture = authoritative_review_admission_fixture_with_test_overrides(
@@ -3054,7 +3054,7 @@ fn authoritative_replay_rejects_start_only_prefix_without_freeze_commit_policy_c
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_replay_validates_multi_context_request_before_semantic_authority_unavailable() {
     let mut fixture = authoritative_review_admission_fixture_with_test_overrides(
@@ -3072,7 +3072,7 @@ fn authoritative_replay_validates_multi_context_request_before_semantic_authorit
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_replay_rejects_duplicate_manifest_paths_before_freeze_authority() {
     let mut manifest = hex_bytes(MANIFEST_RECORD_HEX);
@@ -3098,7 +3098,7 @@ fn authoritative_replay_rejects_duplicate_manifest_paths_before_freeze_authority
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_replay_rejects_review_request_outside_policy_selector_set() {
     let fixture = authoritative_review_admission_fixture_with_roles(true, &[4]);
@@ -3201,7 +3201,7 @@ fn authoritative_store_holds_namespace_directories_against_replacement() {
     assert_eq!(store.root(), store_dir.path.canonicalize().unwrap());
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_open_tolerates_bounded_publication_temp_residue_without_stealing_it() {
     let fixture = authoritative_review_admission_fixture(true);
@@ -3221,7 +3221,7 @@ fn authoritative_open_tolerates_bounded_publication_temp_residue_without_stealin
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_open_recovers_the_hardlink_publish_crash_window() {
     let fixture = authoritative_review_admission_fixture(true);
@@ -3250,7 +3250,7 @@ fn authoritative_open_recovers_the_hardlink_publish_crash_window() {
     assert!(journal_temp.exists());
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_runtime_keeps_policy_context_unsupported_preterminal_and_unpublished() {
     let fixture = authoritative_review_admission_fixture_with_overrides(
@@ -3275,7 +3275,7 @@ fn authoritative_runtime_keeps_policy_context_unsupported_preterminal_and_unpubl
         .exists());
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn authoritative_runtime_does_not_promote_unfrozen_generic_gate_scope_semantics() {
     let fixture = authoritative_review_admission_fixture(true);

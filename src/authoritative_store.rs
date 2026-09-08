@@ -1,6 +1,10 @@
 use super::*;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs;
+#[cfg(not(target_os = "macos"))]
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+#[cfg(not(target_os = "macos"))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Maximum bytes admitted from any single authoritative namespace object.
@@ -35,7 +39,7 @@ pub enum AuthoritativeRegistryStoreOpenError {
     EventRecordDecode,
     /// Frozen-valid structure requires contextual authority semantics not supplied by this runtime.
     EventSemanticAuthorityUnavailable,
-    /// This platform cannot hold a mandatory immutable-generation lease for positive authority.
+    /// This platform lacks an implemented retained-generation protection adapter.
     RetainedGenerationProtectionUnavailable,
     RetainedGenerationChanged,
     RetainedJournal(RetainedJournalError),
@@ -116,7 +120,7 @@ struct AuthoritativeRegistryStoreInstanceIdentity {
 }
 
 static NEXT_AUTHORITATIVE_REVIEW_ADMISSION_TOKEN: AtomicU64 = AtomicU64::new(1);
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 static NEXT_AUTHORITATIVE_PUBLICATION_TEMP: AtomicU64 = AtomicU64::new(1);
 const MAX_AUTHORITATIVE_PUBLICATION_RETRIES: usize = 8;
 
@@ -618,7 +622,7 @@ impl AuthoritativeRegistryStore {
         retained_file_witnesses.append(&mut record_witnesses);
         retained_file_witnesses.append(&mut journal_witnesses);
         before_generation_guard();
-        if !cfg!(windows) {
+        if !cfg!(any(windows, target_os = "linux", target_os = "macos")) {
             return Err(
                 AuthoritativeRegistryStoreOpenError::RetainedGenerationProtectionUnavailable,
             );
@@ -890,10 +894,12 @@ impl AuthoritativeRegistryStore {
 
     /// Executes authoritative §82, §46, §83, terminal construction, and durable publication.
     ///
-    /// Terminal publication is enabled only where this implementation can hold a mandatory
-    /// cross-process publication lock among runtime publishers through Record and Journal
-    /// publication, together with retained-object sharing guards. Other platforms return
-    /// `PublicationLockUnavailable` before making any terminal namespace mutation.
+    /// Terminal publication requires cross-process publisher serialization and retained-object
+    /// revalidation through Record and Journal publication. Windows uses deny-share guards; Linux
+    /// and macOS use cooperative `flock` serialization plus exact identity and byte revalidation.
+    /// Unix adapters do not constrain a same-principal writer that ignores the protocol. Linux
+    /// explicitly unlocks on orderly owner drop; macOS retains the bare File/O_CLOEXEC lifecycle
+    /// and does not promise release while a fork-without-exec child retains its descriptor.
     pub fn complete_authoritative_review_admission(
         &mut self,
         accepted: AcceptedAuthoritativeReviewAdmission,
@@ -1253,11 +1259,152 @@ impl AuthoritativeRegistryStore {
         ))
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn reload_authoritative_namespaces(
         &mut self,
     ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError> {
+        self.reload_authoritative_namespaces_with_hook(|| {})
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reload_authoritative_namespaces_with_hook<F>(
+        &mut self,
+        after_precheck: F,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError>
+    where
+        F: FnOnce(),
+    {
+        self.reload_authoritative_namespaces_with_hooks(after_precheck, || {})
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reload_authoritative_namespaces_with_hooks<F, G>(
+        &mut self,
+        after_precheck: F,
+        after_reopen: G,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError>
+    where
+        F: FnOnce(),
+        G: FnOnce(),
+    {
+        self.revalidate_retained_generation().map_err(|_| {
+            AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            )
+        })?;
+        after_precheck();
+        let mut reloaded =
+            Self::open(&self.root).map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
+        after_reopen();
+        self.revalidate_retained_generation().map_err(|_| {
+            AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            )
+        })?;
+        if reloaded.namespace_holds.len() != self.namespace_holds.len()
+            || reloaded
+                .namespace_holds
+                .iter()
+                .zip(&self.namespace_holds)
+                .any(|(reloaded, retained)| !handles_identify_same_object(reloaded, retained))
+        {
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            ));
+        }
+        Self::rebind_reloaded_witness_paths_to_original_holds(self, &mut reloaded).map_err(
+            |_| {
+                AuthoritativeReviewAdmissionAcceptanceError::Store(
+                    AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+                )
+            },
+        )?;
+        if self.retained_file_witnesses.iter().any(|retained| {
+            !reloaded.retained_file_witnesses.iter().any(|reloaded| {
+                reloaded.path == retained.path
+                    && handles_identify_same_object(&reloaded.file, &retained.file)
+                    && reloaded.expected_length == retained.expected_length
+                    && reloaded.expected_sha256 == retained.expected_sha256
+            })
+        }) {
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            ));
+        }
+        if reloaded.retained_journal.registry_id != self.retained_journal.registry_id {
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged);
+        }
+        self.retained_journal = reloaded.retained_journal;
+        self.records = reloaded.records;
+        self.retained_file_witnesses = reloaded.retained_file_witnesses;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reload_authoritative_namespaces(
+        &mut self,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError> {
+        self.reload_authoritative_namespaces_with_hook(|| {})
+    }
+
+    #[cfg(test)]
+    #[cfg(target_os = "macos")]
+    fn reload_authoritative_namespaces_with_hook<F>(
+        &mut self,
+        before_reopen: F,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError>
+    where
+        F: FnOnce(),
+    {
+        self.reload_authoritative_namespaces_with_reopen_hook(before_reopen)
+    }
+
+    #[cfg(not(test))]
+    #[cfg(target_os = "macos")]
+    fn reload_authoritative_namespaces_with_hook<F>(
+        &mut self,
+        before_reopen: F,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError>
+    where
+        F: FnOnce(),
+    {
+        self.reload_authoritative_namespaces_with_reopen_hook(before_reopen)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reload_authoritative_namespaces_with_reopen_hook<F>(
+        &mut self,
+        before_reopen: F,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError>
+    where
+        F: FnOnce(),
+    {
+        // Profile L coordinates ordinary writers; exact retained identities and bytes, not
+        // timestamps, keep an old authoritative generation continuous through this reopen.
+        self.revalidate_retained_generation().map_err(|_| {
+            AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            )
+        })?;
+        before_reopen();
+        self.revalidate_retained_generation().map_err(|_| {
+            AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            )
+        })?;
         let reloaded =
             Self::open(&self.root).map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
+        self.revalidate_retained_generation().map_err(|_| {
+            AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            )
+        })?;
+        self.ensure_candidate_continues_retained_generation(&reloaded)
+            .map_err(|_| {
+                AuthoritativeReviewAdmissionAcceptanceError::Store(
+                    AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+                )
+            })?;
         if reloaded.retained_journal.registry_id != self.retained_journal.registry_id {
             return Err(AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged);
         }
@@ -1265,6 +1412,66 @@ impl AuthoritativeRegistryStore {
         self.records = reloaded.records;
         self.namespace_holds = reloaded.namespace_holds;
         self.retained_file_witnesses = reloaded.retained_file_witnesses;
+        Ok(())
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn reload_authoritative_namespaces_with_candidate_loader<F>(
+        &mut self,
+        loader: F,
+    ) -> Result<(), AuthoritativeReviewAdmissionAcceptanceError>
+    where
+        F: FnOnce(&Path) -> Result<Self, AuthoritativeRegistryStoreOpenError>,
+    {
+        self.revalidate_retained_generation().map_err(|_| {
+            AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            )
+        })?;
+        let reloaded =
+            loader(&self.root).map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
+        self.revalidate_retained_generation().map_err(|_| {
+            AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            )
+        })?;
+        self.ensure_candidate_continues_retained_generation(&reloaded)
+            .map_err(|_| {
+                AuthoritativeReviewAdmissionAcceptanceError::Store(
+                    AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+                )
+            })?;
+        if reloaded.retained_journal.registry_id != self.retained_journal.registry_id {
+            return Err(AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged);
+        }
+        self.retained_journal = reloaded.retained_journal;
+        self.records = reloaded.records;
+        self.namespace_holds = reloaded.namespace_holds;
+        self.retained_file_witnesses = reloaded.retained_file_witnesses;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ensure_candidate_continues_retained_generation(&self, candidate: &Self) -> Result<(), ()> {
+        if self.namespace_holds.len() != candidate.namespace_holds.len()
+            || !self
+                .namespace_holds
+                .iter()
+                .zip(&candidate.namespace_holds)
+                .all(|(old, fresh)| handles_identify_same_object(old, fresh))
+        {
+            return Err(());
+        }
+        for old in &self.retained_file_witnesses {
+            if !candidate.retained_file_witnesses.iter().any(|fresh| {
+                old.path == fresh.path
+                    && old.expected_length == fresh.expected_length
+                    && old.expected_sha256 == fresh.expected_sha256
+                    && handles_identify_same_object(&old.file, &fresh.file)
+            }) {
+                return Err(());
+            }
+        }
         Ok(())
     }
 
@@ -1288,9 +1495,61 @@ impl AuthoritativeRegistryStore {
     }
 
     fn revalidate_retained_generation(&self) -> Result<(), ()> {
+        self.revalidate_retained_namespace_holds()?;
         for witness in &self.retained_file_witnesses {
             let mut guard = open_retained_file_guard(witness)?;
             revalidate_retained_file_witness(&mut guard)?;
+        }
+        self.revalidate_retained_namespace_holds()?;
+        Ok(())
+    }
+
+    fn revalidate_retained_namespace_holds(&self) -> Result<(), ()> {
+        let [root_hold, registry_hold, journal_hold, records_hold] =
+            self.namespace_holds.as_slice()
+        else {
+            return Err(());
+        };
+        ensure_path_matches_handle(&self.root, root_hold)?;
+        ensure_path_matches_handle(&self.root.join("registry"), registry_hold)?;
+        ensure_path_matches_handle(&self.root.join("journal"), journal_hold)?;
+        ensure_path_matches_handle(&self.root.join("records"), records_hold)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn rebind_reloaded_witness_paths_to_original_holds(
+        original: &Self,
+        reloaded: &mut Self,
+    ) -> Result<(), ()> {
+        let names = [None, Some("registry"), Some("journal"), Some("records")];
+        let mut old_bases = Vec::with_capacity(names.len());
+        let mut new_bases = Vec::with_capacity(names.len());
+        for (index, name) in names.into_iter().enumerate() {
+            let old_path =
+                name.map_or_else(|| original.root.clone(), |name| original.root.join(name));
+            let new_path =
+                name.map_or_else(|| reloaded.root.clone(), |name| reloaded.root.join(name));
+            old_bases.push(namespace_contents_path(
+                &old_path,
+                original.namespace_holds.get(index).ok_or(())?,
+            )?);
+            new_bases.push(namespace_contents_path(
+                &new_path,
+                reloaded.namespace_holds.get(index).ok_or(())?,
+            )?);
+        }
+        for witness in &mut reloaded.retained_file_witnesses {
+            let parent = witness.path.parent().ok_or(())?;
+            let leaf = witness.path.file_name().ok_or(())?;
+            let matches: Vec<_> = new_bases
+                .iter()
+                .enumerate()
+                .filter_map(|(index, base)| (parent == base).then_some(index))
+                .collect();
+            let [index] = matches.as_slice() else {
+                return Err(());
+            };
+            witness.path = old_bases[*index].join(leaf);
         }
         Ok(())
     }
@@ -1677,7 +1936,7 @@ where
         use std::os::unix::ffi::OsStrExt;
 
         unsafe extern "C" {
-            fn openat(directory: i32, path: *const i8, flags: i32, mode: u32) -> i32;
+            fn openat(directory: i32, path: *const i8, flags: i32, ...) -> i32;
             fn linkat(
                 old_directory: i32,
                 old_path: *const i8,
@@ -1773,7 +2032,125 @@ where
         ))
     }
 
-    #[cfg(all(not(windows), not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        unsafe extern "C" {
+            fn openat(directory: i32, path: *const i8, flags: i32, ...) -> i32;
+            fn renameatx_np(
+                from: i32,
+                from_name: *const i8,
+                to: i32,
+                to_name: *const i8,
+                flags: u32,
+            ) -> i32;
+            fn unlinkat(directory: i32, path: *const i8, flags: i32) -> i32;
+        }
+
+        const O_RDWR: i32 = 2;
+        const O_CREAT: i32 = 0x0000_0200;
+        const O_EXCL: i32 = 0x0000_0800;
+        const O_NOFOLLOW: i32 = 0x0000_0100;
+        const O_CLOEXEC: i32 = 0x0100_0000;
+        const RENAME_EXCL: u32 = 0x0000_0004;
+        const EEXIST: i32 = 17;
+
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| ())?;
+        let temp_name = format!(
+            ".evidence-registry-publish-{}-{sequence}.tmp",
+            std::process::id()
+        );
+        let temp_name_c = CString::new(temp_name.as_bytes()).map_err(|_| ())?;
+        let final_name_c =
+            CString::new(final_name.as_os_str().as_encoded_bytes()).map_err(|_| ())?;
+        let descriptor = unsafe {
+            openat(
+                parent_hold.as_raw_fd(),
+                temp_name_c.as_ptr(),
+                O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(());
+        }
+        let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+        let temp_path = parent.join(&temp_name);
+        let cleanup = |file: &fs::File| -> Result<(), ()> {
+            ensure_path_matches_handle(&temp_path, file)?;
+            if unsafe { unlinkat(parent_hold.as_raw_fd(), temp_name_c.as_ptr(), 0) } != 0 {
+                return Err(());
+            }
+            Ok(())
+        };
+        if file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .is_err()
+        {
+            cleanup(&file)?;
+            return Err(());
+        }
+        before_promotion();
+        ensure_path_matches_handle(parent, parent_hold)?;
+        ensure_path_matches_handle(&temp_path, &file)?;
+        let renamed = unsafe {
+            renameatx_np(
+                parent_hold.as_raw_fd(),
+                temp_name_c.as_ptr(),
+                parent_hold.as_raw_fd(),
+                final_name_c.as_ptr(),
+                RENAME_EXCL,
+            )
+        };
+        if renamed != 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(EEXIST) {
+                cleanup(&file)?;
+                return Ok(ImmutablePublicationOutcome::Conflict);
+            }
+            cleanup(&file)?;
+            return Err(());
+        }
+        let final_path = parent.join(final_name);
+        if ensure_path_matches_handle(&final_path, &file).is_err()
+            || after_visibility().is_err()
+            || file.sync_all().is_err()
+        {
+            return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain);
+        }
+        let parent_directory_flush = match sync_retained_directory(parent, parent_hold) {
+            Ok(state) => state,
+            Err(()) => return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain),
+        };
+        let mut witness = RetainedFileWitness {
+            path: final_path,
+            file,
+            expected_length: bytes.len(),
+            expected_sha256: Sha256::digest(bytes).into(),
+        };
+        if revalidate_retained_file_witness(&mut witness).is_err() {
+            return Ok(ImmutablePublicationOutcome::VisibleReceiptUncertain);
+        }
+        Ok(ImmutablePublicationOutcome::Published(
+            ImmutablePublication {
+                facts: ImmutablePublicationFacts {
+                    content_flush: DurabilityActionState::Performed,
+                    atomic_no_replace: DurabilityActionState::Performed,
+                    parent_directory_flush,
+                },
+                retained_witness: witness,
+            },
+        ))
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
     {
         let _ = (bytes, before_promotion, after_visibility);
         Err(())
@@ -1990,7 +2367,179 @@ fn acquire_authoritative_publication_lock(
     Ok(file)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+struct LinuxPublicationLock {
+    file: fs::File,
+    owner_pid: u32,
+}
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsRawFd for LinuxPublicationLock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.file)
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for LinuxPublicationLock {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn getpid() -> i32;
+        }
+        if unsafe { getpid() } == self.owner_pid as i32 && self.unlock().is_err() {
+            eprintln!("linux publication lock unlock failed");
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl LinuxPublicationLock {
+    fn unlock(&self) -> Result<(), ()> {
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        loop {
+            if unsafe { flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), 8) } == 0 {
+                return Ok(());
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(4) {
+                return Err(());
+            }
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+fn acquire_authoritative_publication_lock(
+    root: &Path,
+    root_hold: &fs::File,
+) -> Result<LinuxPublicationLock, ()> {
+    #[cfg(test)]
+    {
+        acquire_authoritative_publication_lock_impl(root, root_hold, None)
+    }
+    #[cfg(not(test))]
+    {
+        acquire_authoritative_publication_lock_impl(root, root_hold)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+type PostLockHook<'a> = dyn FnMut(&fs::File) -> Result<(), ()> + 'a;
+#[cfg(all(test, target_os = "linux"))]
+fn acquire_authoritative_publication_lock_with_post_lock_hook<F>(
+    root: &Path,
+    root_hold: &fs::File,
+    mut post_lock_hook: F,
+) -> Result<LinuxPublicationLock, ()>
+where
+    F: FnMut(&fs::File) -> Result<(), ()>,
+{
+    acquire_authoritative_publication_lock_impl(root, root_hold, Some(&mut post_lock_hook))
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_authoritative_publication_lock_impl(
+    root: &Path,
+    root_hold: &fs::File,
+    #[cfg(test)] mut post_lock_hook: Option<&mut PostLockHook<'_>>,
+) -> Result<LinuxPublicationLock, ()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+        fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    }
+
+    const O_DIRECTORY: i32 = 0x0001_0000;
+    const O_NOFOLLOW: i32 = 0x0002_0000;
+    const O_CLOEXEC: i32 = 0x0008_0000;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const EINTR: i32 = 4;
+
+    ensure_path_matches_handle(root, root_hold)?;
+    let fd = unsafe {
+        openat(
+            root_hold.as_raw_fd(),
+            c".".as_ptr(),
+            O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_dir()
+        || metadata_is_reparse(&metadata)
+        || !handles_identify_same_object(&file, root_hold)
+    {
+        return Err(());
+    }
+    loop {
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(EINTR) {
+            return Err(());
+        }
+    }
+    let lock = LinuxPublicationLock {
+        file,
+        owner_pid: std::process::id(),
+    };
+    #[cfg(test)]
+    if let Some(hook) = post_lock_hook.as_mut() {
+        hook(&lock.file)?;
+    }
+    ensure_path_matches_handle(root, root_hold)?;
+    if !handles_identify_same_object(&lock.file, root_hold) {
+        return Err(());
+    }
+    Ok(lock)
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_authoritative_publication_lock(
+    root: &Path,
+    root_hold: &fs::File,
+) -> Result<fs::File, ()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+        fn openat(directory: i32, path: *const i8, flags: i32, ...) -> i32;
+    }
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const O_RDONLY: i32 = 0;
+    const O_CLOEXEC: i32 = 0x0100_0000;
+    const O_DIRECTORY: i32 = 0x0010_0000;
+
+    ensure_path_matches_handle(root, root_hold)?;
+    let descriptor = unsafe {
+        openat(
+            root_hold.as_raw_fd(),
+            c".".as_ptr(),
+            O_RDONLY | O_CLOEXEC | O_DIRECTORY,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(());
+    }
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_dir()
+        || metadata_is_reparse(&metadata)
+        || unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0
+    {
+        return Err(());
+    }
+    ensure_path_matches_handle(root, root_hold)?;
+    Ok(file)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn acquire_authoritative_publication_lock(
     _root: &Path,
     _root_hold: &fs::File,
@@ -1998,7 +2547,7 @@ fn acquire_authoritative_publication_lock(
     Err(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 fn open_publication_directory_hold(path: &Path) -> Result<fs::File, ()> {
     #[cfg(windows)]
     let directory = {
@@ -2139,7 +2688,48 @@ fn open_real_directory_hold(path: &Path) -> Result<fs::File, ()> {
             .open(path)
             .map_err(|_| ())?
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_DIRECTORY: i32 = 0x0001_0000;
+        const O_NOFOLLOW: i32 = 0x0002_0000;
+        const O_CLOEXEC: i32 = 0x0008_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            .open(path)
+            .map_err(|_| ())?
+    };
+    #[cfg(target_os = "macos")]
+    let file = {
+        use std::ffi::CString;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        unsafe extern "C" {
+            fn open(path: *const i8, flags: i32, ...) -> i32;
+        }
+
+        const O_RDONLY: i32 = 0;
+        const O_NONBLOCK: i32 = 0x0000_0004;
+        const O_NOFOLLOW: i32 = 0x0000_0100;
+        const O_CLOEXEC: i32 = 0x0100_0000;
+        const O_DIRECTORY: i32 = 0x0010_0000;
+
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| ())?;
+        let descriptor = unsafe {
+            open(
+                path.as_ptr(),
+                O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC | O_DIRECTORY,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(());
+        }
+        unsafe { fs::File::from_raw_fd(descriptor) }
+    };
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let file = fs::File::open(path).map_err(|_| ())?;
     let metadata = file.metadata().map_err(|_| ())?;
     if !metadata.is_dir() || metadata_is_reparse(&metadata) {
@@ -2289,7 +2879,7 @@ fn open_child_directory_hold(
     use std::os::fd::{AsRawFd, FromRawFd};
 
     unsafe extern "C" {
-        fn openat(directory: i32, path: *const i8, flags: i32, mode: u32) -> i32;
+        fn openat(directory: i32, path: *const i8, flags: i32, ...) -> i32;
     }
 
     const O_RDONLY: i32 = 0;
@@ -2317,7 +2907,49 @@ fn open_child_directory_hold(
     Ok(child)
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn open_child_directory_hold(
+    parent: &fs::File,
+    parent_path: &Path,
+    name: &str,
+) -> Result<fs::File, ()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    unsafe extern "C" {
+        fn openat(directory: i32, path: *const i8, flags: i32, ...) -> i32;
+    }
+
+    const O_RDONLY: i32 = 0;
+    const O_CLOEXEC: i32 = 0x0100_0000;
+    const O_DIRECTORY: i32 = 0x0010_0000;
+    const O_NOFOLLOW: i32 = 0x0000_0100;
+
+    ensure_path_matches_handle(parent_path, parent)?;
+    let child_path = parent_path.join(name);
+    let name = CString::new(name.as_bytes()).map_err(|_| ())?;
+    let descriptor = unsafe {
+        openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(());
+    }
+    let child = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = child.metadata().map_err(|_| ())?;
+    if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+        return Err(());
+    }
+    ensure_path_matches_handle(parent_path, parent)?;
+    ensure_path_matches_handle(&child_path, &child)?;
+    Ok(child)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 fn open_child_directory_hold(
     _parent: &fs::File,
     _parent_path: &Path,
@@ -2340,7 +2972,13 @@ fn namespace_contents_path(path: &Path, hold: &fs::File) -> Result<PathBuf, ()> 
     Ok(path.to_path_buf())
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn namespace_contents_path(path: &Path, hold: &fs::File) -> Result<PathBuf, ()> {
+    ensure_path_matches_handle(path, hold)?;
+    Ok(path.to_path_buf())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 fn namespace_contents_path(_path: &Path, _hold: &fs::File) -> Result<PathBuf, ()> {
     Err(())
 }
@@ -2400,7 +3038,21 @@ fn read_regular_file(
             .open(path)
             .map_err(|_| NamespaceReadError::Io)?
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x0000_0800;
+        const O_NOFOLLOW: i32 = 0x0002_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| NamespaceReadError::Io)?
+    };
+    #[cfg(target_os = "macos")]
+    let mut file =
+        open_identity_handle_for_regular_file(path).map_err(|_| NamespaceReadError::Io)?;
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let mut file = OpenOptions::new()
         .read(true)
         .open(path)
@@ -2448,22 +3100,58 @@ fn revalidate_retained_file_witness(witness: &mut RetainedFileWitness) -> Result
         return Err(());
     }
     ensure_path_matches_handle(&witness.path, &witness.file)?;
-    witness.file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
-    let read_limit = u64::try_from(witness.expected_length)
-        .map_err(|_| ())?
-        .checked_add(1)
-        .ok_or(())?;
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut witness.file)
-        .take(read_limit)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
-    if bytes.len() != witness.expected_length
-        || <[u8; ID_LENGTH]>::from(Sha256::digest(&bytes)) != witness.expected_sha256
+    #[cfg(target_os = "macos")]
     {
-        return Err(());
+        use std::os::unix::fs::FileExt;
+
+        let read_limit = witness.expected_length.checked_add(1).ok_or(())?;
+        let mut bytes = vec![0; read_limit];
+        let mut offset = 0usize;
+        while offset < read_limit {
+            match witness.file.read_at(&mut bytes[offset..], offset as u64) {
+                Ok(0) => break,
+                Ok(read) => offset += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(()),
+            }
+        }
+        bytes.truncate(offset);
+        let metadata_after = witness.file.metadata().map_err(|_| ())?;
+        if !metadata_after.is_file()
+            || metadata_is_reparse(&metadata_after)
+            || !metadata_has_admitted_link_count(&witness.path, &metadata_after, &witness.file)
+            || usize::try_from(metadata_after.len()).map_err(|_| ())? != witness.expected_length
+        {
+            return Err(());
+        }
+        ensure_path_matches_handle(&witness.path, &witness.file)?;
+        if bytes.len() == witness.expected_length
+            && <[u8; ID_LENGTH]>::from(Sha256::digest(&bytes)) == witness.expected_sha256
+        {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
-    Ok(())
+    #[cfg(not(target_os = "macos"))]
+    {
+        witness.file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
+        let read_limit = u64::try_from(witness.expected_length)
+            .map_err(|_| ())?
+            .checked_add(1)
+            .ok_or(())?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut witness.file)
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ())?;
+        if bytes.len() != witness.expected_length
+            || <[u8; ID_LENGTH]>::from(Sha256::digest(&bytes)) != witness.expected_sha256
+        {
+            return Err(());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -2490,7 +3178,58 @@ fn open_retained_file_guard(source: &RetainedFileWitness) -> Result<RetainedFile
     Ok(guard)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn open_retained_file_guard(source: &RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const O_NONBLOCK: i32 = 0x0000_0800;
+    const O_NOFOLLOW: i32 = 0x0002_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+        .open(&source.path)
+        .map_err(|_| ())?;
+    if !handles_identify_same_object(&source.file, &file) {
+        return Err(());
+    }
+    let mut guard = RetainedFileWitness {
+        path: source.path.clone(),
+        file,
+        expected_length: source.expected_length,
+        expected_sha256: source.expected_sha256,
+    };
+    revalidate_retained_file_witness(&mut guard)?;
+    Ok(guard)
+}
+
+#[cfg(target_os = "macos")]
+fn open_retained_file_guard(source: &RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    const LOCK_SH: i32 = 1;
+    const LOCK_NB: i32 = 4;
+
+    let mut guard = RetainedFileWitness {
+        path: source.path.clone(),
+        file: source.file.try_clone().map_err(|_| ())?,
+        expected_length: source.expected_length,
+        expected_sha256: source.expected_sha256,
+    };
+    if unsafe { flock(guard.file.as_raw_fd(), LOCK_SH | LOCK_NB) } != 0 {
+        return Err(());
+    }
+    if !handles_identify_same_object(&source.file, &guard.file) {
+        return Err(());
+    }
+    revalidate_retained_file_witness(&mut guard)?;
+    Ok(guard)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn open_retained_file_guard(_source: &RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
     Err(())
 }
@@ -2556,7 +3295,81 @@ fn downgrade_publication_witness(source: RetainedFileWitness) -> Result<Retained
     Ok(witness)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn downgrade_publication_witness(source: RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const O_NONBLOCK: i32 = 0x0000_0800;
+    const O_NOFOLLOW: i32 = 0x0002_0000;
+    let path = source.path.clone();
+    let expected_length = source.expected_length;
+    let expected_sha256 = source.expected_sha256;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| ())?;
+    if !handles_identify_same_object(&source.file, &file) {
+        return Err(());
+    }
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata_is_reparse(&metadata)
+        || metadata_link_count(&metadata, &file) != Some(1)
+        || usize::try_from(metadata.len()).map_err(|_| ())? != expected_length
+    {
+        return Err(());
+    }
+    let read_limit = u64::try_from(expected_length)
+        .map_err(|_| ())?
+        .checked_add(1)
+        .ok_or(())?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() != expected_length
+        || <[u8; ID_LENGTH]>::from(Sha256::digest(&bytes)) != expected_sha256
+    {
+        return Err(());
+    }
+    drop(source);
+    let mut witness = RetainedFileWitness {
+        path,
+        file,
+        expected_length,
+        expected_sha256,
+    };
+    revalidate_retained_file_witness(&mut witness)?;
+    Ok(witness)
+}
+
+#[cfg(target_os = "macos")]
+fn downgrade_publication_witness(source: RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    let file = open_identity_handle_for_regular_file(&source.path)?;
+    if !handles_identify_same_object(&source.file, &file) {
+        return Err(());
+    }
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata_is_reparse(&metadata)
+        || !metadata_has_admitted_link_count(&source.path, &metadata, &file)
+        || usize::try_from(metadata.len()).map_err(|_| ())? != source.expected_length
+    {
+        return Err(());
+    }
+    let mut witness = RetainedFileWitness {
+        path: source.path.clone(),
+        file,
+        expected_length: source.expected_length,
+        expected_sha256: source.expected_sha256,
+    };
+    revalidate_retained_file_witness(&mut witness)?;
+    Ok(witness)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn downgrade_publication_witness(_source: RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
     Err(())
 }
@@ -2624,7 +3437,52 @@ fn open_identity_handle_for_regular_file(path: &Path) -> Result<fs::File, ()> {
     {
         open_windows_identity_handle(path, false)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const O_NONBLOCK: i32 = 0x0000_0800;
+        const O_NOFOLLOW: i32 = 0x0002_0000;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| ())?;
+        let metadata = file.metadata().map_err(|_| ())?;
+        (metadata.is_file() && !metadata_is_reparse(&metadata))
+            .then_some(file)
+            .ok_or(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        unsafe extern "C" {
+            fn open(path: *const i8, flags: i32, ...) -> i32;
+        }
+        const O_RDONLY: i32 = 0;
+        const O_NONBLOCK: i32 = 0x0000_0004;
+        const O_NOFOLLOW: i32 = 0x0000_0100;
+        const O_CLOEXEC: i32 = 0x0100_0000;
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| ())?;
+        let descriptor = unsafe {
+            open(
+                path.as_ptr(),
+                O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(());
+        }
+        let file = unsafe { fs::File::from_raw_fd(descriptor) };
+        if !file.metadata().map_err(|_| ())?.is_file() {
+            return Err(());
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         fs::File::open(path).map_err(|_| ())
     }
@@ -5375,6 +6233,222 @@ fn record_id_from_event_reference(reference: &JournalReference) -> RecordId {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    struct LinuxGenesisFixture {
+        root: std::path::PathBuf,
+        genesis: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LinuxGenesisFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "evidence-registry-linux-genesis-{label}-{sequence}-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(root.join("registry")).unwrap();
+            fs::create_dir(root.join("journal")).unwrap();
+            fs::create_dir(root.join("records")).unwrap();
+            let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+            let storage_capability_class_id =
+                RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+            let environment_observation_id =
+                RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+            let genesis = GenesisRecord::new(GenesisRecordInput {
+                registry_id,
+                journal_format_version: 1,
+                record_identity_profile_id: 1,
+                storage_capability_class_id,
+                environment_observation_id,
+                created_by_tool_version: "linux-supported-genesis-fixture".to_owned(),
+            })
+            .unwrap();
+            let entry = GenesisJournalEntry::new(
+                registry_id,
+                EventRecordId::try_from(genesis.record_id().as_bytes().as_slice()).unwrap(),
+                storage_capability_class_id,
+                environment_observation_id,
+            );
+            let genesis_path = root.join("registry/genesis.cbor");
+            fs::write(&genesis_path, genesis.authoritative_cbor()).unwrap();
+            fs::write(
+                root.join("journal/00000000000000000000.cbor"),
+                entry.authoritative_cbor(),
+            )
+            .unwrap();
+            Self {
+                root,
+                genesis: genesis_path,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LinuxGenesisFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+    #[cfg(target_os = "macos")]
+    const CHILD_OUTPUT_MAX: usize = 4096;
+    #[cfg(target_os = "macos")]
+    static MACOS_PROCESS_SPAWN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "macos")]
+    struct BoundedChild {
+        child: std::process::Child,
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
+        stdout_bytes: Vec<u8>,
+        stderr_bytes: Vec<u8>,
+        deadline: std::time::Instant,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl BoundedChild {
+        fn new(child: std::process::Child) -> Result<Self, ()> {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn fcntl(fd: i32, command: i32, ...) -> i32;
+            }
+            const F_GETFL: i32 = 3;
+            const F_SETFL: i32 = 4;
+            const O_NONBLOCK: i32 = 0x0000_0004;
+            let mut bounded = Self {
+                child,
+                stdout: None,
+                stderr: None,
+                stdout_bytes: Vec::new(),
+                stderr_bytes: Vec::new(),
+                deadline: std::time::Instant::now() + CHILD_DEADLINE,
+            };
+            let stdout = bounded.child.stdout.take().ok_or(())?;
+            let stderr = bounded.child.stderr.take().ok_or(())?;
+            for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+                let flags = unsafe { fcntl(fd, F_GETFL) };
+                if flags < 0 || unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+                    return Err(());
+                }
+            }
+            bounded.stdout = Some(stdout);
+            bounded.stderr = Some(stderr);
+            Ok(bounded)
+        }
+
+        fn pump_stream(
+            stream: &mut impl std::io::Read,
+            bytes: &mut Vec<u8>,
+            deadline: std::time::Instant,
+        ) -> Result<(), ()> {
+            let mut chunk = [0_u8; 256];
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) => return Ok(()),
+                    Ok(count) => {
+                        if bytes.len().checked_add(count).ok_or(())? > CHILD_OUTPUT_MAX {
+                            return Err(());
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(());
+                        }
+                        continue;
+                    }
+                    Err(_) => return Err(()),
+                }
+            }
+        }
+
+        fn pump(&mut self) -> Result<(), ()> {
+            self.pump_with_deadline(self.deadline)
+        }
+
+        fn pump_with_deadline(&mut self, deadline: std::time::Instant) -> Result<(), ()> {
+            Self::pump_stream(
+                self.stdout.as_mut().ok_or(())?,
+                &mut self.stdout_bytes,
+                deadline,
+            )?;
+            Self::pump_stream(
+                self.stderr.as_mut().ok_or(())?,
+                &mut self.stderr_bytes,
+                deadline,
+            )
+        }
+
+        fn wait_token(&mut self, token: &[u8]) -> Result<(), ()> {
+            loop {
+                self.pump()?;
+                if std::time::Instant::now() >= self.deadline {
+                    return Err(());
+                }
+                if self
+                    .stdout_bytes
+                    .windows(token.len())
+                    .any(|window| window == token)
+                {
+                    return Ok(());
+                }
+                if self.child.try_wait().map_err(|_| ())?.is_some()
+                    || std::time::Instant::now() >= self.deadline
+                {
+                    return Err(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fn wait_exit(&mut self) -> Result<std::process::ExitStatus, ()> {
+            loop {
+                self.pump()?;
+                if std::time::Instant::now() >= self.deadline {
+                    return Err(());
+                }
+                if let Some(status) = self.child.try_wait().map_err(|_| ())? {
+                    self.pump()?;
+                    if std::time::Instant::now() >= self.deadline {
+                        return Err(());
+                    }
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= self.deadline {
+                    return Err(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fn kill_reap(&mut self) -> Result<std::process::ExitStatus, ()> {
+            let _ = self.child.kill();
+            let reap_deadline = std::time::Instant::now() + CHILD_DEADLINE;
+            while std::time::Instant::now() < reap_deadline {
+                let _ = self.pump_with_deadline(reap_deadline);
+                if let Some(status) = self.child.try_wait().map_err(|_| ())? {
+                    return Ok(status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for BoundedChild {
+        fn drop(&mut self) {
+            let _ = self.kill_reap();
+        }
+    }
+
     #[test]
     fn exact_authority_dependency_validation_has_a_bounded_comparison_topology() {
         const DEPENDENCY_COUNT: u64 = 256;
@@ -5439,7 +6513,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     #[test]
     fn store_open_fails_without_mandatory_retained_generation_protection() {
         let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -5486,7 +6560,210 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_open_retains_a_supported_genesis_generation() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-open-protection-unavailable-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "store-open-protection-test".to_owned(),
+        })
+        .unwrap();
+        let genesis_entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        fs::write(
+            root.join("registry/genesis.cbor"),
+            genesis_record.authoritative_cbor(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            genesis_entry.authoritative_cbor(),
+        )
+        .unwrap();
+
+        let mut store = AuthoritativeRegistryStore::open(&root).unwrap();
+        assert_eq!(store.root(), root.canonicalize().unwrap());
+        let displaced = root.with_extension("displaced");
+        assert_eq!(
+            store.reload_authoritative_namespaces_with_hook(|| {
+                fs::rename(&root, &displaced).unwrap();
+                fs::create_dir_all(root.join("registry")).unwrap();
+                fs::create_dir(root.join("journal")).unwrap();
+                fs::create_dir(root.join("records")).unwrap();
+                fs::write(
+                    root.join("registry/genesis.cbor"),
+                    genesis_record.authoritative_cbor(),
+                )
+                .unwrap();
+                fs::write(
+                    root.join("journal/00000000000000000000.cbor"),
+                    genesis_entry.authoritative_cbor(),
+                )
+                .unwrap();
+            }),
+            Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged
+            ))
+        );
+        drop(store);
+        fs::remove_dir_all(displaced).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_freeze_validation_rejects_a_transplanted_retained_root() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-root-transplant-{}-{sequence}",
+            std::process::id()
+        ));
+        let displaced = root.with_extension("displaced");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&displaced);
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "root-transplant-test".to_owned(),
+        })
+        .unwrap();
+        let genesis_entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        fs::write(
+            root.join("registry/genesis.cbor"),
+            genesis_record.authoritative_cbor(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            genesis_entry.authoritative_cbor(),
+        )
+        .unwrap();
+        let store = AuthoritativeRegistryStore::open(&root).unwrap();
+        let reference = store.retained_journal().current_head_reference();
+        assert_eq!(
+            store.validate_freeze_committed_authority(reference.clone()),
+            Err(AuthoritativeFreezeCommittedBindingError::Structural(
+                ResolvedFreezeCommittedBindingError::CommittedEventMismatch
+            ))
+        );
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        for name in ["registry", "journal", "records"] {
+            fs::rename(displaced.join(name), root.join(name)).unwrap();
+        }
+        assert_eq!(
+            store.validate_freeze_committed_authority(reference),
+            Err(AuthoritativeFreezeCommittedBindingError::RetainedGenerationChanged)
+        );
+        drop(store);
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&displaced).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reload_rejects_a_fresh_candidate_from_a_transient_clone_root() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("evidence-registry-reload-clone-{sequence}"));
+        let displaced = root.with_extension("old");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&displaced);
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let capability = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id: capability,
+            environment_observation_id: environment,
+            created_by_tool_version: "reload-clone-test".to_owned(),
+        })
+        .unwrap();
+        let entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis.record_id().as_bytes().as_slice()).unwrap(),
+            capability,
+            environment,
+        );
+        fs::write(
+            root.join("registry/genesis.cbor"),
+            genesis.authoritative_cbor(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            entry.authoritative_cbor(),
+        )
+        .unwrap();
+        let mut store = AuthoritativeRegistryStore::open(&root).unwrap();
+        assert_eq!(store.reload_authoritative_namespaces(), Ok(()));
+        assert_eq!(
+            store.reload_authoritative_namespaces_with_candidate_loader(|path| {
+                fs::rename(path, &displaced).unwrap();
+                fs::create_dir_all(path.join("registry")).unwrap();
+                fs::create_dir(path.join("journal")).unwrap();
+                fs::create_dir(path.join("records")).unwrap();
+                fs::write(
+                    path.join("registry/genesis.cbor"),
+                    genesis.authoritative_cbor(),
+                )
+                .unwrap();
+                fs::write(
+                    path.join("journal/00000000000000000000.cbor"),
+                    entry.authoritative_cbor(),
+                )
+                .unwrap();
+                let candidate = AuthoritativeRegistryStore::open(path);
+                fs::remove_dir_all(path).unwrap();
+                fs::rename(&displaced, path).unwrap();
+                candidate
+            }),
+            Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged
+            ))
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn store_open_rejects_authority_bytes_changed_after_replay_before_positive_return() {
         let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -5536,6 +6813,982 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fifo_read_child_helper() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("EVIDENCE_REGISTRY_FIFO_PATH") else {
+            return;
+        };
+        assert!(read_regular_file(Path::new(&path), &mut NamespaceBudget::new()).is_err());
+        println!("FIFO_REJECTED");
+        std::io::stdout().flush().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_store_open_fifo_root_child_helper() {
+        use std::io::Write;
+        let Ok(path) = std::env::var("EVIDENCE_REGISTRY_STORE_OPEN_FIFO_ROOT") else {
+            return;
+        };
+        println!("STORE_ROOT_FIFO_CHILD_STARTED");
+        std::io::stdout().flush().unwrap();
+        assert_eq!(
+            AuthoritativeRegistryStore::open(Path::new(&path)).unwrap_err(),
+            AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid
+        );
+        println!("STORE_ROOT_FIFO_REJECTED");
+        std::io::stdout().flush().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bounded_child_fault_helper() {
+        use std::io::Write;
+        let Ok(mode) = std::env::var("EVIDENCE_REGISTRY_BOUNDED_CHILD_MODE") else {
+            return;
+        };
+        match mode.as_str() {
+            "missing" => std::thread::sleep(std::time::Duration::from_secs(10)),
+            "partial" => {
+                print!("PARTIAL");
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            "stdout" => {
+                std::io::stdout().write_all(&vec![b'x'; 8192]).unwrap();
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            "stderr" => {
+                std::io::stderr().write_all(&vec![b'x'; 8192]).unwrap();
+                std::io::stderr().flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            "early" => (),
+            "ready" => {
+                println!("READY");
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            "fifo" => {
+                println!("FIFO_REJECTED");
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            _ => panic!("unknown bounded child mode"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bounded_child_pump_rejects_expired_deadline_before_read() {
+        struct InterruptedThenWouldBlock {
+            reads: usize,
+        }
+
+        impl std::io::Read for InterruptedThenWouldBlock {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                Err(std::io::Error::from(if self.reads == 1 {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::WouldBlock
+                }))
+            }
+        }
+
+        let mut stream = InterruptedThenWouldBlock { reads: 0 };
+        let mut bytes = Vec::new();
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert!(BoundedChild::pump_stream(&mut stream, &mut bytes, expired).is_err());
+        assert_eq!(stream.reads, 0);
+        assert!(bytes.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bounded_child_fault_matrix() {
+        use std::process::{Command, Stdio};
+        let _spawn_guard = MACOS_PROCESS_SPAWN_TEST_MUTEX.lock().unwrap();
+        for (mode, token, token_expected) in [
+            ("missing", b"READY".as_slice(), false),
+            ("partial", b"READY".as_slice(), false),
+            ("stdout", b"READY".as_slice(), false),
+            ("stderr", b"READY".as_slice(), false),
+            ("early", b"READY".as_slice(), false),
+            ("ready", b"READY".as_slice(), true),
+            ("fifo", b"FIFO_REJECTED".as_slice(), true),
+        ] {
+            let mut child = BoundedChild::new(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "authoritative_store::tests::macos_bounded_child_fault_helper",
+                        "--nocapture",
+                    ])
+                    .env("EVIDENCE_REGISTRY_BOUNDED_CHILD_MODE", mode)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            )
+            .unwrap();
+            let token_result = child.wait_token(token);
+            assert_eq!(token_result.is_ok(), token_expected, "{mode}");
+            if mode == "early" {
+                assert!(child.wait_exit().is_ok(), "{mode}");
+            } else {
+                assert!(child.wait_exit().is_err(), "{mode}");
+                let _ = child.kill_reap().unwrap();
+            }
+            assert!(child.child.try_wait().unwrap().is_some(), "{mode}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bounded_child_constructor_failure_reaps_owned_child() {
+        use std::process::{Command, Stdio};
+
+        let _spawn_guard = MACOS_PROCESS_SPAWN_TEST_MUTEX.lock().unwrap();
+        for (label, stdout, stderr) in [
+            ("stdout-null", Stdio::null(), Stdio::piped()),
+            ("stderr-null", Stdio::piped(), Stdio::null()),
+        ] {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "authoritative_store::tests::macos_bounded_child_fault_helper",
+                    "--nocapture",
+                ])
+                .env("EVIDENCE_REGISTRY_BOUNDED_CHILD_MODE", "missing")
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            assert!(BoundedChild::new(child).is_err(), "{label}");
+
+            let status = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            if !status.stdout.is_empty() {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                status.stdout.is_empty(),
+                "{label}: child {pid} was not reaped"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_store_open_namespace_fifo_child_helper() {
+        use std::io::Write;
+        let Ok(root) = std::env::var("EVIDENCE_REGISTRY_STORE_OPEN_FIFO_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let expected = match std::env::var("EVIDENCE_REGISTRY_STORE_OPEN_EXPECTED").as_deref() {
+            Ok("registry") => AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid,
+            Ok("journal") => AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid,
+            Ok("records") => AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid,
+            _ => panic!("missing namespace FIFO expected error"),
+        };
+        println!("STORE_NAMESPACE_FIFO_CHILD_STARTED");
+        std::io::stdout().flush().unwrap();
+        assert_eq!(
+            AuthoritativeRegistryStore::open(root).unwrap_err(),
+            expected
+        );
+        println!("STORE_NAMESPACE_FIFO_REJECTED");
+        std::io::stdout().flush().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_regular_file_rejects_fifo_without_blocking() {
+        let _spawn_guard = MACOS_PROCESS_SPAWN_TEST_MUTEX.lock().unwrap();
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+
+        unsafe extern "C" {
+            fn mkfifo(path: *const i8, mode: u16) -> i32;
+        }
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("evidence-registry-macos-fifo-{sequence}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let fifo = root.join("input.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let mut child = BoundedChild::new(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "authoritative_store::tests::macos_fifo_read_child_helper",
+                    "--nocapture",
+                ])
+                .env("EVIDENCE_REGISTRY_FIFO_PATH", &fifo)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+        .unwrap();
+        let rejected = child.wait_token(b"FIFO_REJECTED").is_ok();
+        let status = if rejected {
+            child.wait_exit().ok()
+        } else {
+            child.kill_reap().ok()
+        };
+        assert!(rejected && status.is_some_and(|status| status.success()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_store_open_rejects_fifo_root_without_blocking() {
+        let _spawn_guard = MACOS_PROCESS_SPAWN_TEST_MUTEX.lock().unwrap();
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+
+        unsafe extern "C" {
+            fn mkfifo(path: *const i8, mode: u16) -> i32;
+        }
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("evidence-registry-macos-store-fifo-{sequence}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let fifo = root.join("root.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let mut child = BoundedChild::new(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "authoritative_store::tests::macos_store_open_fifo_root_child_helper",
+                    "--nocapture",
+                ])
+                .env("EVIDENCE_REGISTRY_STORE_OPEN_FIFO_ROOT", &fifo)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+        .unwrap();
+        let rejected = child.wait_token(b"STORE_ROOT_FIFO_REJECTED").is_ok();
+        let status = if rejected {
+            child.wait_exit().ok()
+        } else {
+            child.kill_reap().ok()
+        };
+        assert!(rejected && status.is_some_and(|status| status.success()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_store_open_rejects_namespace_fifos_without_blocking() {
+        let _spawn_guard = MACOS_PROCESS_SPAWN_TEST_MUTEX.lock().unwrap();
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+
+        unsafe extern "C" {
+            fn mkfifo(path: *const i8, mode: u16) -> i32;
+        }
+        for (case, expected) in [
+            ("genesis", "registry"),
+            ("registry", "registry"),
+            ("journal", "journal"),
+            ("records", "records"),
+        ] {
+            let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("evidence-registry-macos-fifo-{case}-{sequence}"));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir(&root).unwrap();
+            for child_name in ["registry", "journal", "records"] {
+                if case == "genesis" || child_name != case {
+                    fs::create_dir(root.join(child_name)).unwrap();
+                }
+            }
+            let fifo = if case == "genesis" {
+                root.join("registry/genesis.cbor")
+            } else {
+                root.join(case)
+            };
+            let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+            let mut child = BoundedChild::new(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "authoritative_store::tests::macos_store_open_namespace_fifo_child_helper",
+                        "--nocapture",
+                    ])
+                    .env("EVIDENCE_REGISTRY_STORE_OPEN_FIFO_ROOT", &root)
+                    .env("EVIDENCE_REGISTRY_STORE_OPEN_EXPECTED", expected)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            )
+            .unwrap();
+            let rejected = child.wait_token(b"STORE_NAMESPACE_FIFO_REJECTED").is_ok();
+            let status = if rejected {
+                child.wait_exit().ok()
+            } else {
+                child.kill_reap().ok()
+            };
+            assert!(rejected && status.is_some_and(|status| status.success()));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_lock_child_helper() {
+        use std::io::Write;
+        let Ok(root) = std::env::var("EVIDENCE_REGISTRY_ROOT_LOCK_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let hold = open_real_directory_hold(&root).unwrap();
+        match std::env::var("EVIDENCE_REGISTRY_ROOT_LOCK_MODE").as_deref() {
+            Ok("attempt") => {
+                assert!(acquire_authoritative_publication_lock(&root, &hold).is_err());
+                println!("ROOT_LOCK_BLOCKED");
+            }
+            Ok("hold") => {
+                let lock = acquire_authoritative_publication_lock(&root, &hold).unwrap();
+                println!("ROOT_LOCK_READY");
+                std::io::stdout().flush().unwrap();
+                let mut byte = [0_u8; 1];
+                let _ = std::io::stdin().lock().read(&mut byte).unwrap();
+                drop(lock);
+            }
+            Ok("exit") => {
+                let lock = acquire_authoritative_publication_lock(&root, &hold).unwrap();
+                println!("ROOT_LOCK_READY");
+                std::io::stdout().flush().unwrap();
+                drop(lock);
+            }
+            _ => panic!("missing root-lock child mode"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_lock_cross_process_release_lifecycle() {
+        let _spawn_guard = MACOS_PROCESS_SPAWN_TEST_MUTEX.lock().unwrap();
+        use std::process::{Command, Stdio};
+
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-root-lock-process-{sequence}"
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+        let spawn = |mode: &str, input: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "authoritative_store::tests::macos_root_lock_child_helper",
+                    "--nocapture",
+                ])
+                .env("EVIDENCE_REGISTRY_ROOT_LOCK_ROOT", &root)
+                .env("EVIDENCE_REGISTRY_ROOT_LOCK_MODE", mode)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if input {
+                command.stdin(Stdio::piped());
+            }
+            BoundedChild::new(command.spawn().unwrap()).unwrap()
+        };
+        let owner = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        let mut blocked = spawn("attempt", false);
+        assert!(blocked.wait_token(b"ROOT_LOCK_BLOCKED").is_ok());
+        assert!(blocked.wait_exit().unwrap().success());
+        drop(owner);
+        let mut normal = spawn("exit", false);
+        assert!(normal.wait_token(b"ROOT_LOCK_READY").is_ok());
+        assert!(normal.wait_exit().unwrap().success());
+        let reacquired = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        drop(reacquired);
+        let mut abnormal = spawn("hold", true);
+        assert!(abnormal.wait_token(b"ROOT_LOCK_READY").is_ok());
+        assert!(abnormal.child.try_wait().unwrap().is_none());
+        assert!(acquire_authoritative_publication_lock(&root, &root_hold).is_err());
+        let status = abnormal.kill_reap().unwrap();
+        assert!(!status.success());
+        let after_kill = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        drop(after_kill);
+        drop(root_hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_authoritative_publication_lock_serializes_cooperative_writers() {
+        let _spawn_guard = MACOS_PROCESS_SPAWN_TEST_MUTEX.lock().unwrap();
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-publication-lock-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+
+        let first = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        fs::remove_file(root.join(".evidence-registry-publication.lock")).ok();
+        assert!(acquire_authoritative_publication_lock(&root, &root_hold).is_err());
+        drop(first);
+        let second = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        drop(second);
+
+        drop(root_hold);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_downgraded_publication_witness_preserves_identity_and_bytes() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-publication-handoff-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let hold = open_real_directory_hold(&root).unwrap();
+        let final_name = Path::new("final.cbor");
+        let publication =
+            match publish_new_immutable_file(&root, &hold, final_name, b"exact handoff").unwrap() {
+                ImmutablePublicationOutcome::Published(publication) => publication,
+                _ => panic!("publication did not produce a retained witness"),
+            };
+        let mut retained = downgrade_publication_witness(publication.retained_witness).unwrap();
+        revalidate_retained_file_witness(&mut retained).unwrap();
+        drop(retained);
+
+        let replacement_source = root.join("replacement-source.cbor");
+        fs::write(&replacement_source, b"exact handoff").unwrap();
+        let replacement_witness =
+            read_regular_file(&root.join(final_name), &mut NamespaceBudget::new())
+                .unwrap()
+                .witness;
+        fs::rename(&replacement_source, root.join(final_name)).unwrap();
+        assert!(downgrade_publication_witness(replacement_witness).is_err());
+        drop(hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_immutable_publication_is_no_replace() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-no-replace-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let parent_hold = open_real_directory_hold(&root).unwrap();
+        let final_name = Path::new("final.cbor");
+        assert!(matches!(
+            publish_new_immutable_file(&root, &parent_hold, final_name, b"first").unwrap(),
+            ImmutablePublicationOutcome::Published(_)
+        ));
+        assert!(matches!(
+            publish_new_immutable_file(&root, &parent_hold, final_name, b"second").unwrap(),
+            ImmutablePublicationOutcome::Conflict
+        ));
+        use std::os::unix::fs::PermissionsExt;
+        eprintln!(
+            "final_mode={:o}",
+            fs::metadata(root.join(final_name))
+                .unwrap()
+                .permissions()
+                .mode()
+        );
+        assert_eq!(fs::read(root.join(final_name)).unwrap(), b"first");
+        drop(parent_hold);
+        fs::remove_file(root.join(final_name)).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_publication_after_visibility_fault_preserves_visible_bytes() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("evidence-registry-macos-visible-{sequence}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let hold = open_real_directory_hold(&root).unwrap();
+        assert!(matches!(
+            publish_new_immutable_file_with_hooks(
+                &root,
+                &hold,
+                Path::new("final.cbor"),
+                b"visible",
+                || {},
+                || Err(())
+            )
+            .unwrap(),
+            ImmutablePublicationOutcome::VisibleReceiptUncertain
+        ));
+        assert_eq!(fs::read(root.join("final.cbor")).unwrap(), b"visible");
+        drop(hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_publication_post_visibility_witness_drift_is_uncertain_and_retained() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("evidence-registry-macos-witness-drift-{sequence}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let hold = open_real_directory_hold(&root).unwrap();
+        assert!(matches!(
+            publish_new_immutable_file_with_hooks(
+                &root,
+                &hold,
+                Path::new("final.cbor"),
+                b"original",
+                || {},
+                || {
+                    fs::write(root.join("final.cbor"), b"mutated!").unwrap();
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            ImmutablePublicationOutcome::VisibleReceiptUncertain
+        ));
+        assert_eq!(fs::read(root.join("final.cbor")).unwrap(), b"mutated!");
+        drop(hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_publication_preserves_dangling_final_symlink() {
+        use std::os::unix::fs::symlink;
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("evidence-registry-macos-dangling-{sequence}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        symlink("missing-competitor", root.join("final.cbor")).unwrap();
+        let hold = open_real_directory_hold(&root).unwrap();
+        assert!(matches!(
+            publish_new_immutable_file(&root, &hold, Path::new("final.cbor"), b"candidate")
+                .unwrap(),
+            ImmutablePublicationOutcome::Conflict
+        ));
+        assert_eq!(
+            fs::read_link(root.join("final.cbor")).unwrap(),
+            Path::new("missing-competitor")
+        );
+        drop(hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_publication_rejects_moved_parent_without_deleting_decoy_temp() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("evidence-registry-macos-parent-move-{sequence}"));
+        let displaced = root.with_extension("old");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&displaced);
+        fs::create_dir(&root).unwrap();
+        let hold = open_real_directory_hold(&root).unwrap();
+        let decoy_temp = format!(
+            ".evidence-registry-publish-{}-{}.tmp",
+            std::process::id(),
+            sequence + 1
+        );
+        assert!(publish_new_immutable_file_with_hook(
+            &root,
+            &hold,
+            Path::new("final.cbor"),
+            b"candidate",
+            || {
+                fs::rename(&root, &displaced).unwrap();
+                fs::create_dir(&root).unwrap();
+                fs::write(root.join(&decoy_temp), b"competitor").unwrap();
+            }
+        )
+        .is_err());
+        assert!(!displaced.join("final.cbor").exists());
+        assert!(!root.join("final.cbor").exists());
+        assert_eq!(fs::read(root.join(&decoy_temp)).unwrap(), b"competitor");
+        drop(hold);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(displaced).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_admitted_link_count_rejects_symlink_residue_and_accepts_exact_pair() {
+        use std::os::unix::fs::symlink;
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("evidence-registry-macos-link-count-{sequence}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let final_path = root.join("final.cbor");
+        let temp = root.join(".evidence-registry-publish-1-1.tmp");
+        fs::write(&final_path, b"exact pair").unwrap();
+        fs::hard_link(&final_path, root.join("external")).unwrap();
+        symlink(&final_path, &temp).unwrap();
+        let file = open_identity_handle_for_regular_file(&final_path).unwrap();
+        assert!(!metadata_has_admitted_link_count(
+            &final_path,
+            &file.metadata().unwrap(),
+            &file
+        ));
+        fs::remove_file(root.join("external")).unwrap();
+        fs::remove_file(&temp).unwrap();
+        fs::hard_link(&final_path, &temp).unwrap();
+        assert!(metadata_has_admitted_link_count(
+            &final_path,
+            &file.metadata().unwrap(),
+            &file
+        ));
+        assert_eq!(fs::read(&final_path).unwrap(), b"exact pair");
+        assert_eq!(fs::read(&temp).unwrap(), b"exact pair");
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_opener_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-nofollow-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let regular = root.join("regular.cbor");
+        let alias = root.join("alias.cbor");
+        fs::write(&regular, b"exact bytes").unwrap();
+        symlink(&regular, &alias).unwrap();
+        assert!(open_identity_handle_for_regular_file(&regular).is_ok());
+        assert!(open_identity_handle_for_regular_file(&alias).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_regular_file_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-read-nofollow-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let regular = root.join("regular.cbor");
+        let alias = root.join("alias.cbor");
+        fs::write(&regular, b"exact bytes").unwrap();
+        symlink(&regular, &alias).unwrap();
+        assert_eq!(
+            read_regular_file(&regular, &mut NamespaceBudget::new())
+                .unwrap()
+                .bytes,
+            b"exact bytes"
+        );
+        assert!(read_regular_file(&alias, &mut NamespaceBudget::new()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_revalidation_rejects_recreated_root_with_original_children() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-root-continuity-{sequence}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "linux-root-continuity-test".to_owned(),
+        })
+        .unwrap();
+        let entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        fs::write(
+            root.join("registry/genesis.cbor"),
+            genesis.authoritative_cbor(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            entry.authoritative_cbor(),
+        )
+        .unwrap();
+        let store = AuthoritativeRegistryStore::open(&root).unwrap();
+        let displaced = root.with_extension("displaced");
+        fs::rename(&root, &displaced).unwrap();
+        fs::create_dir(&root).unwrap();
+        for child in ["registry", "journal", "records"] {
+            fs::rename(displaced.join(child), root.join(child)).unwrap();
+        }
+        assert!(store.revalidate_retained_generation().is_err());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(displaced).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reload_rejects_transient_same_byte_genesis_inode_substitution() {
+        let fixture = LinuxGenesisFixture::new("reload-transient-inode");
+        let original_bytes = fs::read(&fixture.genesis).unwrap();
+        let displaced = fixture
+            .root
+            .join("original-genesis-held-outside-registry.cbor");
+        let mut store = AuthoritativeRegistryStore::open(&fixture.root).unwrap();
+        let result = store.reload_authoritative_namespaces_with_hooks(
+            || {
+                fs::rename(&fixture.genesis, &displaced).unwrap();
+                fs::write(&fixture.genesis, &original_bytes).unwrap();
+            },
+            || {
+                fs::remove_file(&fixture.genesis).unwrap();
+                fs::rename(&displaced, &fixture.genesis).unwrap();
+            },
+        );
+        assert_eq!(
+            result,
+            Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+            ))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reload_rejects_each_recreated_fixed_child_namespace() {
+        for child in ["registry", "journal", "records"] {
+            let fixture = LinuxGenesisFixture::new(child);
+            let original = fixture.root.join(child);
+            let displaced = fixture.root.join(format!("{child}-original"));
+            let mut store = AuthoritativeRegistryStore::open(&fixture.root).unwrap();
+            let result = store.reload_authoritative_namespaces_with_hook(|| {
+                fs::rename(&original, &displaced).unwrap();
+                fs::create_dir(&original).unwrap();
+                if child == "registry" {
+                    fs::copy(
+                        displaced.join("genesis.cbor"),
+                        original.join("genesis.cbor"),
+                    )
+                    .unwrap();
+                } else if child == "journal" {
+                    fs::copy(
+                        displaced.join("00000000000000000000.cbor"),
+                        original.join("00000000000000000000.cbor"),
+                    )
+                    .unwrap();
+                }
+            });
+            assert_eq!(
+                result,
+                Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                    AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
+                )),
+                "{child} replacement must invalidate the retained namespace"
+            );
+            drop(store);
+            fs::remove_dir_all(&original).unwrap();
+            fs::rename(&displaced, &original).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_acceptance_rejects_retained_genesis_replacement_before_reload() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-acceptance-generation-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "linux-acceptance-generation-test".to_owned(),
+        })
+        .unwrap();
+        let genesis_entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        let genesis_path = root.join("registry/genesis.cbor");
+        fs::write(&genesis_path, genesis_record.authoritative_cbor()).unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            genesis_entry.authoritative_cbor(),
+        )
+        .unwrap();
+        let mut store = AuthoritativeRegistryStore::open(&root).unwrap();
+
+        let genesis_reference = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(0_u64).unwrap(),
+            genesis_entry.entry_hash(),
+            EventTypeId::try_from(1_u64).unwrap(),
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+        );
+        let accepted = store
+            .accept_authoritative_review_admission(
+                genesis_reference.clone(),
+                &[],
+                genesis_reference.clone(),
+                &[],
+            )
+            .unwrap();
+        drop(accepted);
+
+        let replacement = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "linux-acceptance-generation-tesu".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            replacement.authoritative_cbor().len(),
+            genesis_record.authoritative_cbor().len()
+        );
+        fs::write(&genesis_path, replacement.authoritative_cbor()).unwrap();
+
+        assert!(matches!(
+            store.accept_authoritative_review_admission(
+                genesis_reference.clone(),
+                &[],
+                genesis_reference,
+                &[],
+            ),
+            Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged
+            ))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_acceptance_rejects_same_byte_genesis_inode_replacement_before_reload() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-acceptance-inode-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "linux-acceptance-inode-test".to_owned(),
+        })
+        .unwrap();
+        let genesis_entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        let genesis_path = root.join("registry/genesis.cbor");
+        let genesis_bytes = genesis_record.authoritative_cbor();
+        fs::write(&genesis_path, &genesis_bytes).unwrap();
+        fs::write(
+            root.join("journal/00000000000000000000.cbor"),
+            genesis_entry.authoritative_cbor(),
+        )
+        .unwrap();
+        let mut store = AuthoritativeRegistryStore::open(&root).unwrap();
+
+        let replacement_path = root.join("registry/replacement.cbor");
+        fs::write(&replacement_path, &genesis_bytes).unwrap();
+        fs::rename(&replacement_path, &genesis_path).unwrap();
+
+        let genesis_reference = JournalReference::new(
+            registry_id,
+            JournalEntryIndex::try_from(0_u64).unwrap(),
+            genesis_entry.entry_hash(),
+            EventTypeId::try_from(1_u64).unwrap(),
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+        );
+        assert!(matches!(
+            store.accept_authoritative_review_admission(
+                genesis_reference.clone(),
+                &[],
+                genesis_reference,
+                &[],
+            ),
+            Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged
+            ))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn authoritative_publication_lock_serializes_terminal_writers() {
@@ -5556,6 +7809,1128 @@ mod tests {
         fs::remove_file(root.join(".evidence-registry-publication.lock")).unwrap();
         drop(root_hold);
         fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reload_rejects_same_registry_namespace_replacement_after_precheck() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-reload-replacement-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("registry")).unwrap();
+        fs::create_dir(root.join("journal")).unwrap();
+        fs::create_dir(root.join("records")).unwrap();
+        let registry_id = RegistryId::try_from([0x10; ID_LENGTH].as_slice()).unwrap();
+        let storage_capability_class_id = RecordId::try_from([0x20; ID_LENGTH].as_slice()).unwrap();
+        let environment_observation_id = RecordId::try_from([0x30; ID_LENGTH].as_slice()).unwrap();
+        let genesis_record = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id,
+            environment_observation_id,
+            created_by_tool_version: "linux-reload-replacement-test".to_owned(),
+        })
+        .unwrap();
+        let genesis_entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+            storage_capability_class_id,
+            environment_observation_id,
+        );
+        let genesis_bytes = genesis_record.authoritative_cbor();
+        let entry_bytes = genesis_entry.authoritative_cbor();
+        fs::write(root.join("registry/genesis.cbor"), &genesis_bytes).unwrap();
+        fs::write(root.join("journal/00000000000000000000.cbor"), &entry_bytes).unwrap();
+        let mut store = AuthoritativeRegistryStore::open(&root).unwrap();
+        let displaced = root.with_extension("displaced");
+        assert!(matches!(
+            store.reload_authoritative_namespaces_with_hook(|| {
+                fs::rename(&root, &displaced).unwrap();
+                fs::create_dir_all(root.join("registry")).unwrap();
+                fs::create_dir(root.join("journal")).unwrap();
+                fs::create_dir(root.join("records")).unwrap();
+                fs::write(root.join("registry/genesis.cbor"), &genesis_bytes).unwrap();
+                fs::write(root.join("journal/00000000000000000000.cbor"), &entry_bytes).unwrap();
+            }),
+            Err(AuthoritativeReviewAdmissionAcceptanceError::Store(
+                AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged
+            ))
+        ));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(displaced).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_publication_lock_prevents_lockfile_inode_split() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-publication-lock-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+        let lock_path = root.join(".evidence-registry-publication.lock");
+        fs::write(&lock_path, b"decoy-original").unwrap();
+
+        let first = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        assert!(acquire_authoritative_publication_lock(&root, &root_hold).is_err());
+        fs::rename(&lock_path, root.join("displaced.lock")).unwrap();
+        fs::write(&lock_path, b"replacement").unwrap();
+        assert!(acquire_authoritative_publication_lock(&root, &root_hold).is_err());
+        drop(first);
+        let second = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        drop(second);
+        fs::remove_file(&lock_path).unwrap();
+        fs::remove_file(root.join("displaced.lock")).unwrap();
+        drop(root_hold);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct OwnedProtocolChild {
+        child: std::process::Child,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct OwnedForkChild {
+        pid: i32,
+        reaped: bool,
+    }
+    #[cfg(target_os = "linux")]
+    struct OwnedFd(i32);
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            unsafe extern "C" {
+                fn close(fd: i32) -> i32;
+            }
+            if self.0 >= 0 {
+                let _ = unsafe { close(self.0) };
+                self.0 = -1;
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl OwnedForkChild {
+        fn reap_by(&mut self, deadline: std::time::Instant) -> Result<i32, ()> {
+            unsafe extern "C" {
+                fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            }
+            let mut status = 0;
+            loop {
+                if unsafe { waitpid(self.pid, &mut status, 1) } == self.pid {
+                    self.reaped = true;
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        fn kill_and_reap_by(&mut self, deadline: std::time::Instant) -> Result<i32, ()> {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            if self.reaped {
+                return Ok(0);
+            }
+            if unsafe { kill(self.pid, 9) } != 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(3)
+            {
+                return Err(());
+            }
+            self.reap_by(deadline)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedForkChild {
+        fn drop(&mut self) {
+            if !self.reaped
+                && self
+                    .kill_and_reap_by(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                    .is_err()
+            {
+                if std::thread::panicking() {
+                    eprintln!("owned fork child cleanup failed during unwind");
+                } else {
+                    panic!("owned fork child cleanup failed");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedProtocolChild {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let result = self.kill_and_reap_by(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                if result.is_err() {
+                    if std::thread::panicking() {
+                        eprintln!("owned protocol child cleanup failed during unwind");
+                    } else {
+                        panic!("owned protocol child cleanup failed");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl OwnedProtocolChild {
+        fn kill_and_reap_by(
+            &mut self,
+            deadline: std::time::Instant,
+        ) -> Result<std::process::ExitStatus, ()> {
+            if let Some(status) = self.child.try_wait().map_err(|_| ())? {
+                return Ok(status);
+            }
+            match self.child.kill() {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(3) => {}
+                Err(_) => return Err(()),
+            }
+            self.reap_by(deadline)
+        }
+
+        fn reap_by(
+            &mut self,
+            deadline: std::time::Instant,
+        ) -> Result<std::process::ExitStatus, ()> {
+            loop {
+                if let Some(status) = self.child.try_wait().map_err(|_| ())? {
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn protocol_line_by(
+        output: &mut std::process::ChildStdout,
+        deadline: std::time::Instant,
+    ) -> Result<String, ()> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+            fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+        }
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        const F_GETFL: i32 = 3;
+        const F_SETFL: i32 = 4;
+        const O_NONBLOCK: i32 = 0x800;
+        let raw_fd = output.as_raw_fd();
+        let flags = unsafe { fcntl(raw_fd, F_GETFL, 0) };
+        if flags < 0 || unsafe { fcntl(raw_fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+            return Err(());
+        }
+        let mut fd = PollFd {
+            fd: raw_fd,
+            events: 1,
+            revents: 0,
+        };
+        let millis = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+        if unsafe { poll(&mut fd, 1, millis) } <= 0 {
+            return Err(());
+        }
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 16];
+            match output.read(&mut chunk) {
+                Ok(0) => return Err(()),
+                Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err(()),
+            }
+            if bytes.len() > 64 {
+                return Err(());
+            }
+            if bytes.last() == Some(&b'\n') {
+                return std::str::from_utf8(&bytes)
+                    .map(str::to_owned)
+                    .map_err(|_| ());
+            }
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            if remaining == 0 || unsafe { poll(&mut fd, 1, remaining) } <= 0 {
+                return Err(());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn protocol_command_by(
+        input: &mut std::process::ChildStdin,
+        command: u8,
+        deadline: std::time::Instant,
+    ) -> Result<(), ()> {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+            fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+        }
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        let raw_fd = input.as_raw_fd();
+        let flags = unsafe { fcntl(raw_fd, 3, 0) };
+        if flags < 0 || unsafe { fcntl(raw_fd, 4, flags | 0x800) } < 0 {
+            return Err(());
+        }
+        loop {
+            let millis = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            let mut fd = PollFd {
+                fd: raw_fd,
+                events: 4,
+                revents: 0,
+            };
+            if millis == 0 || unsafe { poll(&mut fd, 1, millis) } <= 0 {
+                return Err(());
+            }
+            match input.write(&[command]) {
+                Ok(1) => return Ok(()),
+                Ok(_) => return Err(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => return Err(()),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_publication_lock_is_process_isolated_and_released_on_owner_exit() {
+        use std::process::{Command, Stdio};
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-publication-process-{sequence}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+        let owner = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        let script = r#"import fcntl, os, select, sys
+f=os.open(sys.argv[1],os.O_RDONLY); print('READY',flush=True)
+for _ in range(2):
+ r,_,_=select.select([0],[],[],1)
+ if not r: os._exit(90)
+ if os.read(0,1)!=b'1': os._exit(91)
+ try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); print('ACQUIRED',flush=True)
+ except BlockingIOError: print('BLOCKED',flush=True)
+"#;
+        let mut owned = OwnedProtocolChild {
+            child: Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .arg(&root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        };
+        let mut input = owned.child.stdin.take().unwrap();
+        let mut output = owned.child.stdout.take().unwrap();
+        assert_eq!(protocol_line_by(&mut output, deadline).unwrap(), "READY\n");
+        protocol_command_by(&mut input, b'1', deadline).unwrap();
+        assert_eq!(
+            protocol_line_by(&mut output, deadline).unwrap(),
+            "BLOCKED\n"
+        );
+        drop(owner);
+        protocol_command_by(&mut input, b'1', deadline).unwrap();
+        assert_eq!(
+            protocol_line_by(&mut output, deadline).unwrap(),
+            "ACQUIRED\n"
+        );
+        drop(input);
+        drop(output);
+        assert!(owned.reap_by(deadline).unwrap().success());
+        drop(acquire_authoritative_publication_lock(&root, &root_hold).unwrap());
+
+        let abnormal = r#"import fcntl, os, select, sys
+f=os.open(sys.argv[1],os.O_RDONLY); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); print('READY',flush=True)
+r,_,_=select.select([0],[],[],1)
+if not r: os._exit(90)
+if os.read(0,1)!=b'X': os._exit(91)
+os._exit(23)
+"#;
+        let mut abnormal_owner = OwnedProtocolChild {
+            child: Command::new("python3")
+                .arg("-c")
+                .arg(abnormal)
+                .arg(&root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        };
+        let mut abnormal_input = abnormal_owner.child.stdin.take().unwrap();
+        let mut abnormal_output = abnormal_owner.child.stdout.take().unwrap();
+        assert_eq!(
+            protocol_line_by(&mut abnormal_output, deadline).unwrap(),
+            "READY\n"
+        );
+        assert!(acquire_authoritative_publication_lock(&root, &root_hold).is_err());
+        protocol_command_by(&mut abnormal_input, b'X', deadline).unwrap();
+        drop(abnormal_input);
+        drop(abnormal_output);
+        assert_eq!(abnormal_owner.reap_by(deadline).unwrap().code(), Some(23));
+        drop(acquire_authoritative_publication_lock(&root, &root_hold).unwrap());
+        drop(root_hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_supported_store_enforces_hardlink_alias_and_ordinary_writer_controls() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let positive = LinuxGenesisFixture::new("temp-hardlink-positive");
+        fs::hard_link(
+            &positive.genesis,
+            positive
+                .root
+                .join("registry/.evidence-registry-publish-1-1.tmp"),
+        )
+        .unwrap();
+        assert!(AuthoritativeRegistryStore::open(&positive.root).is_ok());
+
+        let external = LinuxGenesisFixture::new("external-hardlink-negative");
+        fs::hard_link(&external.genesis, external.root.join("external-alias.cbor")).unwrap();
+        assert!(AuthoritativeRegistryStore::open(&external.root).is_err());
+
+        let symlink_alias = LinuxGenesisFixture::new("external-plus-temp-symlink-negative");
+        let external_alias = symlink_alias.root.join("external-alias.cbor");
+        let temp_alias = symlink_alias
+            .root
+            .join("registry/.evidence-registry-publish-1-1.tmp");
+        fs::hard_link(&symlink_alias.genesis, &external_alias).unwrap();
+        symlink(&symlink_alias.genesis, &temp_alias).unwrap();
+        assert!(AuthoritativeRegistryStore::open(&symlink_alias.root).is_err());
+        assert!(external_alias.exists() && temp_alias.is_symlink());
+
+        let permission = LinuxGenesisFixture::new("permission-denied");
+        fs::set_permissions(&permission.genesis, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            fs::File::open(&permission.genesis).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(AuthoritativeRegistryStore::open(&permission.root).is_err());
+        fs::set_permissions(&permission.genesis, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let writer = LinuxGenesisFixture::new("preexisting-writer");
+        let mut fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&writer.genesis)
+            .unwrap();
+        let store = AuthoritativeRegistryStore::open(&writer.root).unwrap();
+        fd.seek(SeekFrom::Start(0)).unwrap();
+        fd.write_all(b"X").unwrap();
+        fd.flush().unwrap();
+        assert!(store.revalidate_retained_generation().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_retained_reopen_rejects_fifo_replacement_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        unsafe extern "C" {
+            fn mkfifo(pathname: *const std::ffi::c_char, mode: u32) -> i32;
+        }
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-fifo-{sequence}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("authority.cbor");
+        let bytes = b"known authority bytes";
+        fs::write(&path, bytes).unwrap();
+        let source = RetainedFileWitness {
+            path: path.clone(),
+            file: OpenOptions::new().read(true).open(&path).unwrap(),
+            expected_length: bytes.len(),
+            expected_sha256: Sha256::digest(bytes).into(),
+        };
+        fs::remove_file(&path).unwrap();
+        let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(raw.as_ptr(), 0o600) }, 0);
+        assert!(open_retained_file_guard(&source).is_err());
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reserved_temp_symlink_cannot_admit_external_hardlink() {
+        use std::os::unix::fs::symlink;
+
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-link-admission-{sequence}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let genesis = root.join("genesis.cbor");
+        fs::write(&genesis, b"exact genesis bytes").unwrap();
+        fs::hard_link(&genesis, root.join("external-alias.cbor")).unwrap();
+        symlink(&genesis, root.join(".evidence-registry-publish-1-1.tmp")).unwrap();
+        let file = OpenOptions::new().read(true).open(&genesis).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert!(!metadata_has_admitted_link_count(
+            &genesis, &metadata, &file
+        ));
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "causal RED driver: inherited flock OFD retains lock after parent close"]
+    fn linux_publication_lock_inherited_ofd_releases_with_owner_scope_red() {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn fork() -> i32;
+            fn pipe(fds: *mut i32) -> i32;
+            fn read(fd: i32, b: *mut u8, n: usize) -> isize;
+            fn write(fd: i32, b: *const u8, n: usize) -> isize;
+            fn close(fd: i32) -> i32;
+            fn _exit(status: i32) -> !;
+
+            fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+            fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+        }
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-inherited-ofd-{sequence}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+        let owner = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+        let owner_fd = owner.as_raw_fd();
+        let flags = unsafe { fcntl(owner_fd, 1, 0) };
+        let metadata = owner.file.metadata().unwrap();
+        let mut ready = [0; 2];
+        let mut release = [0; 2];
+        assert_eq!(unsafe { pipe(ready.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { pipe(release.as_mut_ptr()) }, 0);
+        let pid = unsafe { fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                close(ready[0]);
+                close(release[1]);
+            }
+            let marker = *b"R";
+            if unsafe { write(ready[1], marker.as_ptr(), 1) } != 1 {
+                unsafe { _exit(92) }
+            };
+            let mut release_fd = PollFd {
+                fd: release[0],
+                events: 1,
+                revents: 0,
+            };
+            if unsafe { poll(&mut release_fd, 1, 250) } <= 0 {
+                unsafe { _exit(93) }
+            }
+            let mut command = [0];
+            if unsafe { read(release[0], command.as_mut_ptr(), 1) } != 1 {
+                unsafe { _exit(93) }
+            };
+            unsafe { _exit(0) }
+        }
+        let mut fork_child = OwnedForkChild { pid, reaped: false };
+        let _ready_read = OwnedFd(ready[0]);
+        let _release_write = OwnedFd(release[1]);
+        unsafe {
+            close(ready[1]);
+            close(release[0]);
+        }
+        let mut fd = PollFd {
+            fd: ready[0],
+            events: 1,
+            revents: 0,
+        };
+        assert!(unsafe { poll(&mut fd, 1, 250) } > 0);
+        let mut marker = [0];
+        assert_eq!(unsafe { read(ready[0], marker.as_mut_ptr(), 1) }, 1);
+        assert_eq!(marker, *b"R");
+        eprintln!(
+            "inherited-ofd causal probe pid={} child={} fd={} fdflags={} metadata={:?}",
+            std::process::id(),
+            pid,
+            owner_fd,
+            flags,
+            metadata
+        );
+        drop(owner);
+        let contention = acquire_authoritative_publication_lock(&root, &root_hold);
+        let released = *b"X";
+        assert_eq!(unsafe { write(release[1], released.as_ptr(), 1) }, 1);
+        let status = fork_child
+            .reap_by(std::time::Instant::now() + std::time::Duration::from_millis(250))
+            .unwrap_or_else(|_| {
+                fork_child
+                    .kill_and_reap_by(
+                        std::time::Instant::now() + std::time::Duration::from_millis(250),
+                    )
+                    .unwrap()
+            });
+        assert_eq!(
+            status, 0,
+            "inherited child must exit normally, not by forced kill"
+        );
+        assert!(
+            contention.is_ok(),
+            "inherited child OFD retained the flock after parent owner drop"
+        );
+        drop(root_hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "bounded parent worker"]
+    fn linux_inherited_ofd_parent_fault_worker_reaps_owned_child() {
+        unsafe extern "C" {
+            fn fork() -> i32;
+            fn pipe(fds: *mut i32) -> i32;
+            fn write(fd: i32, b: *const u8, n: usize) -> isize;
+            fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+            fn read(fd: i32, b: *mut u8, n: usize) -> isize;
+            fn close(fd: i32) -> i32;
+            fn _exit(status: i32) -> !;
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-fork-fault-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+        let pid = std::cell::Cell::new(-1);
+        let ready_seen = std::cell::Cell::new(false);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owner = acquire_authoritative_publication_lock(&root, &root_hold).unwrap();
+            let mut ready = [0; 2];
+            assert_eq!(unsafe { pipe(ready.as_mut_ptr()) }, 0);
+            let child = unsafe { fork() };
+            if child == 0 {
+                unsafe {
+                    close(ready[0]);
+                }
+                let marker = *b"R";
+                if unsafe { write(ready[1], marker.as_ptr(), 1) } != 1 {
+                    unsafe { _exit(92) }
+                };
+                let mut hold = PollFd {
+                    fd: -1,
+                    events: 0,
+                    revents: 0,
+                };
+                unsafe { poll(&mut hold, 1, 60_000) };
+                unsafe { _exit(93) }
+            }
+            assert!(child > 0);
+            pid.set(child);
+            let _read = OwnedFd(ready[0]);
+            let _write = OwnedFd(ready[1]);
+            let _child = OwnedForkChild {
+                pid: child,
+                reaped: false,
+            };
+            let mut fd = PollFd {
+                fd: ready[0],
+                events: 1,
+                revents: 0,
+            };
+            assert!(unsafe { poll(&mut fd, 1, 250) } > 0);
+            let mut marker = [0];
+            assert_eq!(unsafe { read(ready[0], marker.as_mut_ptr(), 1) }, 1);
+            assert_eq!(marker, *b"R");
+            ready_seen.set(true);
+            panic!("deterministic parent fault after READY");
+        }));
+        assert!(ready_seen.get(), "worker never reached READY");
+        assert_eq!(
+            panic.unwrap_err().downcast_ref::<&str>(),
+            Some(&"deterministic parent fault after READY")
+        );
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(pid.get(), &mut status, 1) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10));
+        drop(acquire_authoritative_publication_lock(&root, &root_hold).unwrap());
+        drop(root_hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "causal RED driver: post-lock error must unlock retained OFD duplicate"]
+    fn linux_publication_lock_post_lock_error_releases_retained_ofd_red() {
+        use std::cell::RefCell;
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-postlock-ofd-{sequence}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+        let duplicate = RefCell::new(None);
+        assert!(acquire_authoritative_publication_lock_with_post_lock_hook(
+            &root,
+            &root_hold,
+            |file| {
+                *duplicate.borrow_mut() = Some(file.try_clone().map_err(|_| ())?);
+                Err(())
+            }
+        )
+        .is_err());
+        let acquired = acquire_authoritative_publication_lock(&root, &root_hold).is_ok();
+        drop(duplicate.into_inner());
+        assert!(acquired, "post-lock error retained a duplicated OFD flock");
+        drop(root_hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_publication_lock_stalled_ready_times_out_and_reaps_owned_child() {
+        use std::process::{Command, Stdio};
+
+        let started = std::time::Instant::now();
+        let mut owned = OwnedProtocolChild {
+            child: Command::new("python3")
+                .arg("-c")
+                .arg("import time; time.sleep(60)")
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        };
+        let mut output = owned.child.stdout.take().unwrap();
+        assert!(
+            protocol_line_by(&mut output, started + std::time::Duration::from_millis(50)).is_err()
+        );
+        drop(output);
+        let status = owned
+            .kill_and_reap_by(started + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(!status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "bounded parent worker"]
+    fn linux_open_root_fifo_without_writer_worker() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn mkfifo(pathname: *const std::ffi::c_char, mode: u32) -> i32;
+        }
+        let fixture = LinuxGenesisFixture::new("root-fifo-red");
+        fs::remove_dir_all(&fixture.root).unwrap();
+        let raw = CString::new(fixture.root.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(raw.as_ptr(), 0o600) }, 0);
+        match AuthoritativeRegistryStore::open(&fixture.root) {
+            Err(error) => assert_eq!(
+                error,
+                AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid
+            ),
+            Ok(_) => panic!("root FIFO unexpectedly opened"),
+        };
+        fs::remove_file(&fixture.root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "bounded parent worker"]
+    fn linux_open_genesis_fifo_without_writer_worker() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn mkfifo(pathname: *const std::ffi::c_char, mode: u32) -> i32;
+        }
+        let fixture = LinuxGenesisFixture::new("genesis-fifo-red");
+        fs::remove_file(&fixture.genesis).unwrap();
+        let raw = CString::new(fixture.genesis.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(raw.as_ptr(), 0o600) }, 0);
+        match AuthoritativeRegistryStore::open(&fixture.root) {
+            Err(error) => assert_eq!(
+                error,
+                AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid
+            ),
+            Ok(_) => panic!("genesis FIFO unexpectedly opened"),
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "bounded parent worker"]
+    fn linux_open_fixed_child_fifo_without_writer_worker() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn mkfifo(pathname: *const std::ffi::c_char, mode: u32) -> i32;
+        }
+        for name in ["registry", "journal", "records"] {
+            let fixture = LinuxGenesisFixture::new(name);
+            let path = fixture.root.join(name);
+            fs::remove_dir_all(&path).unwrap();
+            let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { mkfifo(raw.as_ptr(), 0o600) }, 0);
+            let expected = match name {
+                "registry" => AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid,
+                "journal" => AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid,
+                "records" => AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid,
+                _ => unreachable!(),
+            };
+            match AuthoritativeRegistryStore::open(&fixture.root) {
+                Err(error) => assert_eq!(error, expected, "{name}"),
+                Ok(_) => panic!("{name} FIFO unexpectedly opened"),
+            };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_ignored_linux_worker(name: &str) -> Result<(), ()> {
+        use std::fs::OpenOptions;
+        use std::process::{Command, Stdio};
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let logs = std::env::current_dir()
+            .map_err(|_| ())?
+            .join("target/cross-platform/linux/successor/worker-logs");
+        fs::create_dir_all(&logs).map_err(|_| ())?;
+        let stem = format!(
+            "{}-{sequence}-{}",
+            name.replace(':', "_"),
+            std::process::id()
+        );
+        let stdout_path = logs.join(format!("{stem}.stdout"));
+        let stderr_path = logs.join(format!("{stem}.stderr"));
+        let stdout = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stdout_path)
+            .map_err(|_| ())?;
+        let stderr = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stderr_path)
+            .map_err(|_| ())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut owned = OwnedProtocolChild {
+            child: Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(name)
+                .arg("--ignored")
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .map_err(|_| ())?,
+        };
+        match owned.reap_by(deadline) {
+            Ok(status) if status.success() => {}
+            Ok(_) => return Err(()),
+            Err(()) => {
+                owned.kill_and_reap_by(
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )?;
+                return Err(());
+            }
+        }
+        for path in [&stdout_path, &stderr_path] {
+            if fs::metadata(path).map_err(|_| ())?.len() > 16 * 1024 {
+                return Err(());
+            }
+        }
+        let stdout = fs::read(&stdout_path).map_err(|_| ())?;
+        let text = std::str::from_utf8(&stdout).map_err(|_| ())?;
+        if !text.contains("running 1 test") || !text.contains("test result: ok. 1 passed; 0 failed")
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_open_fifo_workers_are_bounded_and_reject_typed_inputs() {
+        for name in [
+            "authoritative_store::tests::linux_open_root_fifo_without_writer_worker",
+            "authoritative_store::tests::linux_open_genesis_fifo_without_writer_worker",
+            "authoritative_store::tests::linux_open_fixed_child_fifo_without_writer_worker",
+        ] {
+            run_ignored_linux_worker(name).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_inherited_ofd_worker_is_bounded_in_default_suite() {
+        run_ignored_linux_worker("authoritative_store::tests::linux_publication_lock_inherited_ofd_releases_with_owner_scope_red").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_inherited_ofd_parent_fault_worker_is_bounded_in_default_suite() {
+        run_ignored_linux_worker(
+            "authoritative_store::tests::linux_inherited_ofd_parent_fault_worker_reaps_owned_child",
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_post_lock_error_worker_is_bounded_in_default_suite() {
+        run_ignored_linux_worker(
+            "authoritative_store::tests::linux_publication_lock_post_lock_error_releases_retained_ofd_red",
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_ignored_worker_supervisor_rejects_zero_match_filter() {
+        assert!(
+            run_ignored_linux_worker("authoritative_store::tests::no_such_ignored_worker").is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_protocol_helper_rejects_faulty_child_responses_and_reaps_them() {
+        use std::process::{Command, Stdio};
+
+        for (name, script) in [
+            ("eof", "import sys; sys.stdout.flush()"),
+            ("oversized", "import sys; print('X'*65,flush=True)"),
+            (
+                "partial",
+                "import sys,time; sys.stdout.write('PART'); sys.stdout.flush(); time.sleep(60)",
+            ),
+            ("wrongstage", "print('WRONG',flush=True)"),
+            (
+                "missingresponse",
+                "print('READY',flush=True); import time; time.sleep(60)",
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let mut owned = OwnedProtocolChild {
+                child: Command::new("python3")
+                    .arg("-c")
+                    .arg(script)
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            };
+            let mut output = owned.child.stdout.take().unwrap();
+            let deadline = started + std::time::Duration::from_millis(75);
+            if name == "missingresponse" {
+                assert_eq!(protocol_line_by(&mut output, deadline).unwrap(), "READY\n");
+            }
+            if name == "wrongstage" {
+                assert_ne!(protocol_line_by(&mut output, deadline).unwrap(), "READY\n");
+            } else {
+                assert!(protocol_line_by(&mut output, deadline).is_err(), "{name}");
+            }
+            drop(output);
+            assert!(
+                owned
+                    .kill_and_reap_by(started + std::time::Duration::from_secs(1))
+                    .is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_abnormal_lock_oracles_detect_omission_and_ignored_exit() {
+        use std::process::{Command, Stdio};
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-abnormal-oracle-{sequence}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+        let script = r#"import fcntl, os, select, sys, time
+f=os.open(sys.argv[1],os.O_RDONLY)
+if sys.argv[2] != 'omit': fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+print('READY',flush=True)
+r,_,_=select.select([0],[],[],1)
+if not r: os._exit(90)
+if os.read(0,1)!=b'X': os._exit(91)
+if sys.argv[2] == 'ignore': time.sleep(60)
+os._exit(23)
+"#;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut omitted = OwnedProtocolChild {
+            child: Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .arg(&root)
+                .arg("omit")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        };
+        let mut omitted_input = omitted.child.stdin.take().unwrap();
+        let mut omitted_output = omitted.child.stdout.take().unwrap();
+        assert_eq!(
+            protocol_line_by(&mut omitted_output, deadline).unwrap(),
+            "READY\n"
+        );
+        assert!(
+            acquire_authoritative_publication_lock(&root, &root_hold).is_ok(),
+            "omitted flock must fail live-contention oracle"
+        );
+        protocol_command_by(&mut omitted_input, b'X', deadline).unwrap();
+        drop(omitted_input);
+        drop(omitted_output);
+        assert_eq!(omitted.reap_by(deadline).unwrap().code(), Some(23));
+        let mut ignored = OwnedProtocolChild {
+            child: Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .arg(&root)
+                .arg("ignore")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        };
+        let mut ignored_input = ignored.child.stdin.take().unwrap();
+        let mut ignored_output = ignored.child.stdout.take().unwrap();
+        let short = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        assert_eq!(
+            protocol_line_by(&mut ignored_output, short).unwrap(),
+            "READY\n"
+        );
+        assert!(acquire_authoritative_publication_lock(&root, &root_hold).is_err());
+        protocol_command_by(&mut ignored_input, b'X', short).unwrap();
+        drop(ignored_input);
+        drop(ignored_output);
+        assert!(ignored.reap_by(short).is_err());
+        assert!(!ignored
+            .kill_and_reap_by(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap()
+            .success());
+        drop(acquire_authoritative_publication_lock(&root, &root_hold).unwrap());
+        drop(root_hold);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_published_witness_downgrades_exactly_and_rejects_post_publish_writer() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-linux-downgrade-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root_hold = open_real_directory_hold(&root).unwrap();
+
+        let publication = match publish_new_immutable_file(
+            &root,
+            &root_hold,
+            Path::new("exact.cbor"),
+            b"exact bytes",
+        )
+        .unwrap()
+        {
+            ImmutablePublicationOutcome::Published(publication) => publication,
+            _ => panic!("expected Linux publication"),
+        };
+        assert_eq!(
+            publication.facts.parent_directory_flush,
+            DurabilityActionState::Performed
+        );
+        let mut witness = downgrade_publication_witness(publication.retained_witness).unwrap();
+        revalidate_retained_file_witness(&mut witness).unwrap();
+        assert_eq!(
+            witness.expected_sha256,
+            <[u8; ID_LENGTH]>::from(Sha256::digest(b"exact bytes"))
+        );
+        assert!(matches!(
+            publish_new_immutable_file(&root, &root_hold, Path::new("exact.cbor"), b"competitor")
+                .unwrap(),
+            ImmutablePublicationOutcome::Conflict
+        ));
+
+        let changed_publication = match publish_new_immutable_file(
+            &root,
+            &root_hold,
+            Path::new("changed.cbor"),
+            b"changed bytes",
+        )
+        .unwrap()
+        {
+            ImmutablePublicationOutcome::Published(publication) => publication,
+            _ => panic!("expected Linux publication"),
+        };
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .open(root.join("changed.cbor"))
+            .unwrap();
+        writer.write_all(b"X").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        assert!(downgrade_publication_witness(changed_publication.retained_witness).is_err());
+
+        drop(witness);
+        drop(root_hold);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
@@ -5619,9 +8994,9 @@ mod tests {
         fs::remove_dir(root).unwrap();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
-    fn windows_post_visibility_failure_is_an_explicit_uncertain_publication() {
+    fn post_visibility_failure_is_an_explicit_uncertain_publication() {
         let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "evidence-registry-visible-uncertain-{}-{sequence}",
@@ -5693,7 +9068,7 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn linux_child_directory_open_is_root_handle_relative() {
         let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -5710,15 +9085,30 @@ mod tests {
         fs::create_dir_all(original_root.join("registry")).unwrap();
         fs::write(original_root.join("registry/replacement"), b"replacement").unwrap();
 
-        let child = open_child_directory_hold(&root_hold, &original_root, "registry").unwrap();
         let moved_child = open_real_directory_hold(&moved_root.join("registry")).unwrap();
         let replacement_child = open_real_directory_hold(&original_root.join("registry")).unwrap();
-        assert!(handles_identify_same_object(&child, &moved_child));
-        assert!(!handles_identify_same_object(&child, &replacement_child));
+        let child = open_child_directory_hold(&root_hold, &original_root, "registry");
+        #[cfg(target_os = "linux")]
+        let child = child.unwrap();
+        #[cfg(target_os = "macos")]
+        let child = match child {
+            Ok(child) => child,
+            Err(()) => {
+                drop(replacement_child);
+                drop(moved_child);
+                drop(root_hold);
+                fs::remove_dir_all(parent).unwrap();
+                return;
+            }
+        };
+        {
+            assert!(handles_identify_same_object(&child, &moved_child));
+            assert!(!handles_identify_same_object(&child, &replacement_child));
+            drop(child);
+        }
 
         drop(replacement_child);
         drop(moved_child);
-        drop(child);
         drop(root_hold);
         fs::remove_dir_all(parent).unwrap();
     }
@@ -7675,6 +11065,32 @@ mod tests {
         fs::remove_file(alias).unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_revalidation_preserves_the_retained_handle_cursor() {
+        use std::io::{Seek, SeekFrom};
+
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-positional-revalidate-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let path = root.join("retained.cbor");
+        fs::write(&path, b"retained positional bytes").unwrap();
+        let mut retained = read_regular_file(&path, &mut NamespaceBudget::new()).unwrap();
+        retained.witness.file.seek(SeekFrom::Start(7)).unwrap();
+        let mut shared = retained.witness.file.try_clone().unwrap();
+        assert_eq!(shared.stream_position().unwrap(), 7);
+        revalidate_retained_file_witness(&mut retained.witness).unwrap();
+        assert_eq!(retained.witness.file.stream_position().unwrap(), 7);
+        assert_eq!(shared.stream_position().unwrap(), 7);
+        drop(shared);
+        drop(retained);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

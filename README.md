@@ -146,6 +146,24 @@ cargo test --doc --locked
 git diff --check
 ```
 
+### Cross-platform integration status
+
+The Windows, Linux, and macOS storage adapters are now combined in an integration candidate.
+The accepted Linux and macOS branches were qualified separately; their results do not qualify
+this combined tree. Fresh exact-commit checks on all three platforms and hosted CI remain
+required before an integrated qualification claim. Workflow definitions are not execution evidence.
+
+Windows retains deny-write sharing protection. Linux and macOS instead use cooperative root-object
+`flock` serialization and exact identity/byte revalidation; neither constrains writers that ignore
+the protocol. Linux explicitly unlocks on orderly owner-process drop, including post-lock errors.
+macOS retains its bare File/O_CLOEXEC lifecycle, excluding surviving fork-without-exec descriptor
+holders. Neither adapter establishes universal filesystem durability or terminal Review authority.
+
+Native-byte CLI arguments are preserved. Linux tests existing byte-FF filenames; the macOS test
+is a filesystem-capability probe and reports errno 92 as unsupported, not as successful replay of
+an existing APFS byte-FF name. Missing native-byte paths are tested separately. Linux tests require
+`python3`; the default suite runs its six ignored workers through bounded, exact-name supervisors.
+
 ## Governing documents
 
 Do not select authority by filename version alone. Start with the detached freeze record and authenticate the exact adopted document bytes:
