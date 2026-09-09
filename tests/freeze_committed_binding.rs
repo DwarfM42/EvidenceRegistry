@@ -128,6 +128,139 @@ impl Drop for AuthoritativeStoreFixtureDir {
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_store_profile_requires_every_canonical_operational_directory() {
+    let fixture = AuthoritativeStoreFixtureDir::new();
+    let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
+    let genesis_record = GenesisRecord::new(GenesisRecordInput {
+        registry_id,
+        journal_format_version: 1,
+        record_identity_profile_id: 1,
+        storage_capability_class_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        environment_observation_id: RecordId::try_from(id(0x60).as_slice()).unwrap(),
+        created_by_tool_version: "selected-store-profile-test".to_owned(),
+    })
+    .unwrap();
+    let genesis_entry = GenesisJournalEntry::new(
+        registry_id,
+        EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
+        RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        RecordId::try_from(id(0x60).as_slice()).unwrap(),
+    );
+    fs::write(
+        fixture.path.join("registry/genesis.cbor"),
+        genesis_record.authoritative_cbor(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("journal/00000000000000000000.cbor"),
+        genesis_entry.authoritative_cbor(),
+    )
+    .unwrap();
+    write_record(
+        &fixture.path,
+        genesis_record.record_id(),
+        &genesis_record.authoritative_cbor(),
+    );
+
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid,
+        "the selected Store profile must not silently omit roots"
+    );
+    fs::create_dir(fixture.path.join("roots")).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid,
+        "the selected Store profile must not silently omit coordination"
+    );
+    fs::create_dir(fixture.path.join("coordination")).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid,
+        "the selected Store profile must not silently omit coordination/freeze"
+    );
+    fs::create_dir(fixture.path.join("coordination/freeze")).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid,
+        "the selected Store profile must not silently omit coordination/staging"
+    );
+    fs::create_dir(fixture.path.join("coordination/staging")).unwrap();
+    assert!(AuthoritativeRegistryStore::open_selected_profile(&fixture.path).is_ok());
+
+    fs::remove_file(
+        fixture
+            .path
+            .join("records")
+            .join(record_filename(genesis_record.record_id())),
+    )
+    .unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::GenesisRecordIdentityMismatch,
+        "the selected profile must require the physical GENESIS Record duplicate"
+    );
+    write_record(
+        &fixture.path,
+        genesis_record.record_id(),
+        &genesis_record.authoritative_cbor(),
+    );
+
+    fs::write(
+        fixture.path.join("registry/unexpected"),
+        b"extra registry entry",
+    )
+    .unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid,
+        "the selected Store profile must reject an extra registry entry"
+    );
+    fs::remove_file(fixture.path.join("registry/unexpected")).unwrap();
+
+    let mut orphan_attempt_name = String::with_capacity(64);
+    for byte in id(0xa0) {
+        use std::fmt::Write as _;
+        write!(&mut orphan_attempt_name, "{byte:02x}").unwrap();
+    }
+    let orphan_root = fixture.path.join("roots").join(orphan_attempt_name);
+    fs::create_dir(&orphan_root).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid,
+        "every retained root must name an exact retained FREEZE_ATTEMPT_STARTED attempt"
+    );
+    fs::remove_dir(orphan_root).unwrap();
+
+    fs::write(
+        fixture
+            .path
+            .join("records/.evidence-registry-publish-4294967295-1.tmp"),
+        b"interrupted generic publisher residue",
+    )
+    .unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RecordFilenameInvalid,
+        "the selected profile must not ignore staging residue outside coordination/staging"
+    );
+    fs::remove_file(
+        fixture
+            .path
+            .join("records/.evidence-registry-publish-4294967295-1.tmp"),
+    )
+    .unwrap();
+
+    fs::write(fixture.path.join("unexpected"), b"not a Store namespace").unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid,
+        "the selected Store profile must reject an extra root entry"
+    );
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn record_filename(record_id: RecordId) -> String {
     let mut name = String::with_capacity(69);
     for byte in record_id.as_bytes() {

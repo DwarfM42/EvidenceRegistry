@@ -53,11 +53,20 @@ pub enum AuthoritativeRegistryStoreOpenError {
 #[derive(Debug)]
 pub struct AuthoritativeRegistryStore {
     root: PathBuf,
+    open_profile: AuthoritativeRegistryStoreOpenProfile,
     retained_journal: RetainedJournal,
     records: Vec<(RecordId, Vec<u8>)>,
     namespace_holds: Vec<fs::File>,
     retained_file_witnesses: Vec<RetainedFileWitness>,
     live_instance_identity: Arc<AuthoritativeRegistryStoreInstanceIdentity>,
+}
+
+/// Distinguishes the bounded predecessor reader from the explicitly selected Store profile.
+/// A GENESIS scalar value alone never upgrades a legacy opening into the selected profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthoritativeRegistryStoreOpenProfile {
+    LegacyThreeNamespace,
+    SelectedTerminalAuthorityClosure,
 }
 
 #[derive(Debug)]
@@ -506,11 +515,30 @@ impl AuthoritativeRegistryStore {
     /// Entry is strictly decoded and replayed. Every Record namespace object must have the exact
     /// lowercase content-addressed filename and strict self-hash identity required by its bytes.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, AuthoritativeRegistryStoreOpenError> {
-        Self::open_with_generation_hook(root.as_ref(), || {})
+        Self::open_with_generation_hook(
+            root.as_ref(),
+            AuthoritativeRegistryStoreOpenProfile::LegacyThreeNamespace,
+            || {},
+        )
+    }
+
+    /// Opens the adopted selected Store profile without upgrading predecessor histories.
+    ///
+    /// This boundary requires the complete canonical retained and operational namespace. It never
+    /// initializes or repairs an incomplete root.
+    pub fn open_selected_profile(
+        root: impl AsRef<Path>,
+    ) -> Result<Self, AuthoritativeRegistryStoreOpenError> {
+        Self::open_with_generation_hook(
+            root.as_ref(),
+            AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure,
+            || {},
+        )
     }
 
     fn open_with_generation_hook<F>(
         root: &Path,
+        open_profile: AuthoritativeRegistryStoreOpenProfile,
         before_generation_guard: F,
     ) -> Result<Self, AuthoritativeRegistryStoreOpenError>
     where
@@ -536,12 +564,48 @@ impl AuthoritativeRegistryStore {
             .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid)?;
         ensure_path_matches_handle(&records_dir, &records_hold)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid)?;
+        let selected_namespace_holds = if open_profile
+            == AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            let roots_dir = root.join("roots");
+            let coordination_dir = root.join("coordination");
+            let roots_hold = open_child_directory_hold(&root_hold, &root, "roots")
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            let coordination_hold = open_child_directory_hold(&root_hold, &root, "coordination")
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            let freeze_dir = coordination_dir.join("freeze");
+            let staging_dir = coordination_dir.join("staging");
+            let freeze_hold =
+                open_child_directory_hold(&coordination_hold, &coordination_dir, "freeze")
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            let staging_hold =
+                open_child_directory_hold(&coordination_hold, &coordination_dir, "staging")
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            ensure_path_matches_handle(&roots_dir, &roots_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            ensure_path_matches_handle(&coordination_dir, &coordination_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            ensure_path_matches_handle(&freeze_dir, &freeze_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            ensure_path_matches_handle(&staging_dir, &staging_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            Some((roots_hold, coordination_hold, freeze_hold, staging_hold))
+        } else {
+            None
+        };
+        if selected_namespace_holds.is_some() {
+            validate_selected_profile_namespace_layout(&root)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+        }
         let registry_contents = namespace_contents_path(&registry_dir, &registry_hold)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RegistryNamespaceInvalid)?;
         let journal_contents = namespace_contents_path(&journal_dir, &journal_hold)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid)?;
         let records_contents = namespace_contents_path(&records_dir, &records_hold)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid)?;
+        if selected_namespace_holds.is_some() {
+            validate_selected_retained_object_names(&journal_contents, &records_contents)?;
+        }
         let mut budget = NamespaceBudget::new();
 
         let genesis_record_read =
@@ -569,6 +633,11 @@ impl AuthoritativeRegistryStore {
                 return Err(AuthoritativeRegistryStoreOpenError::GenesisRecordIdentityMismatch)
             }
             Some(_) => {}
+            None if open_profile
+                == AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure =>
+            {
+                return Err(AuthoritativeRegistryStoreOpenError::GenesisRecordIdentityMismatch)
+            }
             None => records.push((genesis_record.record_id(), genesis_record_bytes)),
         }
         records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
@@ -610,6 +679,10 @@ impl AuthoritativeRegistryStore {
                 .append_strict_entry(entry_bytes)
                 .map_err(AuthoritativeRegistryStoreOpenError::RetainedJournal)?;
         }
+        if selected_namespace_holds.is_some() {
+            validate_selected_retained_root_locators(&root, &retained_journal)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+        }
         validate_authoritative_event_records(&retained_journal, &records)?;
 
         let mut retained_file_witnesses = Vec::with_capacity(
@@ -647,16 +720,41 @@ impl AuthoritativeRegistryStore {
             .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid)?;
         ensure_path_matches_handle(&records_dir, &records_hold)
             .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid)?;
+        if let Some((roots_hold, coordination_hold, freeze_hold, staging_hold)) =
+            &selected_namespace_holds
+        {
+            ensure_path_matches_handle(&root.join("roots"), roots_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            ensure_path_matches_handle(&root.join("coordination"), coordination_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            ensure_path_matches_handle(&root.join("coordination/freeze"), freeze_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            ensure_path_matches_handle(&root.join("coordination/staging"), staging_hold)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            validate_selected_profile_namespace_layout(&root)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            validate_selected_retained_root_locators(&root, &retained_journal)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
+            validate_selected_retained_object_names(&journal_contents, &records_contents)?;
+        }
         for witness in &mut retained_generation_guards {
             revalidate_retained_file_witness(witness)
                 .map_err(|_| AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged)?;
         }
 
+        let mut namespace_holds = vec![root_hold, registry_hold, journal_hold, records_hold];
+        if let Some((roots_hold, coordination_hold, freeze_hold, staging_hold)) =
+            selected_namespace_holds
+        {
+            namespace_holds.extend([roots_hold, coordination_hold, freeze_hold, staging_hold]);
+        }
+
         Ok(Self {
             root,
+            open_profile,
             retained_journal,
             records,
-            namespace_holds: vec![root_hold, registry_hold, journal_hold, records_hold],
+            namespace_holds,
             retained_file_witnesses: retained_generation_guards,
             live_instance_identity: Arc::new(AuthoritativeRegistryStoreInstanceIdentity {
                 outstanding_review_admissions: AtomicUsize::new(0),
@@ -1293,8 +1391,8 @@ impl AuthoritativeRegistryStore {
             )
         })?;
         after_precheck();
-        let mut reloaded =
-            Self::open(&self.root).map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
+        let mut reloaded = Self::open_with_generation_hook(&self.root, self.open_profile, || {})
+            .map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
         after_reopen();
         self.revalidate_retained_generation().map_err(|_| {
             AuthoritativeReviewAdmissionAcceptanceError::Store(
@@ -1392,8 +1490,8 @@ impl AuthoritativeRegistryStore {
                 AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
             )
         })?;
-        let reloaded =
-            Self::open(&self.root).map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
+        let reloaded = Self::open_with_generation_hook(&self.root, self.open_profile, || {})
+            .map_err(AuthoritativeReviewAdmissionAcceptanceError::Store)?;
         self.revalidate_retained_generation().map_err(|_| {
             AuthoritativeReviewAdmissionAcceptanceError::Store(
                 AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged,
@@ -1505,7 +1603,7 @@ impl AuthoritativeRegistryStore {
     }
 
     fn revalidate_retained_namespace_holds(&self) -> Result<(), ()> {
-        let [root_hold, registry_hold, journal_hold, records_hold] =
+        let [root_hold, registry_hold, journal_hold, records_hold, remainder @ ..] =
             self.namespace_holds.as_slice()
         else {
             return Err(());
@@ -1513,7 +1611,22 @@ impl AuthoritativeRegistryStore {
         ensure_path_matches_handle(&self.root, root_hold)?;
         ensure_path_matches_handle(&self.root.join("registry"), registry_hold)?;
         ensure_path_matches_handle(&self.root.join("journal"), journal_hold)?;
-        ensure_path_matches_handle(&self.root.join("records"), records_hold)
+        ensure_path_matches_handle(&self.root.join("records"), records_hold)?;
+        match self.open_profile {
+            AuthoritativeRegistryStoreOpenProfile::LegacyThreeNamespace if remainder.is_empty() => {
+                Ok(())
+            }
+            AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure => {
+                let [roots_hold, coordination_hold, freeze_hold, staging_hold] = remainder else {
+                    return Err(());
+                };
+                ensure_path_matches_handle(&self.root.join("roots"), roots_hold)?;
+                ensure_path_matches_handle(&self.root.join("coordination"), coordination_hold)?;
+                ensure_path_matches_handle(&self.root.join("coordination/freeze"), freeze_hold)?;
+                ensure_path_matches_handle(&self.root.join("coordination/staging"), staging_hold)
+            }
+            _ => Err(()),
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -6224,6 +6337,176 @@ fn parse_record_filename(name: &str) -> Option<RecordId> {
     RecordId::try_from(bytes.as_slice()).ok()
 }
 
+fn validate_selected_profile_namespace_layout(root: &Path) -> Result<(), ()> {
+    validate_selected_exact_directory_entries(
+        root,
+        &[
+            ("registry", true),
+            ("journal", true),
+            ("records", true),
+            ("roots", true),
+            ("coordination", true),
+        ],
+    )?;
+    validate_selected_exact_directory_entries(&root.join("registry"), &[("genesis.cbor", false)])?;
+
+    let coordination = root.join("coordination");
+    let mut seen_freeze = false;
+    let mut seen_staging = false;
+    let mut seen_publication_lock = false;
+    for entry in fs::read_dir(&coordination).map_err(|_| ())? {
+        let entry = entry.map_err(|_| ())?;
+        let name = entry.file_name().into_string().map_err(|_| ())?;
+        let file_type = entry.file_type().map_err(|_| ())?;
+        let expected_directory = match name.as_str() {
+            "freeze" => {
+                if seen_freeze {
+                    return Err(());
+                }
+                seen_freeze = true;
+                true
+            }
+            "staging" => {
+                if seen_staging {
+                    return Err(());
+                }
+                seen_staging = true;
+                true
+            }
+            "publication.lock" => {
+                if seen_publication_lock {
+                    return Err(());
+                }
+                seen_publication_lock = true;
+                false
+            }
+            _ => return Err(()),
+        };
+        if file_type.is_symlink()
+            || if expected_directory {
+                !file_type.is_dir()
+            } else {
+                !file_type.is_file()
+            }
+        {
+            return Err(());
+        }
+    }
+    (seen_freeze && seen_staging).then_some(()).ok_or(())
+}
+
+fn validate_selected_retained_object_names(
+    journal_dir: &Path,
+    records_dir: &Path,
+) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+    for entry in fs::read_dir(journal_dir).map_err(|_| AuthoritativeRegistryStoreOpenError::Io)? {
+        let entry = entry.map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(AuthoritativeRegistryStoreOpenError::JournalNamespaceInvalid);
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::JournalSlotNameInvalid)?;
+        if parse_journal_slot_name(&name).is_none() {
+            return Err(AuthoritativeRegistryStoreOpenError::JournalSlotNameInvalid);
+        }
+    }
+    for entry in fs::read_dir(records_dir).map_err(|_| AuthoritativeRegistryStoreOpenError::Io)? {
+        let entry = entry.map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::Io)?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(AuthoritativeRegistryStoreOpenError::RecordNamespaceInvalid);
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::RecordFilenameInvalid)?;
+        if parse_record_filename(&name).is_none() {
+            return Err(AuthoritativeRegistryStoreOpenError::RecordFilenameInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_selected_exact_directory_entries(
+    directory: &Path,
+    expected: &[(&str, bool)],
+) -> Result<(), ()> {
+    let mut found = vec![false; expected.len()];
+    for entry in fs::read_dir(directory).map_err(|_| ())? {
+        let entry = entry.map_err(|_| ())?;
+        let name = entry.file_name().into_string().map_err(|_| ())?;
+        let index = expected
+            .iter()
+            .position(|(expected_name, _)| *expected_name == name)
+            .ok_or(())?;
+        if found[index] {
+            return Err(());
+        }
+        let file_type = entry.file_type().map_err(|_| ())?;
+        if file_type.is_symlink()
+            || if expected[index].1 {
+                !file_type.is_dir()
+            } else {
+                !file_type.is_file()
+            }
+        {
+            return Err(());
+        }
+        found[index] = true;
+    }
+    found
+        .into_iter()
+        .all(|present| present)
+        .then_some(())
+        .ok_or(())
+}
+
+fn validate_selected_retained_root_locators(
+    root: &Path,
+    retained_journal: &RetainedJournal,
+) -> Result<(), ()> {
+    for entry in fs::read_dir(root.join("roots")).map_err(|_| ())? {
+        let entry = entry.map_err(|_| ())?;
+        let file_type = entry.file_type().map_err(|_| ())?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return Err(());
+        }
+        let name = entry.file_name().into_string().map_err(|_| ())?;
+        let attempt_id = parse_lowercase_hex_identity(&name).ok_or(())?;
+        if !retained_journal.entries.iter().any(|journal_entry| {
+            journal_entry.event_type_id().value() == 100
+                && journal_entry.registry_id() == retained_journal.registry_id
+                && journal_entry.lifecycle_object_id() == attempt_id
+        }) {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn parse_lowercase_hex_identity(name: &str) -> Option<[u8; ID_LENGTH]> {
+    if name.len() != ID_LENGTH * 2
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut bytes = [0_u8; ID_LENGTH];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot = u8::from_str_radix(&name[offset..offset + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
 fn record_id_from_event_reference(reference: &JournalReference) -> RecordId {
     RecordId::try_from(reference.event_record_id().as_bytes().as_slice())
         .expect("EventRecordId has RecordId width")
@@ -6800,11 +7083,15 @@ mod tests {
         )
         .unwrap();
 
-        let result = AuthoritativeRegistryStore::open_with_generation_hook(&root, || {
-            let mut changed = genesis_record.authoritative_cbor();
-            changed[0] ^= 1;
-            fs::write(&genesis_path, changed).unwrap();
-        });
+        let result = AuthoritativeRegistryStore::open_with_generation_hook(
+            &root,
+            AuthoritativeRegistryStoreOpenProfile::LegacyThreeNamespace,
+            || {
+                let mut changed = genesis_record.authoritative_cbor();
+                changed[0] ^= 1;
+                fs::write(&genesis_path, changed).unwrap();
+            },
+        );
 
         assert_eq!(
             result.unwrap_err(),
