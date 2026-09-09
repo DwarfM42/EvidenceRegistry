@@ -16,6 +16,15 @@ EvidenceRegistry lets you inspect exact Record bytes and replay a retained Journ
 
 The first release uses exact tagged source from the [official GitHub repository](https://github.com/DwarfM42/EvidenceRegistry) and [GitHub Releases](https://github.com/DwarfM42/EvidenceRegistry/releases), deliberately not crates.io. Prebuilt binaries are outside this first release's distribution scope. Use the release's annotated tag and retain its commit identity; an unqualified moving branch is not a release identity.
 
+## Repository layout
+
+- [`publications/`](publications/) contains non-authoritative publication/article-support material, including fact-check material and retained claim-checking context. It is not part of the frozen EvidenceRegistry authority set.
+- [`scripts/formal/`](scripts/formal/) contains formal-verification provenance capture/verification tooling for future SupportImpact verification evidence. It is not part of the frozen EvidenceRegistry authority set.
+
+### Publication support
+
+[`publications/`](publications/) materials may record which article claims were confirmed, incomplete, or not rerun. They are supporting records, not frozen EvidenceRegistry authority; later tooling improvements do not close historical evidence gaps. See the [article fact-check](publications/evidence-registry-article-fact-check.md).
+
 ## Read-only Journal verification CLI
 
 The [CLI](src/main.rs) exposes one command (there is no separate `--help` command):
@@ -197,6 +206,10 @@ cargo test --release --test freeze_committed_binding --locked
 cargo test --doc --locked
 git diff --check
 ```
+
+### Post-release formal provenance follow-up
+
+Post-release fact-checking identified weaker historical source/log provenance binding for SupportImpact than for Lifecycle verification provenance. The historical evidence was not rewritten or retroactively strengthened. PR #4 added the future-only [SupportImpact capture/verifier path](scripts/formal/) (`run_supportimpact.py` and `verify_supportimpact.py`); a fresh Dafny 4.11.0 verification through that path reported `11 verified, 0 errors`. This post-release formal/provenance work is not part of the original v0.1.0 release qualification, does not change the v0.1.0 release subject, and does not establish EvidenceRegistry authority or admission.
 
 ### Platform boundaries
 
