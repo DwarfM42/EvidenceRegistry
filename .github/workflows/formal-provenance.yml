@@ -1,0 +1,30 @@
+name: Formal provenance maintenance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  provenance-tests:
+    name: provenance-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test future provenance capture and byte verification
+        run: python -B -m unittest discover -s scripts/formal -p 'test_*.py' -v
+      - name: Reject tracked source drift
+        run: git diff --exit-code
