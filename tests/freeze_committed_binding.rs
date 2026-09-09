@@ -9,7 +9,9 @@ use evidence_registry::{
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
-    AuthoritativeRegistryStore, GenesisJournalEntry, GenesisRecord, GenesisRecordInput,
+    AuthoritativeRegistryStore, EnvironmentObservationRecord, EnvironmentObservationRecordInput,
+    GenesisJournalEntry, GenesisRecord, GenesisRecordInput, StorageCapabilityClassRecord,
+    StorageCapabilityClassRecordInput,
 };
 use sha2::{Digest, Sha256};
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -132,20 +134,44 @@ impl Drop for AuthoritativeStoreFixtureDir {
 fn selected_store_profile_requires_every_canonical_operational_directory() {
     let fixture = AuthoritativeStoreFixtureDir::new();
     let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
+    let capability = StorageCapabilityClassRecord::new(StorageCapabilityClassRecordInput {
+        filesystem_transport: "fixture".to_owned(),
+        sync_management: "fixture".to_owned(),
+        placeholder_capability: 3,
+        exclusive_create_capability: 3,
+        no_replace_publication_capability: 3,
+        locking_capability: 3,
+        atomic_rename_capability: 3,
+        file_flush_capability: 3,
+        directory_flush_capability: 3,
+    })
+    .unwrap();
+    let environment = EnvironmentObservationRecord::new(EnvironmentObservationRecordInput {
+        os_name: "fixture".to_owned(),
+        os_version: None,
+        filesystem_reported_name: None,
+        driver_details: None,
+        mount_identity: None,
+        volume_identity: None,
+        resolved_registry_storage_identity: None,
+        probe_tool_version: "fixture".to_owned(),
+        observation_limitations: vec![],
+    })
+    .unwrap();
     let genesis_record = GenesisRecord::new(GenesisRecordInput {
         registry_id,
         journal_format_version: 1,
         record_identity_profile_id: 1,
-        storage_capability_class_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
-        environment_observation_id: RecordId::try_from(id(0x60).as_slice()).unwrap(),
+        storage_capability_class_id: capability.record_id(),
+        environment_observation_id: environment.record_id(),
         created_by_tool_version: "selected-store-profile-test".to_owned(),
     })
     .unwrap();
     let genesis_entry = GenesisJournalEntry::new(
         registry_id,
         EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
-        RecordId::try_from(id(0x40).as_slice()).unwrap(),
-        RecordId::try_from(id(0x60).as_slice()).unwrap(),
+        capability.record_id(),
+        environment.record_id(),
     );
     fs::write(
         fixture.path.join("registry/genesis.cbor"),
@@ -187,6 +213,21 @@ fn selected_store_profile_requires_every_canonical_operational_directory() {
         "the selected Store profile must not silently omit coordination/staging"
     );
     fs::create_dir(fixture.path.join("coordination/staging")).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&fixture.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::GenesisCapabilityObservationInvalid,
+        "the selected profile must require a retained typed capability observation"
+    );
+    write_record(
+        &fixture.path,
+        capability.record_id(),
+        &capability.authoritative_cbor(),
+    );
+    write_record(
+        &fixture.path,
+        environment.record_id(),
+        &environment.authoritative_cbor(),
+    );
     assert!(AuthoritativeRegistryStore::open_selected_profile(&fixture.path).is_ok());
 
     fs::remove_file(

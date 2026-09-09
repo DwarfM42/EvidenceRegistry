@@ -7098,6 +7098,348 @@ impl FreezeCreationProfileRecord {
     }
 }
 
+/// Required local fields of a type-60 STORAGE_CAPABILITY_CLASS Record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageCapabilityClassRecordInput {
+    pub filesystem_transport: String,
+    pub sync_management: String,
+    pub placeholder_capability: u64,
+    pub exclusive_create_capability: u64,
+    pub no_replace_publication_capability: u64,
+    pub locking_capability: u64,
+    pub atomic_rename_capability: u64,
+    pub file_flush_capability: u64,
+    pub directory_flush_capability: u64,
+}
+
+/// The exact-byte, local type-60 STORAGE_CAPABILITY_CLASS grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageCapabilityClassRecord {
+    record_id: RecordId,
+    input: StorageCapabilityClassRecordInput,
+}
+
+impl StorageCapabilityClassRecord {
+    /// Constructs a complete local capability-class Record without asserting
+    /// that its described probes were performed.
+    pub fn new(input: StorageCapabilityClassRecordInput) -> Result<Self, RecordDecodeError> {
+        if !is_canonical_text_length(input.filesystem_transport.len() as u64)
+            || !is_canonical_text_length(input.sync_management.len() as u64)
+            || ![
+                input.placeholder_capability,
+                input.exclusive_create_capability,
+                input.no_replace_publication_capability,
+                input.locking_capability,
+                input.atomic_rename_capability,
+                input.file_flush_capability,
+                input.directory_flush_capability,
+            ]
+            .iter()
+            .all(|value| matches!(value, 1..=3))
+        {
+            return Err(RecordDecodeError);
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact deterministic-CBOR type-60 Record bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x18, 0x3c, 0x01, 0xab, 0x00, 0x01, 0x01, 0x18, 0x3c]);
+        bytes.push(0x10);
+        encode_text(&mut bytes, &self.input.filesystem_transport);
+        bytes.push(0x11);
+        encode_text(&mut bytes, &self.input.sync_management);
+        for (key, value) in [
+            (18, self.input.placeholder_capability),
+            (19, self.input.exclusive_create_capability),
+            (20, self.input.no_replace_publication_capability),
+            (21, self.input.locking_capability),
+            (22, self.input.atomic_rename_capability),
+            (23, self.input.file_flush_capability),
+            (24, self.input.directory_flush_capability),
+        ] {
+            encode_uint(&mut bytes, key);
+            encode_uint(&mut bytes, value);
+        }
+        bytes
+    }
+
+    /// Returns the complete local Record fields.
+    pub fn input(&self) -> &StorageCapabilityClassRecordInput {
+        &self.input
+    }
+
+    /// Returns SHA-256 of the exact Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// Strictly decodes only the complete required type-60 field set.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 60
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(11).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 60 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let filesystem_transport = cursor.text().map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let sync_management = cursor.text().map_err(|_| RecordDecodeError)?;
+        let mut capabilities = [0; 7];
+        for (offset, value) in capabilities.iter_mut().enumerate() {
+            cursor
+                .key(18 + offset as u64)
+                .map_err(|_| RecordDecodeError)?;
+            *value = cursor.uint().map_err(|_| RecordDecodeError)?;
+        }
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        let decoded = Self::new(StorageCapabilityClassRecordInput {
+            filesystem_transport,
+            sync_management,
+            placeholder_capability: capabilities[0],
+            exclusive_create_capability: capabilities[1],
+            no_replace_publication_capability: capabilities[2],
+            locking_capability: capabilities[3],
+            atomic_rename_capability: capabilities[4],
+            file_flush_capability: capabilities[5],
+            directory_flush_capability: capabilities[6],
+        })?;
+        (decoded.authoritative_cbor() == input)
+            .then_some(decoded)
+            .ok_or(RecordDecodeError)
+    }
+}
+
+/// Required and optional local fields of a type-61 ENVIRONMENT_OBSERVATION Record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentObservationRecordInput {
+    pub os_name: String,
+    pub os_version: Option<String>,
+    pub filesystem_reported_name: Option<String>,
+    pub driver_details: Option<String>,
+    pub mount_identity: Option<Vec<u8>>,
+    pub volume_identity: Option<Vec<u8>>,
+    pub resolved_registry_storage_identity: Option<Vec<u8>>,
+    pub probe_tool_version: String,
+    pub observation_limitations: Vec<String>,
+}
+
+/// The exact-byte, local type-61 ENVIRONMENT_OBSERVATION grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentObservationRecord {
+    record_id: RecordId,
+    input: EnvironmentObservationRecordInput,
+}
+
+impl EnvironmentObservationRecord {
+    /// Constructs a local observation Record without claiming that probes,
+    /// capabilities, or a current filesystem state were established.
+    pub fn new(input: EnvironmentObservationRecordInput) -> Result<Self, RecordDecodeError> {
+        let texts = [
+            Some(&input.os_name),
+            input.os_version.as_ref(),
+            input.filesystem_reported_name.as_ref(),
+            input.driver_details.as_ref(),
+            Some(&input.probe_tool_version),
+        ];
+        if texts.into_iter().flatten().any(|text| {
+            u64::try_from(text.len()).map_or(true, |length| !is_canonical_text_length(length))
+        }) || input.observation_limitations.iter().any(|text| {
+            u64::try_from(text.len()).map_or(true, |length| !is_canonical_text_length(length))
+        }) || input
+            .observation_limitations
+            .windows(2)
+            .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        {
+            return Err(RecordDecodeError);
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact deterministic-CBOR type-61 Record bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let optional_count = [
+            self.input.os_version.is_some(),
+            self.input.filesystem_reported_name.is_some(),
+            self.input.driver_details.is_some(),
+            self.input.mount_identity.is_some(),
+            self.input.volume_identity.is_some(),
+            self.input.resolved_registry_storage_identity.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        let mut bytes = Vec::with_capacity(192);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[
+            0x18,
+            0x3d,
+            0x01,
+            0xa0 | (5 + optional_count) as u8,
+            0x00,
+            0x01,
+            0x01,
+            0x18,
+            0x3d,
+        ]);
+        bytes.push(0x10);
+        encode_text(&mut bytes, &self.input.os_name);
+        if let Some(value) = &self.input.os_version {
+            bytes.push(0x11);
+            encode_text(&mut bytes, value);
+        }
+        if let Some(value) = &self.input.filesystem_reported_name {
+            bytes.push(0x12);
+            encode_text(&mut bytes, value);
+        }
+        if let Some(value) = &self.input.driver_details {
+            bytes.push(0x13);
+            encode_text(&mut bytes, value);
+        }
+        for (key, value) in [
+            (20, self.input.mount_identity.as_ref()),
+            (21, self.input.volume_identity.as_ref()),
+            (22, self.input.resolved_registry_storage_identity.as_ref()),
+        ] {
+            if let Some(value) = value {
+                encode_uint(&mut bytes, key);
+                encode_bstr(&mut bytes, value);
+            }
+        }
+        bytes.extend_from_slice(&[0x17]);
+        encode_text(&mut bytes, &self.input.probe_tool_version);
+        bytes.extend_from_slice(&[0x18, 0x18]);
+        encode_array_length(&mut bytes, self.input.observation_limitations.len());
+        for limitation in &self.input.observation_limitations {
+            encode_text(&mut bytes, limitation);
+        }
+        bytes
+    }
+
+    /// Returns the complete local observation fields.
+    pub fn input(&self) -> &EnvironmentObservationRecordInput {
+        &self.input
+    }
+
+    /// Returns SHA-256 of the exact Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// Strictly decodes only assigned type-61 fields without normalization.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 61
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        if !(5..=11).contains(&cursor.map().map_err(|_| RecordDecodeError)?) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 61 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let os_name = cursor.text().map_err(|_| RecordDecodeError)?;
+        let mut optional_text = |key| -> Result<Option<String>, RecordDecodeError> {
+            if cursor.input.get(cursor.offset) == Some(&key) {
+                cursor.key(u64::from(key)).map_err(|_| RecordDecodeError)?;
+                cursor.text().map(Some).map_err(|_| RecordDecodeError)
+            } else {
+                Ok(None)
+            }
+        };
+        let os_version = optional_text(17)?;
+        let filesystem_reported_name = optional_text(18)?;
+        let driver_details = optional_text(19)?;
+        let mut optional_bstr = |key| -> Result<Option<Vec<u8>>, RecordDecodeError> {
+            if cursor.input.get(cursor.offset) == Some(&key) {
+                cursor.key(u64::from(key)).map_err(|_| RecordDecodeError)?;
+                cursor.bstr().map(Some).map_err(|_| RecordDecodeError)
+            } else {
+                Ok(None)
+            }
+        };
+        let mount_identity = optional_bstr(20)?;
+        let volume_identity = optional_bstr(21)?;
+        let resolved_registry_storage_identity = optional_bstr(22)?;
+        cursor.key(23).map_err(|_| RecordDecodeError)?;
+        let probe_tool_version = cursor.text().map_err(|_| RecordDecodeError)?;
+        cursor.key(24).map_err(|_| RecordDecodeError)?;
+        let limitation_count = cursor.array().map_err(|_| RecordDecodeError)?;
+        if limitation_count > cursor.remaining() {
+            return Err(RecordDecodeError);
+        }
+        let mut observation_limitations = Vec::with_capacity(limitation_count);
+        for _ in 0..limitation_count {
+            observation_limitations.push(cursor.text().map_err(|_| RecordDecodeError)?);
+        }
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        let decoded = Self::new(EnvironmentObservationRecordInput {
+            os_name,
+            os_version,
+            filesystem_reported_name,
+            driver_details,
+            mount_identity,
+            volume_identity,
+            resolved_registry_storage_identity,
+            probe_tool_version,
+            observation_limitations,
+        })?;
+        (decoded.authoritative_cbor() == input)
+            .then_some(decoded)
+            .ok_or(RecordDecodeError)
+    }
+}
+
 /// An active identity-dependency kind from Identity Format v0.3 §32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IdentityDependencyKind {

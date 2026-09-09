@@ -34,6 +34,8 @@ pub enum AuthoritativeRegistryStoreOpenError {
     GenesisProfileMismatch,
     GenesisCapabilityMismatch,
     GenesisEnvironmentMismatch,
+    GenesisCapabilityObservationInvalid,
+    GenesisEnvironmentObservationInvalid,
     EventRecordUnavailable,
     EventRecordBinding(EventRecordStructuralBindingError),
     EventRecordDecode,
@@ -43,6 +45,17 @@ pub enum AuthoritativeRegistryStoreOpenError {
     RetainedGenerationProtectionUnavailable,
     RetainedGenerationChanged,
     RetainedJournal(RetainedJournalError),
+}
+
+/// A fail-closed outcome while creating a selected Store from an absent root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoritativeRegistryStoreInitializeError {
+    RootAlreadyExists,
+    RootCreation,
+    NamespaceCreation,
+    ObservationRecord,
+    Publication,
+    Reopen(AuthoritativeRegistryStoreOpenError),
 }
 
 /// An authoritative Registry store opened from its exact retained Journal and Record namespaces.
@@ -536,6 +549,123 @@ impl AuthoritativeRegistryStore {
         )
     }
 
+    /// Creates a selected Store only at an absent root, publishes initial
+    /// Records and slot zero, then returns only an exact selected reopen.
+    ///
+    /// The initial capability Record deliberately records unprobed capability
+    /// dimensions; it is not a claim that later selected operations are supported.
+    pub fn initialize_selected_profile(
+        root: impl AsRef<Path>,
+        registry_id: RegistryId,
+        created_by_tool_version: impl Into<String>,
+    ) -> Result<Self, AuthoritativeRegistryStoreInitializeError> {
+        let root = root.as_ref();
+        match fs::create_dir(root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(AuthoritativeRegistryStoreInitializeError::RootAlreadyExists)
+            }
+            Err(_) => return Err(AuthoritativeRegistryStoreInitializeError::RootCreation),
+        }
+        for relative in [
+            "registry",
+            "journal",
+            "records",
+            "roots",
+            "coordination",
+            "coordination/freeze",
+            "coordination/staging",
+        ] {
+            fs::create_dir(root.join(relative))
+                .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        }
+        let capability = StorageCapabilityClassRecord::new(StorageCapabilityClassRecordInput {
+            filesystem_transport: std::env::consts::FAMILY.to_owned(),
+            sync_management: "std::fs::File::sync_all".to_owned(),
+            placeholder_capability: 3,
+            exclusive_create_capability: 3,
+            no_replace_publication_capability: 3,
+            locking_capability: 3,
+            atomic_rename_capability: 3,
+            file_flush_capability: 3,
+            directory_flush_capability: 3,
+        })
+        .map_err(|_| AuthoritativeRegistryStoreInitializeError::ObservationRecord)?;
+        let environment = EnvironmentObservationRecord::new(EnvironmentObservationRecordInput {
+            os_name: std::env::consts::OS.to_owned(),
+            os_version: None,
+            filesystem_reported_name: None,
+            driver_details: None,
+            mount_identity: None,
+            volume_identity: None,
+            resolved_registry_storage_identity: None,
+            probe_tool_version: created_by_tool_version.into(),
+            observation_limitations: vec![
+                "capability-probes-not-performed".to_owned(),
+                "no-hostile-attestation".to_owned(),
+            ],
+        })
+        .map_err(|_| AuthoritativeRegistryStoreInitializeError::ObservationRecord)?;
+        let genesis = GenesisRecord::new(GenesisRecordInput {
+            registry_id,
+            journal_format_version: 1,
+            record_identity_profile_id: 1,
+            storage_capability_class_id: capability.record_id(),
+            environment_observation_id: environment.record_id(),
+            created_by_tool_version: environment.input().probe_tool_version.clone(),
+        })
+        .map_err(|_| AuthoritativeRegistryStoreInitializeError::ObservationRecord)?;
+        let entry = GenesisJournalEntry::new(
+            registry_id,
+            EventRecordId::try_from(genesis.record_id().as_bytes().as_slice())
+                .expect("RecordId has exact EventRecordId width"),
+            capability.record_id(),
+            environment.record_id(),
+        );
+        let root_hold = open_real_directory_hold(root)
+            .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        let records_hold = open_child_directory_hold(&root_hold, root, "records")
+            .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        let registry_hold = open_child_directory_hold(&root_hold, root, "registry")
+            .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        let journal_hold = open_child_directory_hold(&root_hold, root, "journal")
+            .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        let records_publication_hold =
+            open_publication_child_directory_hold(&root_hold, root, &records_hold, "records")
+                .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        let registry_publication_hold =
+            open_publication_child_directory_hold(&root_hold, root, &registry_hold, "registry")
+                .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        let journal_publication_hold =
+            open_publication_child_directory_hold(&root_hold, root, &journal_hold, "journal")
+                .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
+        for (record_id, bytes) in [
+            (capability.record_id(), capability.authoritative_cbor()),
+            (environment.record_id(), environment.authoritative_cbor()),
+            (genesis.record_id(), genesis.authoritative_cbor()),
+        ] {
+            publish_selected_initial_file(
+                &root.join("records"),
+                &records_publication_hold,
+                Path::new(&record_filename(record_id)),
+                &bytes,
+            )?;
+        }
+        publish_selected_initial_file(
+            &root.join("registry"),
+            &registry_publication_hold,
+            Path::new("genesis.cbor"),
+            &genesis.authoritative_cbor(),
+        )?;
+        publish_selected_initial_file(
+            &root.join("journal"),
+            &journal_publication_hold,
+            Path::new("00000000000000000000.cbor"),
+            &entry.authoritative_cbor(),
+        )?;
+        Self::open_selected_profile(root).map_err(AuthoritativeRegistryStoreInitializeError::Reopen)
+    }
+
     fn open_with_generation_hook<F>(
         root: &Path,
         open_profile: AuthoritativeRegistryStoreOpenProfile,
@@ -641,6 +771,9 @@ impl AuthoritativeRegistryStore {
             None => records.push((genesis_record.record_id(), genesis_record_bytes)),
         }
         records.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        if open_profile == AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure {
+            validate_selected_genesis_observation_records(&records, &genesis_record)?;
+        }
 
         let (journal_slots, mut journal_witnesses) =
             load_journal_slots(&journal_contents, &mut budget)?;
@@ -1689,6 +1822,33 @@ impl AuthoritativeRegistryStore {
     }
 }
 
+fn validate_selected_genesis_observation_records(
+    records: &[(RecordId, Vec<u8>)],
+    genesis: &GenesisRecord,
+) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+    let resolve = |record_id: RecordId| {
+        records
+            .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(record_id.as_bytes()))
+            .ok()
+            .map(|index| records[index].1.as_slice())
+    };
+    let capability = resolve(genesis.input.storage_capability_class_id)
+        .ok_or(AuthoritativeRegistryStoreOpenError::GenesisCapabilityObservationInvalid)?;
+    let decoded_capability = StorageCapabilityClassRecord::decode_authoritative(capability)
+        .map_err(|_| AuthoritativeRegistryStoreOpenError::GenesisCapabilityObservationInvalid)?;
+    if decoded_capability.record_id() != genesis.input.storage_capability_class_id {
+        return Err(AuthoritativeRegistryStoreOpenError::GenesisCapabilityObservationInvalid);
+    }
+    let environment = resolve(genesis.input.environment_observation_id)
+        .ok_or(AuthoritativeRegistryStoreOpenError::GenesisEnvironmentObservationInvalid)?;
+    let decoded_environment = EnvironmentObservationRecord::decode_authoritative(environment)
+        .map_err(|_| AuthoritativeRegistryStoreOpenError::GenesisEnvironmentObservationInvalid)?;
+    if decoded_environment.record_id() != genesis.input.environment_observation_id {
+        return Err(AuthoritativeRegistryStoreOpenError::GenesisEnvironmentObservationInvalid);
+    }
+    Ok(())
+}
+
 fn frozen_generic_policy_scope_applicability_unavailable() -> bool {
     // The governing frozen authorities assign no generic operation/subject-to-Scope predicate.
     // This fixed gate must remain fail-closed unless a frozen successor supplies that relation.
@@ -1947,6 +2107,22 @@ where
         before_promotion,
         || Ok(()),
     )
+}
+
+fn publish_selected_initial_file(
+    parent: &Path,
+    parent_hold: &fs::File,
+    final_name: &Path,
+    bytes: &[u8],
+) -> Result<(), AuthoritativeRegistryStoreInitializeError> {
+    match publish_new_immutable_file(parent, parent_hold, final_name, bytes) {
+        Ok(ImmutablePublicationOutcome::Published(_)) => Ok(()),
+        Ok(
+            ImmutablePublicationOutcome::Conflict
+            | ImmutablePublicationOutcome::VisibleReceiptUncertain,
+        )
+        | Err(()) => Err(AuthoritativeRegistryStoreInitializeError::Publication),
+    }
 }
 
 fn publish_new_immutable_file_with_hooks<F, G>(
