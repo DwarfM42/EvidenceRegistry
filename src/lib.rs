@@ -25,6 +25,13 @@ pub use authoritative_store::{
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
 const ID_LENGTH: usize = 32;
+/// SHA-256 of the adopted raw Terminal Authority Closure Core v0.1 bytes.
+///
+/// This is a selector literal, not an inferred runtime epoch or producer attestation.
+pub const TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256: [u8; ID_LENGTH] = [
+    0xcb, 0x7e, 0xe9, 0xe9, 0xe5, 0xf9, 0xd0, 0x22, 0x9d, 0xba, 0x26, 0x01, 0x2e, 0xcb, 0x52, 0x31,
+    0xc2, 0x67, 0x71, 0xa6, 0xd5, 0x4c, 0x3c, 0x95, 0x76, 0x2c, 0x10, 0x94, 0xec, 0x1f, 0xc1, 0x6d,
+];
 
 #[cfg(test)]
 std::thread_local! {
@@ -4832,6 +4839,7 @@ pub struct ReviewRequestRecord {
     review_method_ref: RecordId,
     review_package_anchor_id: JournalAnchorId,
     operation_start_journal_ref: JournalReference,
+    terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
 }
 
 impl ReviewRequestRecord {
@@ -4852,7 +4860,10 @@ impl ReviewRequestRecord {
         {
             return Err(RecordDecodeError);
         }
-        cursor.map_exact(11).map_err(|_| RecordDecodeError)?;
+        let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(field_count, 11 | 13) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
         if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
             return Err(RecordDecodeError);
@@ -4895,6 +4906,20 @@ impl ReviewRequestRecord {
         cursor.key(24).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        let terminal_authority_closure_sha256 = if field_count == 13 {
+            cursor.key(25).map_err(|_| RecordDecodeError)?;
+            if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+                return Err(RecordDecodeError);
+            }
+            cursor.key(26).map_err(|_| RecordDecodeError)?;
+            let marker = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            (marker == TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+                .then_some(marker)
+                .ok_or(RecordDecodeError)
+                .map(Some)?
+        } else {
+            None
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -4909,6 +4934,7 @@ impl ReviewRequestRecord {
             review_method_ref,
             review_package_anchor_id,
             operation_start_journal_ref,
+            terminal_authority_closure_sha256,
         })
     }
 
@@ -4960,6 +4986,11 @@ impl ReviewRequestRecord {
     /// The exact operation-start chronology reference carried by the Request.
     pub fn operation_start_journal_ref(&self) -> &JournalReference {
         &self.operation_start_journal_ref
+    }
+
+    /// Returns the exact selected Request marker when this Request selected that route.
+    pub fn terminal_authority_closure_sha256(&self) -> Option<&[u8; ID_LENGTH]> {
+        self.terminal_authority_closure_sha256.as_ref()
     }
 }
 
@@ -6270,6 +6301,7 @@ pub struct FreezeReceiptRecordInput {
     pub parent_directory_flush_state: u64,
     pub platform_strongest_available: bool,
     pub requested_commit_durability_ref: Option<RecordId>,
+    pub terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
     pub created_by_tool_version: String,
 }
 
@@ -6298,7 +6330,7 @@ impl FreezeReceiptRecord {
             return Err(RecordDecodeError);
         }
         let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
-        if !matches!(field_count, 17 | 18) {
+        if !matches!(field_count, 17..=19) {
             return Err(RecordDecodeError);
         }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
@@ -6360,17 +6392,33 @@ impl FreezeReceiptRecord {
         }
         cursor.key(29).map_err(|_| RecordDecodeError)?;
         let platform_strongest_available = cursor.bool().map_err(|_| RecordDecodeError)?;
-        let requested_commit_durability_ref = if field_count == 18 {
-            cursor.key(30).map_err(|_| RecordDecodeError)?;
-            Some(
+        let next_key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let requested_commit_durability_ref = if next_key == 30 {
+            let durability = Some(
                 RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
                     .map_err(|_| RecordDecodeError)?,
-            )
-        } else {
+            );
+            cursor.key(31).map_err(|_| RecordDecodeError)?;
+            durability
+        } else if next_key == 31 {
             None
+        } else {
+            return Err(RecordDecodeError);
         };
-        cursor.key(31).map_err(|_| RecordDecodeError)?;
         let created_by_tool_version = cursor.text().map_err(|_| RecordDecodeError)?;
+        let terminal_authority_closure_sha256 = match field_count {
+            17 => None,
+            18 if requested_commit_durability_ref.is_some() => None,
+            18 | 19 => {
+                cursor.key(32).map_err(|_| RecordDecodeError)?;
+                let marker = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+                (marker == TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+                    .then_some(marker)
+                    .ok_or(RecordDecodeError)
+                    .map(Some)?
+            }
+            _ => return Err(RecordDecodeError),
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -6392,6 +6440,7 @@ impl FreezeReceiptRecord {
                 parent_directory_flush_state,
                 platform_strongest_available,
                 requested_commit_durability_ref,
+                terminal_authority_closure_sha256,
                 created_by_tool_version,
             },
         })
@@ -6405,6 +6454,11 @@ impl FreezeReceiptRecord {
     /// Returns the exact typed Receipt fields without inferring external context.
     pub fn input(&self) -> &FreezeReceiptRecordInput {
         &self.input
+    }
+
+    /// Returns the exact selected Freeze marker when this Receipt selected that route.
+    pub fn terminal_authority_closure_sha256(&self) -> Option<&[u8; ID_LENGTH]> {
+        self.input.terminal_authority_closure_sha256.as_ref()
     }
 }
 

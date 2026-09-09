@@ -242,6 +242,41 @@ fn independently_construct_version_1_review_request() -> Vec<u8> {
     independently_construct_version_1_review_request_with_anchor_id(id(0x10))
 }
 
+#[test]
+fn review_request_selector_preserves_predecessor_absence_and_rejects_wrong_present_value() {
+    let predecessor_bytes = independently_construct_version_1_review_request();
+    assert_eq!(
+        ReviewRequestRecord::decode_authoritative(&predecessor_bytes)
+            .unwrap()
+            .terminal_authority_closure_sha256(),
+        None,
+        "an absent marker remains the predecessor Request form"
+    );
+
+    let mut selected_bytes = predecessor_bytes;
+    let map_header = selected_bytes
+        .windows(4)
+        .position(|window| window == [0x18, 30, 0x01, 0xab])
+        .unwrap()
+        + 3;
+    selected_bytes[map_header] = 0xad;
+    selected_bytes.extend_from_slice(&[0x18, 0x19, 0x01, 0x18, 0x1a, 0x58, 0x20]);
+    selected_bytes.extend_from_slice(&evidence_registry::TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256);
+    assert_eq!(
+        ReviewRequestRecord::decode_authoritative(&selected_bytes)
+            .unwrap()
+            .terminal_authority_closure_sha256(),
+        Some(&evidence_registry::TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+    );
+
+    *selected_bytes.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        ReviewRequestRecord::decode_authoritative(&selected_bytes),
+        Err(evidence_registry::RecordDecodeError),
+        "a present non-D marker must not downgrade to the predecessor form"
+    );
+}
+
 fn independently_construct_frozen_v03_review_request() -> Vec<u8> {
     independently_construct_version_1_review_request()
 }

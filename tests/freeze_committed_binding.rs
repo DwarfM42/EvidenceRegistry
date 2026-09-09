@@ -575,6 +575,45 @@ fn freeze_commit_policy_bytes(operation_start: &JournalReference) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn freeze_receipt_selector_preserves_predecessor_absence_and_rejects_wrong_present_value() {
+    let (_, _, _, start_reference) = fixed_start_fixture();
+    let predecessor_bytes = receipt_bytes(
+        &start_reference,
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
+    assert_eq!(
+        FreezeReceiptRecord::decode_authoritative(&predecessor_bytes)
+            .unwrap()
+            .terminal_authority_closure_sha256(),
+        None,
+        "an absent marker remains the predecessor Receipt form"
+    );
+
+    let mut selected_bytes = predecessor_bytes;
+    let map_header = selected_bytes
+        .windows(3)
+        .position(|window| window == [0x04, 0x01, 0xb1])
+        .unwrap()
+        + 2;
+    selected_bytes[map_header] = 0xb2;
+    selected_bytes.extend_from_slice(&[0x18, 0x20, 0x58, 0x20]);
+    selected_bytes.extend_from_slice(&evidence_registry::TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256);
+    assert_eq!(
+        FreezeReceiptRecord::decode_authoritative(&selected_bytes)
+            .unwrap()
+            .terminal_authority_closure_sha256(),
+        Some(&evidence_registry::TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+    );
+
+    *selected_bytes.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        FreezeReceiptRecord::decode_authoritative(&selected_bytes),
+        Err(evidence_registry::RecordDecodeError),
+        "a present non-D marker must not downgrade to the predecessor form"
+    );
+}
+
 fn freeze_committed_bytes(
     previous_entry_hash: JournalEntryHash,
     start_reference: &JournalReference,
