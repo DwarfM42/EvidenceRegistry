@@ -614,6 +614,29 @@ fn freeze_receipt_selector_preserves_predecessor_absence_and_rejects_wrong_prese
     );
 }
 
+#[test]
+fn selected_freeze_receipt_requires_freeze_id_to_copy_start_attempt_id() {
+    let (_, _, _, start_reference) = fixed_start_fixture();
+    let mut selected_bytes = receipt_bytes(
+        &start_reference,
+        RecordId::try_from(id(0xc0).as_slice()).unwrap(),
+    );
+    let map_header = selected_bytes
+        .windows(3)
+        .position(|window| window == [0x04, 0x01, 0xb1])
+        .unwrap()
+        + 2;
+    selected_bytes[map_header] = 0xb2;
+    selected_bytes.extend_from_slice(&[0x18, 0x20, 0x58, 0x20]);
+    selected_bytes.extend_from_slice(&evidence_registry::TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256);
+
+    assert_eq!(
+        binding_result_for_receipt_bytes(&selected_bytes),
+        Err(evidence_registry::FreezeCommittedBindingError::SelectedFreezeIdMismatch),
+        "the selected Receipt freeze_id must be an exact byte copy of START.freeze_attempt_id"
+    );
+}
+
 fn freeze_committed_bytes(
     previous_entry_hash: JournalEntryHash,
     start_reference: &JournalReference,

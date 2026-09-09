@@ -33,6 +33,11 @@ pub const TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256: [u8; ID_LENGTH] = [
     0xc2, 0x67, 0x71, 0xa6, 0xd5, 0x4c, 0x3c, 0x95, 0x76, 0x2c, 0x10, 0x94, 0xec, 0x1f, 0xc1, 0x6d,
 ];
 
+const TERMINAL_REVIEW_ADMISSION_LEGACY_SELECTOR_SHA256: [u8; ID_LENGTH] = [
+    0x65, 0x81, 0x3e, 0x35, 0x6e, 0xab, 0xa8, 0x9c, 0x63, 0x84, 0x75, 0xa4, 0x0c, 0x69, 0xf7, 0x28,
+    0x12, 0x3f, 0x43, 0x14, 0x04, 0x0f, 0x07, 0x5a, 0x09, 0xc6, 0xbe, 0x34, 0xdb, 0x14, 0xe1, 0x14,
+];
+
 #[cfg(test)]
 std::thread_local! {
     pub(crate) static JOURNAL_REFERENCE_EQUALITY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2432,6 +2437,35 @@ fn encode_bstr_32(output: &mut Vec<u8>, bytes: &[u8; ID_LENGTH]) {
     output.extend_from_slice(bytes);
 }
 
+fn encode_bstr(output: &mut Vec<u8>, bytes: &[u8]) {
+    let length = u64::try_from(bytes.len()).expect("platform usize fits into u64");
+    debug_assert!(length <= ER_UINT_MAX);
+    match length {
+        0..=23 => output.push(0x40 | length as u8),
+        24..=0xff => output.extend_from_slice(&[0x58, length as u8]),
+        0x100..=0xffff => output.extend_from_slice(&[0x59, (length >> 8) as u8, length as u8]),
+        0x1_0000..=0xffff_ffff => output.extend_from_slice(&[
+            0x5a,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+        _ => output.extend_from_slice(&[
+            0x5b,
+            (length >> 56) as u8,
+            (length >> 48) as u8,
+            (length >> 40) as u8,
+            (length >> 32) as u8,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+    }
+    output.extend_from_slice(bytes);
+}
+
 fn encode_uint(output: &mut Vec<u8>, value: u64) {
     debug_assert!(value <= ER_UINT_MAX);
     match value {
@@ -3122,6 +3156,51 @@ pub struct ManifestArtifactEntry {
     pub size_bytes: u64,
     pub digest_algorithm_id: u64,
     pub digest_bytes: [u8; ID_LENGTH],
+}
+
+/// Derives the selected regular-file Subject projection from an already
+/// canonical Manifest artifact array. This is a pure projection only; callers
+/// must separately establish source, retained-payload, and Record authority.
+pub fn derive_selected_regular_file_subject(
+    artifacts: &[ManifestArtifactEntry],
+) -> Result<[u8; ID_LENGTH], RecordDecodeError> {
+    let mut previous_path: Option<&[Vec<u8>]> = None;
+    for artifact in artifacts {
+        if artifact.artifact_kind_id != 1
+            || artifact.digest_algorithm_id != 1
+            || artifact.path_components.is_empty()
+            || artifact.path_components.iter().any(|component| {
+                component.is_empty() || matches!(component.as_slice(), b"." | b"..")
+            })
+            || previous_path.is_some_and(|previous| previous >= artifact.path_components.as_slice())
+        {
+            return Err(RecordDecodeError);
+        }
+        previous_path = Some(&artifact.path_components);
+    }
+
+    let mut projection = Vec::with_capacity(64 + artifacts.len() * 64);
+    projection.push(0x85);
+    encode_text(&mut projection, "EvidenceRegistry.Subject.RegularFiles.v1");
+    encode_uint(&mut projection, 1);
+    encode_uint(&mut projection, 1);
+    encode_uint(&mut projection, artifacts.len() as u64);
+    encode_array_length(&mut projection, artifacts.len());
+    for artifact in artifacts {
+        projection.push(0x85);
+        encode_uint(&mut projection, artifact.artifact_kind_id);
+        encode_array_length(&mut projection, artifact.path_components.len());
+        for component in &artifact.path_components {
+            encode_bstr(&mut projection, component);
+        }
+        encode_uint(&mut projection, artifact.size_bytes);
+        encode_uint(&mut projection, artifact.digest_algorithm_id);
+        encode_bstr_32(&mut projection, &artifact.digest_bytes);
+    }
+    Ok(Sha256::digest(projection)
+        .as_slice()
+        .try_into()
+        .expect("SHA-256 always has exact Subject width"))
 }
 
 /// Typed, Record-local fields decoded from a MANIFEST Record.
@@ -5239,6 +5318,7 @@ pub struct ReviewAdmissionRecord {
     policy_authority_ref: JournalReference,
     reason_codes: Vec<String>,
     operation_start_journal_ref: JournalReference,
+    terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
 }
 
 impl ReviewAdmissionRecord {
@@ -5246,6 +5326,26 @@ impl ReviewAdmissionRecord {
     /// already-resolved references. This local constructor does not establish
     /// that the selected disposition is lawful or publish an event.
     pub fn new(input: ReviewAdmissionRecordInput) -> Result<Self, ReviewAdmissionRecordError> {
+        Self::new_with_terminal_authority_closure(input, None)
+    }
+
+    /// Constructs the selected terminal form bound to both assigned selectors.
+    ///
+    /// This only constructs the exact Record-local selected encoding; it does
+    /// not establish a lawful disposition or publish a Journal event.
+    pub fn new_selected(
+        input: ReviewAdmissionRecordInput,
+    ) -> Result<Self, ReviewAdmissionRecordError> {
+        Self::new_with_terminal_authority_closure(
+            input,
+            Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256),
+        )
+    }
+
+    fn new_with_terminal_authority_closure(
+        input: ReviewAdmissionRecordInput,
+        terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
+    ) -> Result<Self, ReviewAdmissionRecordError> {
         if !matches!(input.disposition_id, 1 | 2)
             || input.review_request_ref.event_type_id().value() != 300
             || input.review_result_ref.event_type_id().value() != 301
@@ -5266,6 +5366,7 @@ impl ReviewAdmissionRecord {
             policy_authority_ref: input.policy_authority_ref,
             reason_codes: input.reason_codes,
             operation_start_journal_ref: input.operation_start_journal_ref,
+            terminal_authority_closure_sha256,
         };
         record.record_id =
             RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
@@ -5280,7 +5381,11 @@ impl ReviewAdmissionRecord {
         bytes.extend_from_slice(RECORD_DOMAIN);
         encode_uint(&mut bytes, 32);
         bytes.push(1);
-        bytes.push(0xa8);
+        bytes.push(if self.terminal_authority_closure_sha256.is_some() {
+            0xaa
+        } else {
+            0xa8
+        });
         bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
         encode_uint(&mut bytes, 32);
         encode_uint(&mut bytes, 16);
@@ -5298,6 +5403,15 @@ impl ReviewAdmissionRecord {
         }
         encode_uint(&mut bytes, 23);
         bytes.extend_from_slice(&self.operation_start_journal_ref.authoritative_cbor());
+        if let Some(selector) = self.terminal_authority_closure_sha256 {
+            encode_uint(&mut bytes, 24);
+            encode_bstr_32(
+                &mut bytes,
+                &TERMINAL_REVIEW_ADMISSION_LEGACY_SELECTOR_SHA256,
+            );
+            encode_uint(&mut bytes, 25);
+            encode_bstr_32(&mut bytes, &selector);
+        }
         bytes
     }
 
@@ -5318,7 +5432,10 @@ impl ReviewAdmissionRecord {
         {
             return Err(RecordDecodeError);
         }
-        cursor.map_exact(8).map_err(|_| RecordDecodeError)?;
+        let body_field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(body_field_count, 8 | 10) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
         if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
             return Err(RecordDecodeError);
@@ -5368,6 +5485,22 @@ impl ReviewAdmissionRecord {
         cursor.key(23).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        let terminal_authority_closure_sha256 = if body_field_count == 10 {
+            cursor.key(24).map_err(|_| RecordDecodeError)?;
+            if cursor.bstr_32().map_err(|_| RecordDecodeError)?
+                != TERMINAL_REVIEW_ADMISSION_LEGACY_SELECTOR_SHA256
+            {
+                return Err(RecordDecodeError);
+            }
+            cursor.key(25).map_err(|_| RecordDecodeError)?;
+            let selector = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            if selector != TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256 {
+                return Err(RecordDecodeError);
+            }
+            Some(selector)
+        } else {
+            None
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -5379,6 +5512,7 @@ impl ReviewAdmissionRecord {
             policy_authority_ref,
             reason_codes,
             operation_start_journal_ref,
+            terminal_authority_closure_sha256,
         })
     }
 
@@ -5415,6 +5549,11 @@ impl ReviewAdmissionRecord {
     /// The exact Record-local operation-start chronology reference.
     pub fn operation_start_journal_ref(&self) -> &JournalReference {
         &self.operation_start_journal_ref
+    }
+
+    /// The exact selected-terminal Core digest when both selector fields are present.
+    pub fn terminal_authority_closure_sha256(&self) -> Option<&[u8; ID_LENGTH]> {
+        self.terminal_authority_closure_sha256.as_ref()
     }
 }
 
@@ -6496,6 +6635,8 @@ pub enum FreezeCommittedBindingError {
     IntendedRootMismatch,
     /// The START, Receipt, and terminal event do not bind one Freeze Attempt identity.
     FreezeAttemptMismatch,
+    /// A selected Receipt's Freeze ID is not the exact START Freeze Attempt ID copy.
+    SelectedFreezeIdMismatch,
     /// The Receipt and START do not preserve the same exact subject identity.
     SubjectMismatch,
     /// The Receipt and START do not preserve the same exact Policy identity.
@@ -6523,6 +6664,19 @@ pub fn validate_freeze_committed_binding(
         != input.freeze_receipt_record.input.freeze_attempt_id
     {
         return Err(FreezeCommittedBindingError::FreezeAttemptMismatch);
+    }
+    if input
+        .freeze_receipt_record
+        .terminal_authority_closure_sha256()
+        .is_some()
+        && input.freeze_receipt_record.input.freeze_id
+            != *input
+                .freeze_attempt_start_record
+                .input
+                .freeze_attempt_id
+                .as_bytes()
+    {
+        return Err(FreezeCommittedBindingError::SelectedFreezeIdMismatch);
     }
     let committed = input
         .retained_journal
@@ -6871,6 +7025,76 @@ impl GenesisRecord {
             return Err(RecordDecodeError);
         }
         Ok(decoded)
+    }
+}
+
+/// The one exact static parameter Record for the selected Freeze creation profile.
+///
+/// This Record is content addressed only; it is not an event or evidence that a
+/// Freeze creation procedure completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeCreationProfileRecord {
+    record_id: RecordId,
+}
+
+impl FreezeCreationProfileRecord {
+    /// Constructs the sole assigned type-64/profile-1 parameter Record.
+    pub fn new() -> Result<Self, RecordDecodeError> {
+        let bytes = Self::exact_cbor();
+        Self::decode_authoritative(&bytes)
+    }
+
+    fn exact_cbor() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(48);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[
+            0x18, 0x40, 0x01, 0xa3, 0x00, 0x01, 0x01, 0x18, 0x40, 0x10, 0x01,
+        ]);
+        bytes
+    }
+
+    /// Emits the sole canonical type-64/profile-1 Record byte sequence.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        Self::exact_cbor()
+    }
+
+    /// The identity of the exact static parameter Record.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// Strictly decodes only the exact assigned type-64/profile-1 Record.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 64
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(3).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 64 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 || !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        if input != Self::exact_cbor() {
+            return Err(RecordDecodeError);
+        }
+        let record_id = RecordId::try_from(Sha256::digest(input).as_slice())
+            .expect("SHA-256 has exact RecordId width");
+        Ok(Self { record_id })
     }
 }
 
