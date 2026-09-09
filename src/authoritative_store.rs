@@ -53,6 +53,7 @@ pub enum AuthoritativeRegistryStoreInitializeError {
     RootAlreadyExists,
     RootCreation,
     NamespaceCreation,
+    CapabilityProbe,
     ObservationRecord,
     Publication,
     Reopen(AuthoritativeRegistryStoreOpenError),
@@ -552,8 +553,9 @@ impl AuthoritativeRegistryStore {
     /// Creates a selected Store only at an absent root, publishes initial
     /// Records and slot zero, then returns only an exact selected reopen.
     ///
-    /// The initial capability Record deliberately records unprobed capability
-    /// dimensions; it is not a claim that later selected operations are supported.
+    /// Capability dimensions are marked PRESENT only after an operation-scoped
+    /// probe at this exact selected root. Unsupported dimensions remain
+    /// NOT_PROBED and cannot authorize a later selected operation.
     pub fn initialize_selected_profile(
         root: impl AsRef<Path>,
         registry_id: RegistryId,
@@ -579,18 +581,10 @@ impl AuthoritativeRegistryStore {
             fs::create_dir(root.join(relative))
                 .map_err(|_| AuthoritativeRegistryStoreInitializeError::NamespaceCreation)?;
         }
-        let capability = StorageCapabilityClassRecord::new(StorageCapabilityClassRecordInput {
-            filesystem_transport: std::env::consts::FAMILY.to_owned(),
-            sync_management: "std::fs::File::sync_all".to_owned(),
-            placeholder_capability: 3,
-            exclusive_create_capability: 3,
-            no_replace_publication_capability: 3,
-            locking_capability: 3,
-            atomic_rename_capability: 3,
-            file_flush_capability: 3,
-            directory_flush_capability: 3,
-        })
-        .map_err(|_| AuthoritativeRegistryStoreInitializeError::ObservationRecord)?;
+        let capability_input = probe_selected_initial_storage_capabilities(root)
+            .map_err(|_| AuthoritativeRegistryStoreInitializeError::CapabilityProbe)?;
+        let capability = StorageCapabilityClassRecord::new(capability_input)
+            .map_err(|_| AuthoritativeRegistryStoreInitializeError::ObservationRecord)?;
         let environment = EnvironmentObservationRecord::new(EnvironmentObservationRecordInput {
             os_name: std::env::consts::OS.to_owned(),
             os_version: None,
@@ -601,8 +595,11 @@ impl AuthoritativeRegistryStore {
             resolved_registry_storage_identity: None,
             probe_tool_version: created_by_tool_version.into(),
             observation_limitations: vec![
-                "capability-probes-not-performed".to_owned(),
+                "atomic-rename-not-probed".to_owned(),
                 "no-hostile-attestation".to_owned(),
+                "no-replace-publication-not-probed".to_owned(),
+                "placeholder-capability-not-probed".to_owned(),
+                "writer-lock-not-probed".to_owned(),
             ],
         })
         .map_err(|_| AuthoritativeRegistryStoreInitializeError::ObservationRecord)?;
@@ -1820,6 +1817,105 @@ impl AuthoritativeRegistryStore {
             .fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
     }
+}
+
+/// Observes only capabilities that can be exercised safely in the selected
+/// nonauthoritative staging namespace. It deliberately leaves unrelated
+/// dimensions unprobed instead of promoting implementation assumptions.
+fn probe_selected_initial_storage_capabilities(
+    root: &Path,
+) -> Result<StorageCapabilityClassRecordInput, ()> {
+    let root_hold = open_real_directory_hold(root)?;
+    let coordination = root.join("coordination");
+    let coordination_hold = open_child_directory_hold(&root_hold, root, "coordination")?;
+    let staging = coordination.join("staging");
+    let staging_hold = open_child_directory_hold(&coordination_hold, &coordination, "staging")?;
+    let staging_publication_hold = open_publication_child_directory_hold(
+        &coordination_hold,
+        &coordination,
+        &staging_hold,
+        "staging",
+    )?;
+    ensure_path_matches_handle(&staging, &staging_publication_hold)?;
+
+    let temporary = staging.join(format!("{}.tmp", selected_staging_probe_token()?));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| ())?;
+    let write_result = file
+        .write_all(b"EvidenceRegistry.selected-staging-capability-probe.v1")
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    if write_result.is_err() {
+        drop(file);
+        return Err(());
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        _ => return Err(()),
+    }
+    drop(file);
+    sync_retained_directory(&staging, &staging_publication_hold)?;
+    fs::remove_file(&temporary).map_err(|_| ())?;
+    sync_retained_directory(&staging, &staging_publication_hold)?;
+
+    Ok(StorageCapabilityClassRecordInput {
+        filesystem_transport: std::env::consts::FAMILY.to_owned(),
+        sync_management: "std::fs::File::sync_all".to_owned(),
+        placeholder_capability: 3,
+        exclusive_create_capability: 1,
+        no_replace_publication_capability: 3,
+        locking_capability: 3,
+        atomic_rename_capability: 3,
+        file_flush_capability: 1,
+        directory_flush_capability: 1,
+    })
+}
+
+fn selected_staging_probe_token() -> Result<String, ()> {
+    let mut bytes = [0_u8; 16];
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                algorithm: isize,
+                buffer: *mut u8,
+                buffer_length: u32,
+                flags: u32,
+            ) -> i32;
+        }
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        if unsafe {
+            BCryptGenRandom(
+                0,
+                bytes.as_mut_ptr(),
+                u32::try_from(bytes.len()).map_err(|_| ())?,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        } < 0
+        {
+            return Err(());
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        fs::File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut bytes))
+            .map_err(|_| ())?;
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        return Err(());
+    }
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn validate_selected_genesis_observation_records(
