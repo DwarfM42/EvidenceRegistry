@@ -1,4 +1,6 @@
-use evidence_registry::{ManifestRecord, RecordId, RecordTypeId, StrictRecordFrame};
+use evidence_registry::{
+    ManifestRecord, ManifestRecordInput, RecordId, RecordTypeId, StrictRecordFrame,
+};
 
 const MANIFEST_RECORD_HEX: &str = concat!(
     "84781a45766964656e636552656769737472792e5265636f72642e76310201a700010102105820",
@@ -95,6 +97,24 @@ fn manifest_record_decodes_fixed_local_artifact_fields_and_exact_identity() {
         decoded.input().artifacts[0].digest_bytes,
         hex_id("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
     );
+}
+
+#[test]
+fn manifest_record_constructs_the_same_canonical_local_bytes_that_it_decodes() {
+    let expected = ManifestRecord::decode_authoritative(&hex_bytes(MANIFEST_RECORD_HEX)).unwrap();
+    let constructed = ManifestRecord::new(ManifestRecordInput {
+        subject_id: expected.input().subject_id,
+        artifact_count: expected.input().artifact_count,
+        path_identity_profile_id: expected.input().path_identity_profile_id,
+        digest_profile_id: expected.input().digest_profile_id,
+        artifacts: expected.input().artifacts.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        constructed.authoritative_cbor(),
+        hex_bytes(MANIFEST_RECORD_HEX)
+    );
+    assert_eq!(constructed, expected);
 }
 
 #[test]

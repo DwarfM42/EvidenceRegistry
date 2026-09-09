@@ -3226,6 +3226,66 @@ pub struct ManifestRecord {
 }
 
 impl ManifestRecord {
+    /// Constructs canonical MANIFEST Record bytes from already selected local
+    /// fields. This establishes neither source, retained-payload, profile, nor
+    /// authority facts.
+    pub fn new(input: ManifestRecordInput) -> Result<Self, RecordDecodeError> {
+        if input.artifact_count != input.artifacts.len() as u64 {
+            return Err(RecordDecodeError);
+        }
+        let mut artifact_paths = BTreeSet::new();
+        for artifact in &input.artifacts {
+            if !matches!(artifact.artifact_kind_id, 1 | 2)
+                || artifact.path_components.is_empty()
+                || artifact.path_components.iter().any(|component| {
+                    component.is_empty() || matches!(component.as_slice(), b"." | b"..")
+                })
+                || artifact.digest_algorithm_id != 1
+                || !artifact_paths.insert(artifact.path_components.clone())
+            {
+                return Err(RecordDecodeError);
+            }
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0_u8; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact canonical MANIFEST Record bytes for these local fields.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128 + self.input.artifacts.len() * 80);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x02, 0x01, 0xa7, 0x00, 0x01, 0x01, 0x02, 0x10]);
+        encode_bstr_32(&mut bytes, &self.input.subject_id);
+        encode_uint(&mut bytes, 17);
+        encode_uint(&mut bytes, self.input.artifact_count);
+        encode_uint(&mut bytes, 18);
+        encode_uint(&mut bytes, self.input.path_identity_profile_id);
+        encode_uint(&mut bytes, 19);
+        encode_uint(&mut bytes, self.input.digest_profile_id);
+        encode_uint(&mut bytes, 20);
+        encode_array_length(&mut bytes, self.input.artifacts.len());
+        for artifact in &self.input.artifacts {
+            bytes.push(0x85);
+            encode_uint(&mut bytes, artifact.artifact_kind_id);
+            encode_array_length(&mut bytes, artifact.path_components.len());
+            for component in &artifact.path_components {
+                encode_bstr(&mut bytes, component);
+            }
+            encode_uint(&mut bytes, artifact.size_bytes);
+            encode_uint(&mut bytes, artifact.digest_algorithm_id);
+            encode_bstr_32(&mut bytes, &artifact.digest_bytes);
+        }
+        bytes
+    }
+
     /// Strictly decodes the frozen MANIFEST local Record grammar without normalization.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
@@ -3304,16 +3364,17 @@ impl ManifestRecord {
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
-        Ok(Self {
-            record_id: frame.record_id(),
-            input: ManifestRecordInput {
-                subject_id,
-                artifact_count,
-                path_identity_profile_id,
-                digest_profile_id,
-                artifacts,
-            },
-        })
+        let decoded = Self::new(ManifestRecordInput {
+            subject_id,
+            artifact_count,
+            path_identity_profile_id,
+            digest_profile_id,
+            artifacts,
+        })?;
+        if decoded.record_id != frame.record_id() || decoded.authoritative_cbor() != input {
+            return Err(RecordDecodeError);
+        }
+        Ok(decoded)
     }
 
     /// The exact immutable identity of the strictly decoded MANIFEST Record.
