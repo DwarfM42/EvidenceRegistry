@@ -1,11 +1,11 @@
 use evidence_registry::{
-    derive_freeze_root, validate_freeze_committed_binding, validate_freeze_manifest_profile,
+    derive_freeze_root, validate_freeze_committed_binding,
     validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
     FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
     FreezeReceiptRecord, IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference,
-    ManifestRecord, MinimalPolicyRecord, RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
-    ResolvedFreezeCommittedBindingOutcome, RetainedJournal, ScopeRecord, StrictRecordFrame,
+    RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
+    ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
@@ -425,15 +425,12 @@ fn receipt_bytes_with_policy(
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-fn freeze_commit_policy_bytes(
-    operation_start: &JournalReference,
-    gate_scope_ref: RecordId,
-) -> Vec<u8> {
+fn freeze_commit_policy_bytes(operation_start: &JournalReference) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
     bytes.extend_from_slice(&[0x18, 0x28, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x18, 0x28, 0x10]);
-    append_bstr_32(&mut bytes, gate_scope_ref.as_bytes());
+    append_bstr_32(&mut bytes, &id(0x31));
     bytes.extend_from_slice(&[0x18, 0x1d]);
     bytes.push(0x85);
     append_bstr_32(&mut bytes, operation_start.registry_id().as_bytes());
@@ -443,13 +440,6 @@ fn freeze_commit_policy_bytes(
     append_bstr_32(&mut bytes, operation_start.event_record_id().as_bytes());
     bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x01]);
     bytes
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-fn freeze_commit_minimal_policy_scope_bytes() -> Vec<u8> {
-    hex_bytes(
-        "84781a45766964656e636552656769737472792e5265636f72642e76311401a500010114100211011240",
-    )
 }
 
 fn freeze_committed_bytes(
@@ -1259,7 +1249,7 @@ fn freeze_committed_binding_rejects_start_record_root_that_disagrees_with_retain
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
-fn authoritative_store_derives_freeze_authority_for_zero_requirement_policy() {
+fn authoritative_store_fails_closed_before_positive_freeze_authority() {
     let fixture = AuthoritativeStoreFixtureDir::new();
     let registry_id = RegistryId::try_from(id(0x00).as_slice()).unwrap();
     let storage_capability_class_id = RecordId::try_from(id(0x40).as_slice()).unwrap();
@@ -1286,9 +1276,7 @@ fn authoritative_store_derives_freeze_authority_for_zero_requirement_policy() {
         EventTypeId::try_from(1_u64).unwrap(),
         EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
     );
-    let freeze_scope_bytes = freeze_commit_minimal_policy_scope_bytes();
-    let freeze_scope_id = RecordId::try_from(sha256(&freeze_scope_bytes).as_slice()).unwrap();
-    let policy_bytes = freeze_commit_policy_bytes(&genesis_reference, freeze_scope_id);
+    let policy_bytes = freeze_commit_policy_bytes(&genesis_reference);
     let policy_record_id = RecordId::try_from(sha256(&policy_bytes).as_slice()).unwrap();
     let start_record = start_record_with_policy(registry_id, policy_record_id);
     let start_entry_bytes = freeze_start_bytes(genesis_entry.entry_hash(), &start_record);
@@ -1308,20 +1296,8 @@ fn authoritative_store_derives_freeze_authority_for_zero_requirement_policy() {
     );
     let manifest_bytes = hex_bytes(MANIFEST_RECORD_HEX);
     let manifest_id = RecordId::try_from(sha256(&manifest_bytes).as_slice()).unwrap();
-    let manifest = ManifestRecord::decode_authoritative(&manifest_bytes).unwrap();
-    assert_eq!(manifest.record_id(), manifest_id);
-    assert_eq!(validate_freeze_manifest_profile(&manifest), Ok(()));
     let receipt_bytes = receipt_bytes_with_policy(&start_reference, manifest_id, policy_record_id);
     let receipt = FreezeReceiptRecord::decode_authoritative(&receipt_bytes).unwrap();
-    let policy = MinimalPolicyRecord::decode_authoritative(&policy_bytes).unwrap();
-    assert_eq!(policy.record_id(), policy_record_id);
-    assert_eq!(policy.operation_start_journal_ref(), &genesis_reference);
-    assert_eq!(policy.supported_context_ids(), &[1]);
-    let scope = ScopeRecord::decode_authoritative(&freeze_scope_bytes).unwrap();
-    assert_eq!(scope.record_id(), freeze_scope_id);
-    assert_eq!(scope.input().scope_profile_id, 2);
-    assert_eq!(scope.input().scope_profile_version, 1);
-    assert!(scope.input().scope_payload.is_empty());
     let committed_entry_bytes = freeze_committed_bytes(
         start_reference.entry_hash(),
         &start_reference,
@@ -1385,7 +1361,6 @@ fn authoritative_store_derives_freeze_authority_for_zero_requirement_policy() {
         &start_record.authoritative_cbor(),
     );
     write_record(&fixture.path, manifest_id, &manifest_bytes);
-    write_record(&fixture.path, freeze_scope_id, &freeze_scope_bytes);
     write_record(&fixture.path, policy_record_id, &policy_bytes);
     write_record(&fixture.path, receipt.record_id(), &receipt_bytes);
 
@@ -1401,22 +1376,12 @@ fn authoritative_store_derives_freeze_authority_for_zero_requirement_policy() {
         drop(accepted);
     }
     // Resolve against the same instance that adopted both repeated reloads.
-    let binding = live_store
-        .validate_freeze_committed_authority(committed_reference.clone())
-        .unwrap();
-    assert_eq!(binding.registry_id(), registry_id);
-    assert_eq!(binding.committed_event_reference(), &committed_reference);
-    assert_eq!(binding.start_event_reference(), &start_reference);
-    assert_eq!(binding.receipt_record_id(), receipt.record_id());
-    assert_eq!(binding.manifest_record_id(), manifest_id);
-    assert_eq!(binding.start_record_id(), start_record.record_id());
     assert_eq!(
-        binding.freeze_attempt_id(),
-        start_record.input().freeze_attempt_id
+        live_store.validate_freeze_committed_authority(committed_reference.clone()),
+        Err(
+            evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
+        )
     );
-    assert_eq!(binding.freeze_id(), receipt.input().freeze_id);
-    assert_eq!(binding.subject_id(), receipt.input().subject_id);
-    assert_eq!(binding.policy_record_id(), policy_record_id);
     assert_eq!(
         validate_resolved_freeze_committed_binding(
             live_store.retained_journal(),
@@ -1444,11 +1409,10 @@ fn authoritative_store_derives_freeze_authority_for_zero_requirement_policy() {
 
     let store = AuthoritativeRegistryStore::open(&fixture.path).unwrap();
     assert_eq!(
-        store
-            .validate_freeze_committed_authority(committed_reference.clone())
-            .unwrap()
-            .policy_record_id(),
-        policy_record_id
+        store.validate_freeze_committed_authority(committed_reference.clone()),
+        Err(
+            evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
+        )
     );
     assert_eq!(
         validate_resolved_freeze_committed_binding(
@@ -1485,11 +1449,8 @@ fn authoritative_store_derives_freeze_authority_for_zero_requirement_policy() {
             copy_tree(&fixture.path, &case_root);
             let case_store = AuthoritativeRegistryStore::open(&case_root).unwrap();
             assert_eq!(
-                case_store
-                    .validate_freeze_committed_authority(committed_reference.clone())
-                    .unwrap()
-                    .policy_record_id(),
-                policy_record_id
+                case_store.validate_freeze_committed_authority(committed_reference.clone()),
+                Err(evidence_registry::AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)
             );
             let target = if component == "." {
                 case_root.clone()

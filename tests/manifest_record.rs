@@ -1,7 +1,4 @@
-use evidence_registry::{
-    validate_freeze_manifest_profile, FreezeManifestProfileError, ManifestRecord, RecordId,
-    RecordTypeId, StrictRecordFrame,
-};
+use evidence_registry::{ManifestRecord, RecordId, RecordTypeId, StrictRecordFrame};
 
 const MANIFEST_RECORD_HEX: &str = concat!(
     "84781a45766964656e636552656769737472792e5265636f72642e76310201a700010102105820",
@@ -97,82 +94,6 @@ fn manifest_record_decodes_fixed_local_artifact_fields_and_exact_identity() {
     assert_eq!(
         decoded.input().artifacts[0].digest_bytes,
         hex_id("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
-    );
-}
-
-#[test]
-fn freeze_manifest_profile_accepts_the_selected_utf8_sha256_profile() {
-    let manifest = ManifestRecord::decode_authoritative(&hex_bytes(MANIFEST_RECORD_HEX)).unwrap();
-
-    assert_eq!(validate_freeze_manifest_profile(&manifest), Ok(()));
-}
-
-#[test]
-fn freeze_manifest_profile_rejects_an_unselected_path_profile() {
-    let mut bytes = hex_bytes(MANIFEST_RECORD_HEX);
-    replace_unique(&mut bytes, &[0x12, 0x01, 0x13], 1, 0x02);
-    let manifest = ManifestRecord::decode_authoritative(&bytes).unwrap();
-
-    assert_eq!(
-        validate_freeze_manifest_profile(&manifest),
-        Err(FreezeManifestProfileError::UnsupportedPathIdentityProfile)
-    );
-}
-
-#[test]
-fn freeze_manifest_profile_rejects_an_unselected_digest_profile() {
-    let mut bytes = hex_bytes(MANIFEST_RECORD_HEX);
-    replace_unique(&mut bytes, &[0x13, 0x01, 0x14], 1, 0x02);
-    let manifest = ManifestRecord::decode_authoritative(&bytes).unwrap();
-
-    assert_eq!(
-        validate_freeze_manifest_profile(&manifest),
-        Err(FreezeManifestProfileError::UnsupportedDigestProfile)
-    );
-}
-
-#[test]
-fn freeze_manifest_profile_rejects_a_non_utf8_path_component() {
-    let mut bytes = hex_bytes(MANIFEST_RECORD_HEX);
-    replace_unique(&mut bytes, &[0x81, 0x41, b'a', 0x00], 2, 0xff);
-    let manifest = ManifestRecord::decode_authoritative(&bytes).unwrap();
-
-    assert_eq!(
-        validate_freeze_manifest_profile(&manifest),
-        Err(FreezeManifestProfileError::InvalidUtf8PathComponent)
-    );
-}
-
-#[test]
-fn freeze_manifest_profile_rejects_noncanonical_component_order() {
-    let bytes = manifest_with_artifact_paths(&[b"b", b"a"]);
-    let manifest = ManifestRecord::decode_authoritative(&bytes).unwrap();
-
-    assert_eq!(
-        validate_freeze_manifest_profile(&manifest),
-        Err(FreezeManifestProfileError::NonCanonicalArtifactOrder)
-    );
-}
-
-#[test]
-fn freeze_manifest_profile_rejects_an_absolute_root_component() {
-    let bytes = manifest_with_artifact_paths(&[b"/"]);
-    let manifest = ManifestRecord::decode_authoritative(&bytes).unwrap();
-
-    assert_eq!(
-        validate_freeze_manifest_profile(&manifest),
-        Err(FreezeManifestProfileError::AbsoluteRootPathComponent)
-    );
-}
-
-#[test]
-fn freeze_manifest_profile_rejects_a_drive_prefix_component() {
-    let bytes = manifest_with_artifact_paths(&[b"C:"]);
-    let manifest = ManifestRecord::decode_authoritative(&bytes).unwrap();
-
-    assert_eq!(
-        validate_freeze_manifest_profile(&manifest),
-        Err(FreezeManifestProfileError::DrivePrefixPathComponent)
     );
 }
 

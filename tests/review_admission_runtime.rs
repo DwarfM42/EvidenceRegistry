@@ -1,10 +1,9 @@
 use evidence_registry::{
     compare_retained_journal_anchor_history, derive_freeze_root,
-    derive_review_admission_section_83_disposition,
-    evaluate_authoritative_review_admission_policy_46,
-    evaluate_retained_review_admission_policy_46, policy_evaluator_registry,
-    resolve_retained_review_package_anchor_input, route_retained_review_admission_policy_context,
-    route_retained_review_admission_section_82, route_review_admission_after_anchor_comparison,
+    derive_review_admission_section_83_disposition, evaluate_retained_review_admission_policy_46,
+    policy_evaluator_registry, resolve_retained_review_package_anchor_input,
+    route_retained_review_admission_policy_context, route_retained_review_admission_section_82,
+    route_review_admission_after_anchor_comparison,
     validate_review_admission_common_request_result_fields,
     validate_review_package_anchor_transport, validate_review_request_recorded_binding,
     validate_review_result_recorded_binding, AuthoritativeRegistryStore, EventRecordId,
@@ -13,8 +12,7 @@ use evidence_registry::{
     IntendedRootId, JournalAnchor, JournalAnchorHistoryComparison, JournalEntryHash,
     JournalEntryIndex, JournalReference, RecordId, RegistryId, RetainedJournal,
     RetainedJournalError, RetainedReviewPackageAnchorInputError, ReviewAdmissionAcceptanceError,
-    ReviewAdmissionCommonRequestResultError, ReviewAdmissionCompletedPolicyResult,
-    ReviewAdmissionExactScopeProfileError, ReviewAdmissionIndividualEvaluatorOutcome,
+    ReviewAdmissionCommonRequestResultError, ReviewAdmissionExactScopeProfileError,
     ReviewAdmissionPolicy46RouteOutcome, ReviewAdmissionPolicyContextPrerequisitesError,
     ReviewAdmissionPolicyContextRouteOutcome, ReviewAdmissionPolicyRecord,
     ReviewAdmissionPolicyRecordedBindingError, ReviewAdmissionRuntimeError,
@@ -164,7 +162,6 @@ fn freeze_receipt_bytes(
 
 fn independently_construct_freeze_commit_policy(
     operation_start: &JournalReference,
-    gate_scope_ref: RecordId,
     context_id: u8,
     minimum_durability: Option<[bool; 4]>,
 ) -> Vec<u8> {
@@ -187,7 +184,7 @@ fn independently_construct_freeze_commit_policy(
         0x28,
         0x10,
     ]);
-    append_bstr_32(&mut bytes, *gate_scope_ref.as_bytes());
+    append_bstr_32(&mut bytes, id(0x31));
     if let Some(requirements) = minimum_durability {
         bytes.extend_from_slice(&[0x17, 0xa4]);
         for (key, required) in requirements.into_iter().enumerate() {
@@ -199,12 +196,6 @@ fn independently_construct_freeze_commit_policy(
     append_journal_reference(&mut bytes, operation_start);
     bytes.extend_from_slice(&[0x18, 0x1e, 0x81, context_id]);
     bytes
-}
-
-fn independently_construct_freeze_commit_minimal_policy_scope() -> Vec<u8> {
-    hex_bytes(
-        "84781a45766964656e636552656769737472792e5265636f72642e76311401a500010114100211011240",
-    )
 }
 
 fn freeze_committed_entry(
@@ -671,7 +662,7 @@ fn independently_construct_review_admission_policy_with_requirement_roles(
     if include_verification_requirement {
         bytes.extend_from_slice(&[0x18, 0x1e, 0x83, 0x02, 0x03, 0x05]);
     } else {
-        bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x02]);
+        bytes.extend_from_slice(&[0x18, 0x1e, 0x82, 0x02, 0x05]);
     }
     bytes
 }
@@ -848,7 +839,6 @@ struct ReviewAdmissionFixtureOverrides {
     freeze_start_record_intended_root: Option<[u8; 32]>,
     freeze_policy_context_id: Option<u8>,
     freeze_policy_minimum_durability: Option<[bool; 4]>,
-    freeze_policy_scope_bytes: Option<Vec<u8>>,
     freeze_receipt_file_content_flush_state: Option<u8>,
     manifest_bytes: Option<Vec<u8>>,
     policy_operation_start: Option<JournalReference>,
@@ -944,7 +934,6 @@ fn authoritative_review_admission_fixture_with_overrides(
         freeze_start_record_intended_root,
         freeze_policy_context_id,
         freeze_policy_minimum_durability,
-        freeze_policy_scope_bytes,
         freeze_receipt_file_content_flush_state,
         manifest_bytes,
         policy_operation_start,
@@ -977,13 +966,8 @@ fn authoritative_review_admission_fixture_with_overrides(
         evidence_registry::EventTypeId::try_from(1_u64).unwrap(),
         EventRecordId::try_from(genesis_record().record_id().as_bytes().as_slice()).unwrap(),
     );
-    let freeze_scope_bytes = freeze_policy_scope_bytes
-        .unwrap_or_else(independently_construct_freeze_commit_minimal_policy_scope);
-    let freeze_scope_id =
-        RecordId::try_from(Sha256::digest(&freeze_scope_bytes).as_slice()).unwrap();
     let freeze_policy_bytes = independently_construct_freeze_commit_policy(
         &genesis_reference,
-        freeze_scope_id,
         freeze_policy_context_id.unwrap_or(1),
         freeze_policy_minimum_durability,
     );
@@ -1303,7 +1287,6 @@ fn authoritative_review_admission_fixture_with_overrides(
         (start_record.record_id(), start_record.authoritative_cbor()),
         (receipt_id, receipt_bytes),
         (manifest_id, manifest_bytes),
-        (freeze_scope_id, freeze_scope_bytes),
         (freeze_policy_id, freeze_policy_bytes),
         (gate_scope_id, gate_scope_bytes),
         (policy_id, policy_bytes),
@@ -1520,11 +1503,10 @@ fn retained_journal_exposes_the_exact_current_head_for_accept_and_snapshot() {
 }
 
 #[test]
-fn policy_registry_registers_adopted_evaluator_1015() {
-    assert!(policy_evaluator_registry().iter().any(|registration| {
-        registration.id == 1015
-            && registration.name == "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING"
-    }));
+fn policy_registry_excludes_unassigned_evaluator_1015() {
+    assert!(policy_evaluator_registry()
+        .iter()
+        .all(|registration| registration.id != 1015));
 }
 
 #[test]
@@ -1778,35 +1760,7 @@ fn authoritative_store_open_requires_the_exact_freeze_commit_policy_context() {
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
-fn authoritative_store_open_rejects_an_unselected_freeze_policy_scope_profile() {
-    let mut scope = independently_construct_freeze_commit_minimal_policy_scope();
-    let profile = scope
-        .windows(6)
-        .position(|window| window == [0x10, 0x02, 0x11, 0x01, 0x12, 0x40])
-        .unwrap();
-    scope[profile + 1] = 3;
-    let fixture = authoritative_review_admission_fixture_with_overrides(
-        true,
-        &[5],
-        IdentityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        ReviewAdmissionFixtureOverrides {
-            freeze_policy_scope_bytes: Some(scope),
-            ..Default::default()
-        },
-    );
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-
-    assert_eq!(
-        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
-        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
-    );
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_store_leaves_freeze_minimum_durability_semantics_unavailable() {
+fn authoritative_store_open_evaluates_freeze_minimum_durability() {
     let fixture = |file_content_flush_state| {
         authoritative_review_admission_fixture_with_overrides(
             true,
@@ -1822,43 +1776,15 @@ fn authoritative_store_leaves_freeze_minimum_durability_semantics_unavailable() 
         )
     };
 
-    let asserted = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(1));
+    let satisfied = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(1));
     assert_eq!(
-        AuthoritativeRegistryStore::open(&asserted.path).unwrap_err(),
+        AuthoritativeRegistryStore::open(&satisfied.path).unwrap_err(),
         evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
 
-    let contradictory = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(2));
+    let unsatisfied = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture(2));
     assert_eq!(
-        AuthoritativeRegistryStore::open(&contradictory.path).unwrap_err(),
-        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
-    );
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_store_open_rejects_an_unselected_freeze_manifest_digest_profile() {
-    let mut manifest = hex_bytes(MANIFEST_RECORD_HEX);
-    let profile = manifest
-        .windows(3)
-        .position(|window| window == [0x13, 0x01, 0x14])
-        .unwrap();
-    manifest[profile + 1] = 2;
-    let fixture = authoritative_review_admission_fixture_with_overrides(
-        true,
-        &[5],
-        IdentityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        ReviewAdmissionFixtureOverrides {
-            manifest_bytes: Some(manifest),
-            ..Default::default()
-        },
-    );
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-
-    assert_eq!(
-        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        AuthoritativeRegistryStore::open(&unsatisfied.path).unwrap_err(),
         evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
     );
 }
@@ -1909,7 +1835,10 @@ fn authoritative_store_projects_repeated_result_findings_into_one_identity_set_m
     );
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
 
-    let _store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
 }
 
 #[test]
@@ -2944,335 +2873,12 @@ fn structurally_complete_inputs_without_authoritative_store_provenance_remain_pr
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
-fn authoritative_store_retains_structurally_valid_review_inputs_before_section_82_evaluation() {
+fn authoritative_store_blocks_review_request_before_section_82_without_freeze_semantic_authority() {
     let fixture = authoritative_review_admission_fixture(true);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_section_82_evaluates_adopted_gate_scope_evaluator_1015_exactly() {
-    for (gate_scope_matches_common_scope, expected_outcome, expected_completion) in [
-        (
-            true,
-            ReviewAdmissionIndividualEvaluatorOutcome::Pass,
-            ReviewAdmissionCompletedPolicyResult::Satisfied,
-        ),
-        (
-            false,
-            ReviewAdmissionIndividualEvaluatorOutcome::Fail,
-            ReviewAdmissionCompletedPolicyResult::GateUnsatisfied,
-        ),
-    ] {
-        let fixture = authoritative_review_admission_fixture(gate_scope_matches_common_scope);
-        let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-        let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-        let accepted = store
-            .accept_authoritative_review_admission(
-                fixture.request_reference.clone(),
-                &fixture.request_bytes,
-                fixture.result_reference.clone(),
-                &fixture.result_bytes,
-            )
-            .unwrap();
-        let section_82 = store
-            .complete_authoritative_review_admission_section_82(accepted)
-            .unwrap();
-        let completion = evaluate_authoritative_review_admission_policy_46(&section_82);
-
-        assert_eq!(completion.result(), expected_completion);
-        assert_eq!(
-            completion
-                .evaluator_results()
-                .iter()
-                .find(|result| result.evaluator_id() == 1015)
-                .map(|result| result.outcome()),
-            Some(expected_outcome),
-        );
-    }
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_store_completes_matching_exact_review_scope_policy_46_without_publication() {
-    let fixture = authoritative_review_admission_fixture(true);
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
-        .unwrap()
-        .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
-    let completion = match store.complete_authoritative_review_admission_policy_46(accepted) {
-        evidence_registry::AuthoritativeReviewAdmissionPolicy46Outcome::Completed(completion) => {
-            completion
-        }
-        evidence_registry::AuthoritativeReviewAdmissionPolicy46Outcome::PreTerminal(error) => {
-            panic!("matching exact profile prerequisites unexpectedly stopped: {error:?}")
-        }
-    };
-
     assert_eq!(
-        completion.result(),
-        ReviewAdmissionCompletedPolicyResult::Satisfied,
-    );
-    assert_eq!(
-        completion
-            .evaluator_results()
-            .iter()
-            .find(|result| result.evaluator_id() == 1015)
-            .map(|result| result.outcome()),
-        Some(ReviewAdmissionIndividualEvaluatorOutcome::Pass),
-    );
-    assert!(!store_dir
-        .path
-        .join("journal/00000000000000000006.cbor")
-        .exists());
-    assert_eq!(
-        fs::read_dir(store_dir.path.join("records"))
-            .unwrap()
-            .count(),
-        retained_record_count
-    );
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_store_completes_mismatched_exact_review_scope_policy_46_without_publication() {
-    let fixture = authoritative_review_admission_fixture(false);
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
-        .unwrap()
-        .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
-    let completion = match store.complete_authoritative_review_admission_policy_46(accepted) {
-        evidence_registry::AuthoritativeReviewAdmissionPolicy46Outcome::Completed(completion) => {
-            completion
-        }
-        evidence_registry::AuthoritativeReviewAdmissionPolicy46Outcome::PreTerminal(error) => {
-            panic!("mismatched exact profile prerequisites unexpectedly stopped: {error:?}")
-        }
-    };
-
-    assert_eq!(
-        completion.result(),
-        ReviewAdmissionCompletedPolicyResult::GateUnsatisfied,
-    );
-    assert_eq!(
-        completion
-            .evaluator_results()
-            .iter()
-            .find(|result| result.evaluator_id() == 1015)
-            .map(|result| result.outcome()),
-        Some(ReviewAdmissionIndividualEvaluatorOutcome::Fail),
-    );
-    assert!(!store_dir
-        .path
-        .join("journal/00000000000000000006.cbor")
-        .exists());
-    assert_eq!(
-        fs::read_dir(store_dir.path.join("records"))
-            .unwrap()
-            .count(),
-        retained_record_count
-    );
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_store_publishes_matching_exact_review_scope_admission() {
-    let fixture = authoritative_review_admission_fixture(true);
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
-        .unwrap()
-        .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
-    let publication = match store
-        .complete_authoritative_review_admission_exact_review_scope_profile(accepted)
-        .unwrap()
-    {
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::Published(publication) => {
-            publication
-        }
-        outcome => panic!("matching exact profile did not publish: {outcome:?}"),
-    };
-
-    assert_eq!(
-        publication.policy_completion().result(),
-        ReviewAdmissionCompletedPolicyResult::Satisfied,
-    );
-    assert_eq!(
-        publication.disposition(),
-        evidence_registry::ReviewAdmissionSection83Disposition::ReviewAdmissionAccepted,
-    );
-    assert!(store_dir
-        .path
-        .join("journal/00000000000000000006.cbor")
-        .exists());
-    assert_eq!(
-        fs::read_dir(store_dir.path.join("records"))
-            .unwrap()
-            .count(),
-        retained_record_count + 1
-    );
-
-    let replayed = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    assert_eq!(
-        replayed.retained_journal().current_head_reference(),
-        publication.journal_reference().clone(),
-    );
-    assert_eq!(
-        replayed.resolve(publication.admission_record().record_id()),
-        Some(publication.admission_record_bytes()),
-    );
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_store_publishes_mismatched_exact_review_scope_rejection() {
-    let fixture = authoritative_review_admission_fixture(false);
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
-        .unwrap()
-        .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
-    let publication = match store
-        .complete_authoritative_review_admission_exact_review_scope_profile(accepted)
-        .unwrap()
-    {
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::Published(publication) => {
-            publication
-        }
-        outcome => panic!("mismatched exact profile did not publish rejection: {outcome:?}"),
-    };
-
-    assert_eq!(
-        publication.policy_completion().result(),
-        ReviewAdmissionCompletedPolicyResult::GateUnsatisfied,
-    );
-    assert_eq!(
-        publication.disposition(),
-        evidence_registry::ReviewAdmissionSection83Disposition::ReviewAdmissionRejected,
-    );
-    assert!(store_dir
-        .path
-        .join("journal/00000000000000000006.cbor")
-        .exists());
-    assert_eq!(
-        fs::read_dir(store_dir.path.join("records"))
-            .unwrap()
-            .count(),
-        retained_record_count + 1
-    );
-
-    let replayed = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    assert_eq!(
-        replayed.retained_journal().current_head_reference(),
-        publication.journal_reference().clone(),
-    );
-    assert_eq!(
-        replayed.resolve(publication.admission_record().record_id()),
-        Some(publication.admission_record_bytes()),
-    );
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn gate_scope_1015_mismatch_remains_unpublished_behind_generic_scope_hold() {
-    let fixture = authoritative_review_admission_fixture(false);
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-    let section_82 = store
-        .complete_authoritative_review_admission_section_82(accepted)
-        .unwrap();
-    let completion = evaluate_authoritative_review_admission_policy_46(&section_82);
-    assert_eq!(
-        completion.result(),
-        ReviewAdmissionCompletedPolicyResult::GateUnsatisfied,
-    );
-    assert_eq!(
-        completion
-            .evaluator_results()
-            .iter()
-            .find(|result| result.evaluator_id() == 1015)
-            .map(|result| result.outcome()),
-        Some(ReviewAdmissionIndividualEvaluatorOutcome::Fail),
-    );
-
-    let fixture = authoritative_review_admission_fixture(false);
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
-        .unwrap()
-        .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-    assert_eq!(
-        store
-            .complete_authoritative_review_admission(accepted)
-            .unwrap(),
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::PolicyScopeApplicabilityUnavailable,
-        ),
-    );
-    assert!(!store_dir
-        .path
-        .join("journal/00000000000000000006.cbor")
-        .exists());
-    assert_eq!(
-        fs::read_dir(store_dir.path.join("records"))
-            .unwrap()
-            .count(),
-        retained_record_count
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
 }
 
@@ -3292,26 +2898,9 @@ fn authoritative_policy_context_unsupported_never_becomes_a_completed_policy_res
         },
     );
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
     assert_eq!(
-        store
-            .complete_authoritative_review_admission(accepted)
-            .unwrap(),
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
-                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
-                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported,
-                ),
-            ),
-        ),
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
 }
 
@@ -3386,7 +2975,7 @@ fn authoritative_replay_does_not_promote_locally_framed_terminal_admission_histo
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
-fn authoritative_replay_rejects_accepted_disposition_when_exact_scope_evaluation_fails() {
+fn authoritative_replay_does_not_claim_disposition_without_frozen_scope_applicability() {
     let fixture = authoritative_review_admission_fixture(false);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
     let request = ReviewRequestRecord::decode_authoritative(&fixture.request_bytes).unwrap();
@@ -3426,7 +3015,7 @@ fn authoritative_replay_rejects_accepted_disposition_when_exact_scope_evaluation
 
     assert_eq!(
         AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
-        evidence_registry::AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
 }
 
@@ -3477,7 +3066,10 @@ fn authoritative_replay_validates_multi_context_request_before_semantic_authorit
     fixture.journal_entry_bytes.truncate(5);
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
 
-    let _store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -3619,7 +3211,10 @@ fn authoritative_open_tolerates_bounded_publication_temp_residue_without_stealin
         .join("records/.evidence-registry-publish-4294967295-1.tmp");
     fs::write(&residue, b"crash residue").unwrap();
 
-    let _store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
     assert!(
         residue.exists(),
         "opening must not delete a possibly live concurrent publisher's temp"
@@ -3647,7 +3242,10 @@ fn authoritative_open_recovers_the_hardlink_publish_crash_window() {
         .join("journal/.evidence-registry-publish-700-2.tmp");
     fs::hard_link(&journal_path, &journal_temp).unwrap();
 
-    let _store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
+    assert_eq!(
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
+    );
     assert!(record_temp.exists());
     assert!(journal_temp.exists());
 }
@@ -3667,133 +3265,14 @@ fn authoritative_runtime_keeps_policy_context_unsupported_preterminal_and_unpubl
         },
     );
     let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
     assert_eq!(
-        store
-            .complete_authoritative_review_admission(accepted)
-            .unwrap(),
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
-                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
-                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported,
-                ),
-            ),
-        ),
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
     assert!(!store_dir
         .path
         .join("journal/00000000000000000006.cbor")
         .exists());
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_store_policy_46_keeps_unsupported_context_preterminal_and_unpublished() {
-    let fixture = authoritative_review_admission_fixture_with_overrides(
-        true,
-        &[5],
-        IdentityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        ReviewAdmissionFixtureOverrides {
-            policy_context_id: Some(5),
-            ..Default::default()
-        },
-    );
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
-        .unwrap()
-        .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
-    assert_eq!(
-        store.complete_authoritative_review_admission_policy_46(accepted),
-        evidence_registry::AuthoritativeReviewAdmissionPolicy46Outcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
-                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
-                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported,
-                ),
-            ),
-        ),
-    );
-    assert!(!store_dir
-        .path
-        .join("journal/00000000000000000006.cbor")
-        .exists());
-    assert_eq!(
-        fs::read_dir(store_dir.path.join("records"))
-            .unwrap()
-            .count(),
-        retained_record_count
-    );
-}
-
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-#[test]
-fn authoritative_exact_terminal_route_keeps_unsupported_context_preterminal_and_unpublished() {
-    let fixture = authoritative_review_admission_fixture_with_overrides(
-        true,
-        &[5],
-        IdentityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        AuthorityDependencyMode::Exact,
-        ReviewAdmissionFixtureOverrides {
-            policy_context_id: Some(5),
-            ..Default::default()
-        },
-    );
-    let store_dir = AuthoritativeReviewStoreFixtureDir::from_fixture(&fixture);
-    let retained_record_count = fs::read_dir(store_dir.path.join("records"))
-        .unwrap()
-        .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
-
-    assert_eq!(
-        store
-            .complete_authoritative_review_admission_exact_review_scope_profile(accepted)
-            .unwrap(),
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::Structural(
-                ReviewAdmissionSection82AuthorityError::PolicyContextPrerequisites(
-                    ReviewAdmissionPolicyContextPrerequisitesError::PolicyContextUnsupported,
-                ),
-            ),
-        ),
-    );
-    assert!(!store_dir
-        .path
-        .join("journal/00000000000000000006.cbor")
-        .exists());
-    assert_eq!(
-        fs::read_dir(store_dir.path.join("records"))
-            .unwrap()
-            .count(),
-        retained_record_count
-    );
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -3804,22 +3283,9 @@ fn authoritative_runtime_does_not_promote_unfrozen_generic_gate_scope_semantics(
     let retained_record_count = fs::read_dir(store_dir.path.join("records"))
         .unwrap()
         .count();
-    let mut store = AuthoritativeRegistryStore::open(&store_dir.path).unwrap();
-    let accepted = store
-        .accept_authoritative_review_admission(
-            fixture.request_reference.clone(),
-            &fixture.request_bytes,
-            fixture.result_reference.clone(),
-            &fixture.result_bytes,
-        )
-        .unwrap();
     assert_eq!(
-        store
-            .complete_authoritative_review_admission(accepted)
-            .unwrap(),
-        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
-            evidence_registry::AuthoritativeReviewAdmissionSection82Error::PolicyScopeApplicabilityUnavailable,
-        ),
+        AuthoritativeRegistryStore::open(&store_dir.path).unwrap_err(),
+        evidence_registry::AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable,
     );
     assert!(!store_dir
         .path

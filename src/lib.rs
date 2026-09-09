@@ -11,11 +11,10 @@ use std::sync::Arc;
 
 mod authoritative_store;
 pub use authoritative_store::{
-    evaluate_authoritative_review_admission_policy_46, AcceptedAuthoritativeReviewAdmission,
-    AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError,
-    AuthoritativePublicationDurability, AuthoritativeRegistryStore,
-    AuthoritativeRegistryStoreOpenError, AuthoritativeReviewAdmissionAcceptanceError,
-    AuthoritativeReviewAdmissionPolicy46Outcome, AuthoritativeReviewAdmissionPublication,
+    AcceptedAuthoritativeReviewAdmission, AuthoritativeFreezeCommittedBinding,
+    AuthoritativeFreezeCommittedBindingError, AuthoritativePublicationDurability,
+    AuthoritativeRegistryStore, AuthoritativeRegistryStoreOpenError,
+    AuthoritativeReviewAdmissionAcceptanceError, AuthoritativeReviewAdmissionPublication,
     AuthoritativeReviewAdmissionPublicationError,
     AuthoritativeReviewAdmissionPublishedReceiptUncertain,
     AuthoritativeReviewAdmissionRuntimeError, AuthoritativeReviewAdmissionRuntimeOutcome,
@@ -3247,82 +3246,6 @@ impl ManifestRecord {
     }
 }
 
-/// A selected Manifest profile is outside the adopted prospective Freeze lane.
-///
-/// This is a semantic precondition only. A successful result does not establish
-/// Store provenance, Policy completion, Freeze authority, event legality, or
-/// publication.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FreezeManifestProfileError {
-    UnsupportedPathIdentityProfile,
-    UnsupportedDigestProfile,
-    InvalidUtf8PathComponent,
-    NonCanonicalArtifactOrder,
-    AbsoluteRootPathComponent,
-    DrivePrefixPathComponent,
-}
-
-/// Validates the numeric Manifest profile selections adopted for the prospective
-/// Freeze lane.
-///
-/// The adopted successor assigns only path profile `1` (`UTF8_STRICT_V1`) and
-/// digest profile `1` (`SHA256_ONLY_V1`) to this lane. Other profile IDs remain
-/// pre-completion and receive no inferred equivalent semantics.
-pub fn validate_freeze_manifest_profile(
-    manifest: &ManifestRecord,
-) -> Result<(), FreezeManifestProfileError> {
-    if manifest.input().path_identity_profile_id != 1 {
-        return Err(FreezeManifestProfileError::UnsupportedPathIdentityProfile);
-    }
-    if manifest.input().digest_profile_id != 1 {
-        return Err(FreezeManifestProfileError::UnsupportedDigestProfile);
-    }
-    if manifest
-        .input()
-        .artifacts
-        .iter()
-        .flat_map(|artifact| artifact.path_components.iter())
-        .any(|component| std::str::from_utf8(component).is_err())
-    {
-        return Err(FreezeManifestProfileError::InvalidUtf8PathComponent);
-    }
-    if manifest
-        .input()
-        .artifacts
-        .iter()
-        .flat_map(|artifact| artifact.path_components.iter())
-        .any(|component| component == b"/")
-    {
-        return Err(FreezeManifestProfileError::AbsoluteRootPathComponent);
-    }
-    if manifest
-        .input()
-        .artifacts
-        .iter()
-        .flat_map(|artifact| artifact.path_components.iter())
-        .any(|component| matches!(component.as_slice(), [drive, b':', ..] if drive.is_ascii_alphabetic()))
-    {
-        return Err(FreezeManifestProfileError::DrivePrefixPathComponent);
-    }
-    if manifest.input().artifacts.windows(2).any(|pair| {
-        canonical_manifest_path_ordering(&pair[0].path_components, &pair[1].path_components)
-            != std::cmp::Ordering::Less
-    }) {
-        return Err(FreezeManifestProfileError::NonCanonicalArtifactOrder);
-    }
-    Ok(())
-}
-
-fn canonical_manifest_path_ordering(left: &[Vec<u8>], right: &[Vec<u8>]) -> std::cmp::Ordering {
-    for (left_component, right_component) in left.iter().zip(right) {
-        let ordering = left_component.cmp(right_component);
-        if ordering != std::cmp::Ordering::Equal {
-            return ordering;
-        }
-    }
-    left.len().cmp(&right.len())
-}
-
 /// The exact local fields from the frozen POLICY shape with no optional
 /// requirements. This is a declared-context witness only; it does not establish
 /// Policy authority, satisfaction, admission, or a lifecycle outcome.
@@ -3780,13 +3703,16 @@ pub enum ReviewAdmissionPolicyContextDeclaration {
     PolicyContextUnsupported,
 }
 
-/// Requires the exact v0.4 `{ REVIEW_ADMISSION }` declaration before §46
-/// evaluation. Other declared contexts are not hidden gates, but they are not
-/// part of this adopted profile either.
+/// Requires an explicit REVIEW_ADMISSION declaration before §46 requirement
+/// evaluation. Other explicitly declared contexts remain separate and do not
+/// become hidden gates for this operation.
 pub fn check_review_admission_policy_context(
     policy: &ReviewAdmissionPolicyRecord,
 ) -> ReviewAdmissionPolicyContextDeclaration {
-    if policy.supported_context_ids() == [PolicyEvaluationContext::ReviewAdmission.id()] {
+    if policy
+        .supported_context_ids()
+        .contains(&PolicyEvaluationContext::ReviewAdmission.id())
+    {
         ReviewAdmissionPolicyContextDeclaration::Declared
     } else {
         ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported
@@ -4003,46 +3929,6 @@ pub fn resolve_review_admission_exact_scope_profile(
     Ok(scope)
 }
 
-/// Fail-closed outcomes while resolving the adopted profile-2 Freeze Commit
-/// minimal Policy marker.
-///
-/// These are pre-completion inputs, never evaluator results or Freeze terminal
-/// dispositions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FreezeCommitMinimalPolicyScopeProfileError {
-    ScopePayloadUnavailable,
-    ScopeDecode,
-    ScopeIdentityMismatch,
-    UnsupportedProfile,
-}
-
-/// Resolves the exact typed SCOPE Record selected by the adopted
-/// `FREEZE_COMMIT_MINIMAL_POLICY_MARKER` profile.
-///
-/// This validates profile `(2, 1)` and an empty payload only. It does not infer
-/// a target relation, Policy completion, Freeze authority, event legality, or
-/// publication.
-pub fn resolve_freeze_commit_minimal_policy_scope_profile(
-    scope_ref: RecordId,
-    resolver: &impl ExactRecordByteResolver,
-) -> Result<ScopeRecord, FreezeCommitMinimalPolicyScopeProfileError> {
-    let scope_bytes = resolver
-        .resolve(scope_ref)
-        .ok_or(FreezeCommitMinimalPolicyScopeProfileError::ScopePayloadUnavailable)?;
-    let scope = ScopeRecord::decode_authoritative(scope_bytes)
-        .map_err(|_| FreezeCommitMinimalPolicyScopeProfileError::ScopeDecode)?;
-    if scope.record_id() != scope_ref {
-        return Err(FreezeCommitMinimalPolicyScopeProfileError::ScopeIdentityMismatch);
-    }
-    if scope.input().scope_profile_id != 2
-        || scope.input().scope_profile_version != 1
-        || !scope.input().scope_payload.is_empty()
-    {
-        return Err(FreezeCommitMinimalPolicyScopeProfileError::UnsupportedProfile);
-    }
-    Ok(scope)
-}
-
 /// Exact structural facts established before the v0.4 profile-specific
 /// Review Admission gate-Scope evaluator may be considered.
 ///
@@ -4149,7 +4035,7 @@ pub struct PolicyEvaluatorRegistration {
     pub name: &'static str,
 }
 
-const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 15] = [
+const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 14] = [
     PolicyEvaluatorRegistration {
         id: 1001,
         name: "POLICY_REVIEW_REQUIREMENT_MATCH",
@@ -4205,10 +4091,6 @@ const POLICY_EVALUATOR_REGISTRY: [PolicyEvaluatorRegistration; 15] = [
     PolicyEvaluatorRegistration {
         id: 1014,
         name: "POLICY_SUPPORTED_CONTEXT",
-    },
-    PolicyEvaluatorRegistration {
-        id: 1015,
-        name: "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING",
     },
 ];
 
