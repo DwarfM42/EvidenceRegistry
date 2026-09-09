@@ -1,6 +1,7 @@
 use evidence_registry::{
-    resolve_minimal_policy_gate_scope, ExactRecordByteResolver, MinimalPolicyRecord,
-    PolicyScopeStructuralBindingError, RecordId, RecordTypeId, ScopeRecord, StrictRecordFrame,
+    resolve_freeze_commit_minimal_policy_scope_profile, resolve_minimal_policy_gate_scope,
+    ExactRecordByteResolver, MinimalPolicyRecord, PolicyScopeStructuralBindingError, RecordId,
+    RecordTypeId, ScopeRecord, StrictRecordFrame,
 };
 
 const SCOPE_RECORD_NO_LABEL_HEX: &str =
@@ -160,5 +161,21 @@ fn minimal_policy_scope_binding_fails_closed_for_unavailable_invalid_or_wrong_id
     assert_eq!(
         resolve_minimal_policy_gate_scope(&policy, &different_valid_scope),
         Err(PolicyScopeStructuralBindingError::ScopeIdentityMismatch)
+    );
+}
+
+#[test]
+fn freeze_commit_scope_profile_accepts_the_adopted_empty_profile_marker() {
+    let scope_bytes = hex_bytes(
+        "84781a45766964656e636552656769737472792e5265636f72642e76311401a500010114100211011240",
+    );
+    let scope = ScopeRecord::decode_authoritative(&scope_bytes).unwrap();
+    let resolver = FixtureRecordResolver {
+        records: vec![(scope.record_id(), scope_bytes)],
+    };
+
+    assert_eq!(
+        resolve_freeze_commit_minimal_policy_scope_profile(scope.record_id(), &resolver),
+        Ok(scope)
     );
 }

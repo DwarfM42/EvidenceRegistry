@@ -404,6 +404,17 @@ pub enum AuthoritativeReviewAdmissionRuntimeOutcome {
     PublishedReceiptUncertain(Box<AuthoritativeReviewAdmissionPublishedReceiptUncertain>),
 }
 
+/// The Store-owned non-mutating §46 result for the adopted exact Review Scope profile.
+///
+/// This boundary consumes an opaque accepted Review presentation, reconstructs §82 from retained
+/// Store bytes, and only then evaluates the bounded profile-1/version-1 gate-Scope rule. It does
+/// not select a §83 disposition, construct an Admission, append a Journal entry, or publish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthoritativeReviewAdmissionPolicy46Outcome {
+    PreTerminal(AuthoritativeReviewAdmissionSection82Error),
+    Completed(ReviewAdmissionPolicy46Completion),
+}
+
 /// A failure after a terminal disposition was derived but before a durable publication receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthoritativeReviewAdmissionPublicationError {
@@ -652,7 +663,7 @@ impl AuthoritativeRegistryStore {
                 .map_err(|_| AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged)?;
         }
 
-        Ok(Self {
+        let mut store = Self {
             root,
             retained_journal,
             records,
@@ -661,7 +672,9 @@ impl AuthoritativeRegistryStore {
             live_instance_identity: Arc::new(AuthoritativeRegistryStoreInstanceIdentity {
                 outstanding_review_admissions: AtomicUsize::new(0),
             }),
-        })
+        };
+        store.validate_replayed_exact_review_admission_terminals()?;
+        Ok(store)
     }
 
     /// The canonical root locator from which this store's authority namespaces were opened.
@@ -669,13 +682,84 @@ impl AuthoritativeRegistryStore {
         &self.root
     }
 
+    fn validate_replayed_exact_review_admission_terminals(
+        &mut self,
+    ) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+        let terminal_entries: Vec<_> = self
+            .retained_journal
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.event_type_id().value(), 302 | 303))
+            .map(|entry| {
+                (
+                    entry.event_type_id().value(),
+                    record_id_from_event_reference(&JournalReference::new(
+                        entry.registry_id(),
+                        entry.entry_index(),
+                        entry.entry_hash(),
+                        entry.event_type_id(),
+                        entry.event_record_id(),
+                    )),
+                )
+            })
+            .collect();
+        for (event_type, admission_record_id) in terminal_entries {
+            let admission_bytes = self
+                .resolve(admission_record_id)
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordUnavailable)?
+                .to_vec();
+            let admission = ReviewAdmissionRecord::decode_authoritative(&admission_bytes)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let request_reference = admission
+                .review_request_ref()
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let result_reference = admission
+                .review_result_ref()
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let request_bytes = self
+                .resolve(record_id_from_event_reference(request_reference))
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordUnavailable)?
+                .to_vec();
+            let result_bytes = self
+                .resolve(record_id_from_event_reference(result_reference))
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordUnavailable)?
+                .to_vec();
+            let section_82 = self
+                .complete_authoritative_review_admission_section_82_from_store_inputs(
+                    request_reference,
+                    &request_bytes,
+                    result_reference,
+                    &result_bytes,
+                    admission.operation_start_journal_ref(),
+                )
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            if section_82.policy_authority_ref()
+                != admission
+                    .policy_authority_ref()
+                    .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+            {
+                return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+            }
+            let completion = evaluate_authoritative_review_admission_policy_46(&section_82);
+            let expected = match completion.result() {
+                ReviewAdmissionCompletedPolicyResult::Satisfied => (302, 1),
+                ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+                | ReviewAdmissionCompletedPolicyResult::GateIndeterminate => (303, 2),
+            };
+            if (event_type, admission.disposition_id()) != expected {
+                return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+            }
+        }
+        Ok(())
+    }
+
     /// The exact retained Journal reconstructed from the authoritative Journal namespace.
     pub fn retained_journal(&self) -> &RetainedJournal {
         &self.retained_journal
     }
 
-    /// Validates exact retained Freeze bindings and fails closed before positive authority where
-    /// frozen generic Policy-Scope and selected Manifest-profile semantics remain unavailable.
+    /// Validates exact retained Freeze bindings and derives authority only for the adopted
+    /// zero-requirement Freeze Commit Policy profile.
     pub fn validate_freeze_committed_authority(
         &self,
         committed_event_reference: JournalReference,
@@ -691,7 +775,77 @@ impl AuthoritativeRegistryStore {
         {
             ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable => {}
         }
-        Err(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)
+
+        let receipt_record_id = record_id_from_event_reference(&committed_event_reference);
+        let receipt_bytes = self
+            .records
+            .binary_search_by(|(stored_id, _)| {
+                stored_id.as_bytes().cmp(receipt_record_id.as_bytes())
+            })
+            .ok()
+            .map(|index| self.records[index].1.as_slice())
+            .ok_or(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)?;
+        let receipt = FreezeReceiptRecord::decode_authoritative(receipt_bytes)
+            .map_err(|_| AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)?;
+
+        let manifest_record_id = receipt.input().manifest_id;
+        let manifest_bytes = self
+            .records
+            .binary_search_by(|(stored_id, _)| {
+                stored_id.as_bytes().cmp(manifest_record_id.as_bytes())
+            })
+            .ok()
+            .map(|index| self.records[index].1.as_slice())
+            .ok_or(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)?;
+        let manifest = ManifestRecord::decode_authoritative(manifest_bytes)
+            .map_err(|_| AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)?;
+        if manifest.record_id() != manifest_record_id {
+            return Err(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable);
+        }
+        validate_freeze_manifest_profile(&manifest)
+            .map_err(|_| AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)?;
+
+        let policy_record_id = receipt.input().policy_record_id;
+        let policy_bytes = self
+            .records
+            .binary_search_by(|(stored_id, _)| {
+                stored_id.as_bytes().cmp(policy_record_id.as_bytes())
+            })
+            .ok()
+            .map(|index| self.records[index].1.as_slice())
+            .ok_or(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)?;
+        let policy = MinimalPolicyRecord::decode_authoritative(policy_bytes)
+            .map_err(|_| AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)?;
+        if policy.record_id() != policy_record_id || policy.supported_context_ids() != [1] {
+            return Err(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable);
+        }
+        let scope =
+            resolve_minimal_policy_gate_scope(&policy, &RecordNamespaceResolver(&self.records))
+                .map_err(|_| {
+                    AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable
+                })?;
+        let scope_input = scope.scope_record().input();
+        if scope_input.scope_profile_id != 2
+            || scope_input.scope_profile_version != 1
+            || !scope_input.scope_payload.is_empty()
+        {
+            return Err(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable);
+        }
+
+        Ok(AuthoritativeFreezeCommittedBinding {
+            registry_id: committed_event_reference.registry_id(),
+            committed_event_reference,
+            start_event_reference: receipt.input().attempt_start_journal_ref.clone(),
+            receipt_record_id,
+            manifest_record_id,
+            start_record_id: record_id_from_event_reference(
+                &receipt.input().attempt_start_journal_ref,
+            ),
+            freeze_attempt_id: receipt.input().freeze_attempt_id,
+            freeze_id: receipt.input().freeze_id,
+            subject_id: receipt.input().subject_id,
+            policy_record_id,
+        })
     }
 
     /// Accepts one bounded opaque Request/Result presentation and binds the exact authoritative
@@ -798,9 +952,26 @@ impl AuthoritativeRegistryStore {
                     unreachable!("namespace reload does not inspect opaque input allocation")
                 }
             })?;
+        self.complete_authoritative_review_admission_section_82_from_store_inputs(
+            &accepted.request_event_reference,
+            &accepted.request_bytes,
+            &accepted.result_event_reference,
+            &accepted.result_bytes,
+            &accepted.operation_start_journal_ref,
+        )
+    }
 
-        let request_record_id = record_id_from_event_reference(&accepted.request_event_reference);
-        let result_record_id = record_id_from_event_reference(&accepted.result_event_reference);
+    fn complete_authoritative_review_admission_section_82_from_store_inputs(
+        &mut self,
+        request_event_reference: &JournalReference,
+        presented_request_bytes: &[u8],
+        result_event_reference: &JournalReference,
+        presented_result_bytes: &[u8],
+        operation_start_journal_ref: &JournalReference,
+    ) -> Result<AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error>
+    {
+        let request_record_id = record_id_from_event_reference(request_event_reference);
+        let result_record_id = record_id_from_event_reference(result_event_reference);
         let request_bytes = self
             .resolve(request_record_id)
             .ok_or(AuthoritativeReviewAdmissionSection82Error::RequestPayloadUnavailable)?
@@ -809,34 +980,34 @@ impl AuthoritativeRegistryStore {
             .resolve(result_record_id)
             .ok_or(AuthoritativeReviewAdmissionSection82Error::ResultPayloadUnavailable)?
             .to_vec();
-        if accepted.request_bytes != request_bytes {
+        if presented_request_bytes != request_bytes {
             return Err(AuthoritativeReviewAdmissionSection82Error::PresentedRequestMismatch);
         }
-        if accepted.result_bytes != result_bytes {
+        if presented_result_bytes != result_bytes {
             return Err(AuthoritativeReviewAdmissionSection82Error::PresentedResultMismatch);
         }
 
         validate_review_admission_section_82_structural_inputs(
             &self.retained_journal,
-            &accepted.request_event_reference,
+            request_event_reference,
             &request_bytes,
-            &accepted.result_event_reference,
+            result_event_reference,
             &result_bytes,
             self,
         )
         .map_err(AuthoritativeReviewAdmissionSection82Error::Structural)?;
         self.retained_journal
-            .resolve_reference(&accepted.operation_start_journal_ref)
+            .resolve_reference(operation_start_journal_ref)
             .map_err(AuthoritativeReviewAdmissionSection82Error::OperationStartReference)?;
-        if accepted.request_event_reference.entry_index().value()
-            > accepted.operation_start_journal_ref.entry_index().value()
+        if request_event_reference.entry_index().value()
+            > operation_start_journal_ref.entry_index().value()
         {
             return Err(
                 AuthoritativeReviewAdmissionSection82Error::RequestAuthorityAfterOperationStart,
             );
         }
-        if accepted.result_event_reference.entry_index().value()
-            > accepted.operation_start_journal_ref.entry_index().value()
+        if result_event_reference.entry_index().value()
+            > operation_start_journal_ref.entry_index().value()
         {
             return Err(
                 AuthoritativeReviewAdmissionSection82Error::ResultAuthorityAfterOperationStart,
@@ -849,9 +1020,9 @@ impl AuthoritativeRegistryStore {
             .expect("the structural §82 validator strictly decoded the Result");
         let returned_anchor = resolve_retained_review_package_anchor_input(
             &self.retained_journal,
-            &accepted.request_event_reference,
+            request_event_reference,
             &request_bytes,
-            &accepted.result_event_reference,
+            result_event_reference,
             &result_bytes,
         )
         .expect("the structural §82 validator resolved the returned Anchor");
@@ -878,9 +1049,9 @@ impl AuthoritativeRegistryStore {
             .map_err(AuthoritativeReviewAdmissionSection82Error::FreezeAuthority)?;
 
         Ok(AuthoritativeReviewAdmissionSection82 {
-            operation_start_journal_ref: accepted.operation_start_journal_ref.clone(),
-            request_event_reference: accepted.request_event_reference.clone(),
-            result_event_reference: accepted.result_event_reference.clone(),
+            operation_start_journal_ref: operation_start_journal_ref.clone(),
+            request_event_reference: request_event_reference.clone(),
+            result_event_reference: result_event_reference.clone(),
             request,
             result,
             policy,
@@ -890,6 +1061,48 @@ impl AuthoritativeRegistryStore {
             policy_context_prerequisites,
             freeze_authority,
         })
+    }
+
+    /// Consumes one authoritative acceptance through the adopted exact Review Scope §46 boundary.
+    ///
+    /// This is deliberately narrower than the production runtime route: it cannot infer generic
+    /// Scope applicability and has no terminal or publication effect.
+    pub fn complete_authoritative_review_admission_policy_46(
+        &mut self,
+        accepted: AcceptedAuthoritativeReviewAdmission,
+    ) -> AuthoritativeReviewAdmissionPolicy46Outcome {
+        let section_82 = match self.complete_authoritative_review_admission_section_82(accepted) {
+            Ok(section_82) => section_82,
+            Err(error) => return AuthoritativeReviewAdmissionPolicy46Outcome::PreTerminal(error),
+        };
+        AuthoritativeReviewAdmissionPolicy46Outcome::Completed(
+            evaluate_authoritative_review_admission_policy_46(&section_82),
+        )
+    }
+
+    /// Executes the adopted profile-1 exact Review Scope path through §83 and terminal publication.
+    ///
+    /// Unlike the generic runtime route, this method is available only after Store-owned §82
+    /// resolution establishes the adopted Review Admission context and exact Scope prerequisites.
+    /// It leaves the generic Scope-applicability hold unchanged for every other profile or context.
+    pub fn complete_authoritative_review_admission_exact_review_scope_profile(
+        &mut self,
+        accepted: AcceptedAuthoritativeReviewAdmission,
+    ) -> Result<AuthoritativeReviewAdmissionRuntimeOutcome, AuthoritativeReviewAdmissionRuntimeError>
+    {
+        let section_82 = match self.complete_authoritative_review_admission_section_82(accepted) {
+            Ok(section_82) => section_82,
+            Err(error) => {
+                return Ok(AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
+                    error,
+                ));
+            }
+        };
+        let policy_completion = evaluate_authoritative_review_admission_policy_46(&section_82);
+        self.publish_authoritative_review_admission_from_completed_policy(
+            section_82,
+            policy_completion,
+        )
     }
 
     /// Executes authoritative §82, §46, §83, terminal construction, and durable publication.
@@ -918,7 +1131,19 @@ impl AuthoritativeRegistryStore {
                 AuthoritativeReviewAdmissionSection82Error::PolicyScopeApplicabilityUnavailable,
             ));
         }
-        let policy_completion = evaluate_unfrozen_review_admission_policy_profile(&section_82);
+        let policy_completion = evaluate_authoritative_review_admission_policy_46(&section_82);
+        self.publish_authoritative_review_admission_from_completed_policy(
+            section_82,
+            policy_completion,
+        )
+    }
+
+    fn publish_authoritative_review_admission_from_completed_policy(
+        &mut self,
+        section_82: AuthoritativeReviewAdmissionSection82,
+        policy_completion: ReviewAdmissionPolicy46Completion,
+    ) -> Result<AuthoritativeReviewAdmissionRuntimeOutcome, AuthoritativeReviewAdmissionRuntimeError>
+    {
         let policy_route =
             ReviewAdmissionPolicy46RouteOutcome::Completed(policy_completion.clone());
         let disposition = derive_review_admission_section_83_disposition(&policy_route);
@@ -1582,10 +1807,12 @@ fn frozen_generic_policy_scope_applicability_unavailable() -> bool {
     true
 }
 
-/// Retains the previously implemented profile-specific composition behind the fixed frozen-Scope
-/// fail-closed gate. Evaluator 1015 is not assigned by the governing frozen v0.3 authorities, so
-/// this helper is private and cannot authorize §46 completion or terminal publication.
-fn evaluate_unfrozen_review_admission_policy_profile(
+/// Evaluates the adopted profile-1 exact Scope binding only from a successful
+/// Store-owned §82 witness.
+///
+/// This is a non-mutating §46 boundary. It does not select §83 disposition,
+/// construct an Admission, append a Journal entry, or publish any bytes.
+pub fn evaluate_authoritative_review_admission_policy_46(
     section_82: &AuthoritativeReviewAdmissionSection82,
 ) -> ReviewAdmissionPolicy46Completion {
     evaluate_profile_requirements_without_generic_scope(
@@ -1593,6 +1820,7 @@ fn evaluate_unfrozen_review_admission_policy_profile(
         section_82.request(),
         section_82.result(),
         section_82.anchor_comparison(),
+        Some(section_82.policy_context_prerequisites()),
     )
 }
 
@@ -1601,6 +1829,7 @@ fn evaluate_profile_requirements_without_generic_scope(
     request: &ReviewRequestRecord,
     result: &ReviewResultRecord,
     anchor_comparison: JournalAnchorHistoryComparison,
+    exact_scope_prerequisites: Option<ReviewAdmissionPolicyContextPrerequisites>,
 ) -> ReviewAdmissionPolicy46Completion {
     let mut evaluator_results = Vec::with_capacity(4);
 
@@ -1642,6 +1871,15 @@ fn evaluate_profile_requirements_without_generic_scope(
                 policy
                     .acceptable_anchor_relation_ids()
                     .contains(&anchor_relation_id(anchor_comparison)),
+            ),
+        });
+    }
+
+    if let Some(prerequisites) = exact_scope_prerequisites {
+        evaluator_results.push(ReviewAdmissionIndividualEvaluatorResult {
+            evaluator_id: 1015,
+            outcome: pass_or_fail(
+                prerequisites.gate_scope_ref() == prerequisites.common_review_scope_ref(),
             ),
         });
     }
@@ -4997,11 +5235,33 @@ fn decode_policy_supported_contexts(record_bytes: &[u8]) -> Result<Vec<u64>, Rec
     supported_contexts.ok_or(RecordDecodeError)
 }
 
+/// The limited Freeze policy profile can prove only the zero-requirement completion.
+///
+/// The adopted successor preserves evaluator 1008's identity, but its frozen inputs do not
+/// determine the evaluator predicate. A present `minimum_durability` field therefore remains an
+/// authority-semantic gap rather than becoming a handwritten terminal-legality decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreezeCommitPolicyRequirementsOutcome {
+    ZeroRequirements,
+    MinimumDurabilityEvaluatorUnavailable,
+}
+
 fn validate_freeze_commit_policy_requirements(
     receipt_record_bytes: &[u8],
     records: &[(RecordId, Vec<u8>)],
-) -> Result<(), RecordDecodeError> {
+) -> Result<FreezeCommitPolicyRequirementsOutcome, RecordDecodeError> {
     let receipt = FreezeReceiptRecord::decode_authoritative(receipt_record_bytes)?;
+    let manifest_record_id = receipt.input().manifest_id;
+    let manifest_bytes = records
+        .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(manifest_record_id.as_bytes()))
+        .ok()
+        .map(|index| records[index].1.as_slice())
+        .ok_or(RecordDecodeError)?;
+    let manifest = ManifestRecord::decode_authoritative(manifest_bytes)?;
+    if manifest.record_id() != manifest_record_id {
+        return Err(RecordDecodeError);
+    }
+    validate_freeze_manifest_profile(&manifest).map_err(|_| RecordDecodeError)?;
     let policy_record_id = receipt.input().policy_record_id;
     let policy_bytes = records
         .binary_search_by(|(stored_id, _)| stored_id.as_bytes().cmp(policy_record_id.as_bytes()))
@@ -5015,11 +5275,18 @@ fn validate_freeze_commit_policy_requirements(
     validate_policy_record_schema(policy_bytes)?;
 
     let (mut cursor, field_count) = decode_event_record_body(policy_bytes, 40)?;
+    let mut gate_scope_ref = None;
     let mut contexts = None;
     let mut minimum_durability = None;
     for _ in 0..field_count {
         let key = cursor.uint().map_err(|_| RecordDecodeError)?;
         match key {
+            16 => {
+                gate_scope_ref = Some(
+                    RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
+                        .map_err(|_| RecordDecodeError)?,
+                )
+            }
             23 => {
                 cursor.map_exact(4).map_err(|_| RecordDecodeError)?;
                 let mut requirements = [false; 4];
@@ -5031,31 +5298,28 @@ fn validate_freeze_commit_policy_requirements(
                 }
                 minimum_durability = Some(requirements);
             }
+            29 => decode_journal_reference_value(&mut cursor)?,
             30 => {
                 contexts = Some(decode_nonempty_sorted_uint_set(&mut cursor, |value| {
                     matches!(value, 1..=5)
                 })?);
             }
-            _ => cursor.skip_value().map_err(|_| RecordDecodeError)?,
+            _ => return Err(RecordDecodeError),
         }
     }
-    if !cursor.finished() || !contexts.ok_or(RecordDecodeError)?.contains(&1) {
+    if !cursor.finished() || contexts.as_deref() != Some(&[1]) {
         return Err(RecordDecodeError);
     }
-    if let Some(
-        [require_file_content_flush, require_atomic_publish_no_replace, require_parent_directory_flush, require_platform_strongest_available],
-    ) = minimum_durability
-    {
-        if require_file_content_flush && receipt.input().file_content_flush_state != 1
-            || require_atomic_publish_no_replace
-                && receipt.input().atomic_publish_no_replace_state != 1
-            || require_parent_directory_flush && receipt.input().parent_directory_flush_state != 1
-            || require_platform_strongest_available && !receipt.input().platform_strongest_available
-        {
-            return Err(RecordDecodeError);
-        }
-    }
-    Ok(())
+    resolve_freeze_commit_minimal_policy_scope_profile(
+        gate_scope_ref.ok_or(RecordDecodeError)?,
+        &RecordNamespaceResolver(records),
+    )
+    .map_err(|_| RecordDecodeError)?;
+    Ok(if minimum_durability.is_some() {
+        FreezeCommitPolicyRequirementsOutcome::MinimumDurabilityEvaluatorUnavailable
+    } else {
+        FreezeCommitPolicyRequirementsOutcome::ZeroRequirements
+    })
 }
 
 fn validate_review_request_replay_contract(
@@ -5087,13 +5351,6 @@ fn validate_review_request_replay_contract(
         .chain([request.operation_start_journal_ref()])
     {
         validate_resolved_prior_reference(retained_journal, entry, reference)?;
-    }
-    let policy_contexts = decode_policy_supported_contexts(record_bytes_for_reference(
-        records,
-        request.policy_authority_ref(),
-    )?)?;
-    if !policy_contexts.contains(&5) {
-        return Err(RecordDecodeError);
     }
     let policy = ReviewAdmissionPolicyRecord::decode_authoritative(record_bytes_for_reference(
         records,
@@ -6084,8 +6341,12 @@ fn validate_authoritative_event_records(
                 {
                     ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable => {}
                 }
-                validate_freeze_commit_policy_requirements(record_bytes, records)
-                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                if validate_freeze_commit_policy_requirements(record_bytes, records)
+                    .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+                    == FreezeCommitPolicyRequirementsOutcome::MinimumDurabilityEvaluatorUnavailable
+                {
+                    semantic_authority_unavailable = true;
+                }
                 let record = FreezeReceiptRecord::decode_authoritative(record_bytes)
                     .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
                 if record.input().freeze_attempt_id.as_bytes() != &entry.lifecycle_object_id() {
@@ -6152,15 +6413,12 @@ fn event_semantic_authority_is_unavailable(
     event_type: u16,
     record_bytes: &[u8],
 ) -> Result<bool, RecordDecodeError> {
-    if matches!(
-        event_type,
-        200 | 300 | 301 | 302 | 303 | 500 | 501 | 600 | 700
-    ) {
+    if matches!(event_type, 200 | 500 | 501 | 600 | 700) {
         // The retained inputs do not uniquely re-establish all frozen contextual semantics for
         // these families: Verification-to-Freeze/Manifest continuity remains incomplete; generic
-        // Review Request, Review Result, Review Admission, and Closeout Policy satisfaction require
-        // an unassigned generic gate-Scope relation; Review Request also lacks positive Freeze
-        // authority; capability transition sets lack a frozen capability-ID mapping; and
+        // Closeout Policy satisfaction requires an unassigned generic gate-Scope relation;
+        // Review Request lacks positive Freeze authority; capability transition sets lack a
+        // frozen capability-ID mapping; and
         // Manifest-relative eviction Scope validation lacks assigned selected-profile semantics.
         // Type-local, event/body, dependency, and otherwise decidable contextual checks run before
         // this gate so malformed histories retain their more precise classification. A locally
@@ -10335,10 +10593,16 @@ os._exit(23)
 
     #[test]
     fn unsupported_contextual_event_semantics_fail_closed_before_positive_replay() {
-        for event_type in [200, 300, 301, 302, 303, 500, 501, 600, 700] {
+        for event_type in [200, 500, 501, 600, 700] {
             assert_eq!(
                 event_semantic_authority_is_unavailable(event_type, &[]),
                 Ok(true)
+            );
+        }
+        for event_type in [300, 301, 302, 303] {
+            assert_eq!(
+                event_semantic_authority_is_unavailable(event_type, &[]),
+                Ok(false)
             );
         }
     }

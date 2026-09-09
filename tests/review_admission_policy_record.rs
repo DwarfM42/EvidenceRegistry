@@ -352,7 +352,7 @@ fn review_admission_policy_preserves_context_unsupported_before_requirement_eval
 }
 
 #[test]
-fn review_admission_policy_allows_other_declared_contexts_without_inference() {
+fn review_admission_policy_requires_the_exact_review_admission_context_set() {
     let genesis = genesis();
     let mut policy_bytes = independently_construct_review_admission_policy(
         &genesis_reference(&genesis),
@@ -368,12 +368,12 @@ fn review_admission_policy_allows_other_declared_contexts_without_inference() {
 
     assert_eq!(
         check_review_admission_policy_context(&policy),
-        ReviewAdmissionPolicyContextDeclaration::Declared,
+        ReviewAdmissionPolicyContextDeclaration::PolicyContextUnsupported,
     );
 }
 
 #[test]
-fn unassigned_evaluator_1015_is_absent_and_distinct_scope_identities_remain_structural() {
+fn evaluator_1015_is_registered_and_distinct_scope_identities_remain_pre_evaluator_facts() {
     let genesis = genesis();
     let common_scope_bytes = independently_construct_exact_review_admission_scope();
     let common_scope_id =
@@ -419,9 +419,10 @@ fn unassigned_evaluator_1015_is_absent_and_distinct_scope_identities_remain_stru
     )
     .unwrap();
 
-    assert!(policy_evaluator_registry()
-        .iter()
-        .all(|registration| registration.id != 1015));
+    assert!(policy_evaluator_registry().iter().any(|registration| {
+        registration.id == 1015
+            && registration.name == "POLICY_REVIEW_ADMISSION_GATE_SCOPE_EXACT_BINDING"
+    }));
     assert_eq!(prerequisites.gate_scope_ref(), gate_scope_id);
     assert_eq!(prerequisites.common_review_scope_ref(), common_scope_id);
 }

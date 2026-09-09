@@ -70,6 +70,18 @@ fn minimal_policy_record_rejects_optional_requirements_and_does_not_infer_contex
         [0x11, 0x80],
     );
 
+    let mut minimum_durability_requirement = canonical.clone();
+    minimum_durability_requirement[map_offset] = 0xa6;
+    let minimum_durability_offset = minimum_durability_requirement
+        .windows(2)
+        .position(|candidate| candidate == [0x18, 0x1d])
+        .unwrap();
+    // Key 23 is `minimum_durability`; insert it in canonical key order before key 29.
+    minimum_durability_requirement.splice(
+        minimum_durability_offset..minimum_durability_offset,
+        [0x17, 0x84, 0xf5, 0xf4, 0xf4, 0xf4],
+    );
+
     let mut non_freeze_context = canonical.clone();
     *non_freeze_context.last_mut().unwrap() = 3;
     let mut review_context_without_requirements = canonical.clone();
@@ -81,6 +93,8 @@ fn minimal_policy_record_rejects_optional_requirements_and_does_not_infer_contex
 
     assert!(StrictRecordFrame::decode_authoritative(&optional_requirement).is_ok());
     assert!(MinimalPolicyRecord::decode_authoritative(&optional_requirement).is_err());
+    assert!(StrictRecordFrame::decode_authoritative(&minimum_durability_requirement).is_ok());
+    assert!(MinimalPolicyRecord::decode_authoritative(&minimum_durability_requirement).is_err());
     assert!(StrictRecordFrame::decode_authoritative(&review_context_without_requirements).is_ok());
     assert!(
         MinimalPolicyRecord::decode_authoritative(&review_context_without_requirements).is_err()
