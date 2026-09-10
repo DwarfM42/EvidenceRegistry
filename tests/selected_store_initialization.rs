@@ -32,6 +32,11 @@ fn selected_initializer_creates_an_absent_root_then_reopens_the_exact_profile() 
         registry_id
     );
     assert!(AuthoritativeRegistryStore::open_selected_profile(&root).is_ok());
+    let inspection = AuthoritativeRegistryStore::inspect_selected_terminal(&root).unwrap();
+    let selected_head = store.retained_journal().current_head_reference();
+    assert_eq!(inspection.captured_head_reference(), &selected_head);
+    assert_eq!(inspection.terminal_admission_event_reference(), None);
+    assert_eq!(inspection.terminal_disposition_id(), None);
     assert!(root.join("registry/genesis.cbor").is_file());
     assert!(root.join("coordination/staging").is_dir());
     drop(store);

@@ -24,7 +24,7 @@ pub use authoritative_store::{
     SelectedEmbeddedFreezePreparationError, SelectedEmbeddedFreezePreparationInput,
     SelectedReviewAdmissionCompletionError, SelectedReviewAdmissionSection82Error,
     SelectedReviewRequestError, SelectedReviewRequestInput, SelectedReviewResultError,
-    SelectedReviewResultInput, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
+    SelectedReviewResultInput, SelectedTerminalInspection, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
     AUTHORITATIVE_STORE_MAX_OBJECTS, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
 };
 

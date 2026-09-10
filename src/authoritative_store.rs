@@ -49,6 +49,37 @@ pub enum AuthoritativeRegistryStoreOpenError {
     RetainedJournal(RetainedJournalError),
 }
 
+/// A read-only view of the exact retained head inspected through the selected
+/// terminal-closure replay path.
+///
+/// This reports retained semantic consistency at `captured_head_reference`.
+/// It is not a live publication receipt and cannot attest historical flushes,
+/// producer identity, or the state of the filesystem after this inspection
+/// returned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedTerminalInspection {
+    captured_head_reference: JournalReference,
+    terminal_admission_event_reference: Option<JournalReference>,
+    terminal_disposition_id: Option<u64>,
+}
+
+impl SelectedTerminalInspection {
+    /// The exact Journal head captured by the selected cold reopen.
+    pub fn captured_head_reference(&self) -> &JournalReference {
+        &self.captured_head_reference
+    }
+
+    /// The latest retained selected terminal Admission, if this captured prefix contains one.
+    pub fn terminal_admission_event_reference(&self) -> Option<&JournalReference> {
+        self.terminal_admission_event_reference.as_ref()
+    }
+
+    /// The retained Admission disposition ID, if this captured prefix contains one.
+    pub fn terminal_disposition_id(&self) -> Option<u64> {
+        self.terminal_disposition_id
+    }
+}
+
 /// A fail-closed outcome while creating a selected Store from an absent root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthoritativeRegistryStoreInitializeError {
@@ -797,6 +828,47 @@ impl AuthoritativeRegistryStore {
             AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure,
             || {},
         )
+    }
+
+    /// Performs a separate, read-only selected cold reopen and reports the
+    /// resulting exact retained view. The Journal-only CLI remains unchanged.
+    pub fn inspect_selected_terminal(
+        root: impl AsRef<Path>,
+    ) -> Result<SelectedTerminalInspection, AuthoritativeRegistryStoreOpenError> {
+        let store = Self::open_selected_profile(root)?;
+        let captured_head_reference = store.retained_journal.current_head_reference();
+        let mut terminal_admission_event_reference = None;
+        let mut terminal_disposition_id = None;
+        for entry in store.retained_journal.entries.iter().rev() {
+            if !matches!(entry.event_type_id().value(), 302 | 303) {
+                continue;
+            }
+            let event_reference = JournalReference::new(
+                entry.registry_id(),
+                entry.entry_index(),
+                entry.entry_hash(),
+                entry.event_type_id(),
+                entry.event_record_id(),
+            );
+            let admission_bytes = store
+                .resolve(record_id_from_event_reference(&event_reference))
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let admission = ReviewAdmissionRecord::decode_authoritative(admission_bytes)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            if admission.terminal_authority_closure_sha256()
+                != Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+            {
+                continue;
+            }
+            terminal_admission_event_reference = Some(event_reference);
+            terminal_disposition_id = Some(admission.disposition_id());
+            break;
+        }
+        Ok(SelectedTerminalInspection {
+            captured_head_reference,
+            terminal_admission_event_reference,
+            terminal_disposition_id,
+        })
     }
 
     /// Creates a selected Store only at an absent root, publishes initial

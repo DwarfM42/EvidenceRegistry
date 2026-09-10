@@ -794,6 +794,11 @@ fn freeze_commit_policy_bytes(
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn selected_review_scope_bytes(profile_id: u8) -> Vec<u8> {
+    selected_review_scope_bytes_with_label(profile_id, b"selected")
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn selected_review_scope_bytes_with_label(profile_id: u8, label: &[u8; 8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
@@ -801,7 +806,7 @@ fn selected_review_scope_bytes(profile_id: u8) -> Vec<u8> {
         0x14, 0x01, 0xa6, 0x00, 0x01, 0x01, 0x14, 0x10, profile_id, 0x11, 0x01, 0x12, 0x40, 0x13,
         0x68,
     ]);
-    bytes.extend_from_slice(b"selected");
+    bytes.extend_from_slice(label);
     bytes
 }
 
@@ -833,6 +838,7 @@ fn selected_review_policy_bytes(
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn selected_review_policy_entry(
     registry_id: RegistryId,
+    entry_index: u8,
     previous_entry_hash: JournalEntryHash,
     policy_record_id: RecordId,
     identity_records: &[RecordId],
@@ -847,7 +853,7 @@ fn selected_review_policy_entry(
     bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
     bytes.extend_from_slice(&[0xac, 0x00, 0x01, 0x01]);
     append_bstr_32(&mut bytes, registry_id.as_bytes());
-    bytes.extend_from_slice(&[0x02, 0x03, 0x03]);
+    bytes.extend_from_slice(&[0x02, entry_index, 0x03]);
     append_bstr_32(&mut bytes, previous_entry_hash.as_bytes());
     bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x90, 0x05]);
     append_bstr_32(&mut bytes, policy_record_id.as_bytes());
@@ -1108,6 +1114,7 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
     let review_policy_id = RecordId::try_from(sha256(&review_policy_bytes).as_slice()).unwrap();
     let policy_entry = selected_review_policy_entry(
         registry_id,
+        3,
         head.entry_hash(),
         review_policy_id,
         &[gate_scope_id, review_scope_id, method_id, checks_id],
@@ -1265,6 +1272,18 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         "a persisted selected Admission must cold-replay as the retained head"
     );
     drop(terminal_reopened);
+    let inspection = AuthoritativeRegistryStore::inspect_selected_terminal(&root).unwrap();
+    assert_eq!(
+        inspection.captured_head_reference(),
+        publication.journal_reference(),
+        "inspection reports only the exact retained head captured by its selected cold reopen"
+    );
+    assert_eq!(
+        inspection.terminal_admission_event_reference(),
+        Some(publication.journal_reference()),
+        "inspection identifies the retained selected Admission without claiming its live receipt"
+    );
+    assert_eq!(inspection.terminal_disposition_id(), Some(1));
     assert!(
         matches!(
             AuthoritativeRegistryStore::open(&root),
@@ -1272,6 +1291,135 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         ),
         "the legacy profile must not interpret a selected terminal marker chain"
     );
+    fs::remove_dir_all(&root).unwrap();
+    let _ = fs::remove_dir_all(&source);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_rejected_admission_cold_replays_and_is_inspected() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "evidence-registry-selected-review-rejected-{}-{}",
+            std::process::id(),
+            NEXT_AUTHORITATIVE_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    let source = root.with_extension("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), b"selected rejected review payload").unwrap();
+    let registry_id = RegistryId::try_from(id(0x73).as_slice()).unwrap();
+    let store = AuthoritativeRegistryStore::initialize_selected_profile(
+        &root,
+        registry_id,
+        "selected-review-rejected-test",
+    )
+    .unwrap();
+    let freeze_scope_bytes = selected_freeze_scope_bytes();
+    let freeze_scope_id = RecordId::try_from(sha256(&freeze_scope_bytes).as_slice()).unwrap();
+    write_record(&root, freeze_scope_id, &freeze_scope_bytes);
+    let freeze_policy_bytes = freeze_commit_policy_bytes(
+        &store.retained_journal().current_head_reference(),
+        freeze_scope_id,
+    );
+    let freeze_policy_id = RecordId::try_from(sha256(&freeze_policy_bytes).as_slice()).unwrap();
+    write_record(&root, freeze_policy_id, &freeze_policy_bytes);
+    drop(store);
+
+    let mut store = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let prepared = store
+        .prepare_selected_embedded_freeze(SelectedEmbeddedFreezePreparationInput {
+            source_root: source.clone(),
+            freeze_attempt_id: FreezeAttemptId::try_from(id(0x93).as_slice()).unwrap(),
+            policy_record_id: freeze_policy_id,
+        })
+        .unwrap();
+    let freeze = store
+        .commit_prepared_selected_embedded_freeze(prepared)
+        .unwrap();
+    let head = store.retained_journal().current_head_reference();
+    let context = store.retained_journal().resolve_reference(&head).unwrap();
+    let gate_scope_bytes = selected_review_scope_bytes_with_label(1, b"rejected");
+    let review_scope_bytes = selected_review_scope_bytes(1);
+    let method_bytes = selected_review_scope_bytes(3);
+    let checks_bytes = selected_review_scope_bytes(4);
+    let gate_scope_id = RecordId::try_from(sha256(&gate_scope_bytes).as_slice()).unwrap();
+    let review_scope_id = RecordId::try_from(sha256(&review_scope_bytes).as_slice()).unwrap();
+    let method_id = RecordId::try_from(sha256(&method_bytes).as_slice()).unwrap();
+    let checks_id = RecordId::try_from(sha256(&checks_bytes).as_slice()).unwrap();
+    let review_policy_bytes = selected_review_policy_bytes(
+        freeze.start_event_reference(),
+        gate_scope_id,
+        review_scope_id,
+        method_id,
+        checks_id,
+    );
+    let review_policy_id = RecordId::try_from(sha256(&review_policy_bytes).as_slice()).unwrap();
+    let policy_entry = selected_review_policy_entry(
+        registry_id,
+        3,
+        head.entry_hash(),
+        review_policy_id,
+        &[gate_scope_id, review_scope_id, method_id, checks_id],
+        context.storage_capability_class_id(),
+        context.environment_observation_id(),
+    );
+    drop(store);
+    for (record_id, bytes) in [
+        (gate_scope_id, gate_scope_bytes),
+        (review_scope_id, review_scope_bytes),
+        (method_id, method_bytes),
+        (checks_id, checks_bytes),
+        (review_policy_id, review_policy_bytes),
+    ] {
+        write_record(&root, record_id, &bytes);
+    }
+    fs::write(root.join("journal/00000000000000000003.cbor"), policy_entry).unwrap();
+
+    let mut store = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let request = store
+        .record_selected_review_request(SelectedReviewRequestInput {
+            freeze_authority: freeze,
+            review_policy_record_id: review_policy_id,
+            review_role_id: 1,
+        })
+        .unwrap();
+    let result = store
+        .record_selected_review_result(SelectedReviewResultInput {
+            request_event_reference: request.request_event_reference().clone(),
+            method_status: 1,
+            finding_state: 1,
+            reason_codes: Vec::new(),
+            findings: Vec::new(),
+            reviewer_metadata: None,
+        })
+        .unwrap();
+    let publication = store
+        .complete_selected_review_admission(result.result_event_reference().clone())
+        .unwrap();
+    let publication = match publication {
+        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::Published(publication) => {
+            publication
+        }
+        outcome => panic!("selected rejected route must publish, got {outcome:?}"),
+    };
+    assert_eq!(publication.journal_reference().entry_index().value(), 6);
+    assert_eq!(publication.journal_reference().event_type_id().value(), 303);
+    assert_eq!(publication.admission_record().disposition_id(), 2);
+    drop(store);
+
+    let inspection = AuthoritativeRegistryStore::inspect_selected_terminal(&root).unwrap();
+    assert_eq!(
+        inspection.captured_head_reference(),
+        publication.journal_reference()
+    );
+    assert_eq!(
+        inspection.terminal_admission_event_reference(),
+        Some(publication.journal_reference())
+    );
+    assert_eq!(inspection.terminal_disposition_id(), Some(2));
     fs::remove_dir_all(&root).unwrap();
     let _ = fs::remove_dir_all(&source);
 }
