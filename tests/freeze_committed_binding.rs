@@ -3,11 +3,11 @@ use evidence_registry::{
     validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartJournalEntry,
     FreezeAttemptStartJournalEntryInput, FreezeAttemptStartRecord, FreezeAttemptStartRecordInput,
-    FreezeCommittedBindingInput, FreezeCommittedBindingOutcome, FreezeReceiptRecord,
-    FreezeReceiptRecordInput, IntendedRootId, JournalEntryHash, JournalEntryIndex,
-    JournalReference, RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
-    ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
-    TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
+    FreezeCommittedBindingInput, FreezeCommittedBindingOutcome, FreezeCommittedJournalEntry,
+    FreezeCommittedJournalEntryInput, FreezeReceiptRecord, FreezeReceiptRecordInput,
+    IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId,
+    ResolvedFreezeCommittedBindingError, ResolvedFreezeCommittedBindingOutcome, RetainedJournal,
+    StrictRecordFrame, TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
@@ -506,6 +506,65 @@ fn freeze_attempt_start_entry_rejects_genesis_slot() {
         })
         .is_err(),
         "a FREEZE_ATTEMPT_STARTED event cannot reuse GENESIS slot zero"
+    );
+}
+
+#[test]
+fn freeze_committed_entry_constructs_the_exact_canonical_fixture() {
+    let receipt = FreezeReceiptRecord::decode_authoritative(&hex_bytes(RECEIPT_HEX)).unwrap();
+    let entry = FreezeCommittedJournalEntry::new(FreezeCommittedJournalEntryInput {
+        registry_id: RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        entry_index: JournalEntryIndex::try_from(2_u64).unwrap(),
+        previous_entry_hash: JournalEntryHash::try_from(hex_id(START_HASH_HEX).as_slice()).unwrap(),
+        receipt: receipt.clone(),
+        storage_capability_class_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        environment_observation_id: RecordId::try_from(id(0x60).as_slice()).unwrap(),
+    })
+    .unwrap();
+
+    assert_eq!(entry.authoritative_cbor(), hex_bytes(COMMITTED_ENTRY_HEX));
+    assert_eq!(
+        entry.event_type_id(),
+        EventTypeId::try_from(101_u64).unwrap()
+    );
+    assert_eq!(
+        entry.event_record_id(),
+        EventRecordId::try_from(receipt.record_id().as_bytes().as_slice()).unwrap()
+    );
+    assert_eq!(entry.receipt(), &receipt);
+    assert_eq!(
+        entry.authority_dependencies(),
+        std::slice::from_ref(&receipt.input().attempt_start_journal_ref)
+    );
+}
+
+#[test]
+fn freeze_committed_entry_rejects_a_nonprior_start_reference() {
+    let mut receipt_input = FreezeReceiptRecord::decode_authoritative(&hex_bytes(RECEIPT_HEX))
+        .unwrap()
+        .input()
+        .clone();
+    receipt_input.attempt_start_journal_ref = JournalReference::new(
+        RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        JournalEntryIndex::try_from(2_u64).unwrap(),
+        JournalEntryHash::try_from(id(0x90).as_slice()).unwrap(),
+        EventTypeId::try_from(100_u64).unwrap(),
+        EventRecordId::try_from(id(0xa0).as_slice()).unwrap(),
+    );
+    let receipt = FreezeReceiptRecord::new(receipt_input).unwrap();
+
+    assert!(
+        FreezeCommittedJournalEntry::new(FreezeCommittedJournalEntryInput {
+            registry_id: RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+            entry_index: JournalEntryIndex::try_from(2_u64).unwrap(),
+            previous_entry_hash: JournalEntryHash::try_from(hex_id(START_HASH_HEX).as_slice())
+                .unwrap(),
+            receipt,
+            storage_capability_class_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
+            environment_observation_id: RecordId::try_from(id(0x60).as_slice()).unwrap(),
+        })
+        .is_err(),
+        "a FREEZE_COMMITTED event must depend on a strictly earlier START"
     );
 }
 

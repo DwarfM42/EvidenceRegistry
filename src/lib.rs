@@ -6884,6 +6884,152 @@ impl FreezeReceiptRecord {
     }
 }
 
+/// Typed inputs for a FREEZE_COMMITTED Journal Entry.
+///
+/// This construction layer derives terminal event bindings from one exact
+/// Receipt. It neither resolves the Receipt's prerequisites nor publishes an
+/// event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeCommittedJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub receipt: FreezeReceiptRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+/// A rejected FREEZE_COMMITTED Journal Entry construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreezeCommittedJournalEntryError;
+
+/// A canonical FREEZE_COMMITTED Journal Entry, not a publication effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeCommittedJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    receipt: FreezeReceiptRecord,
+    authority_dependencies: AuthorityDependencyCollection,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl FreezeCommittedJournalEntry {
+    /// Constructs the event-101 Entry whose sole direct authority is the
+    /// Receipt's exact retained START reference.
+    pub fn new(
+        input: FreezeCommittedJournalEntryInput,
+    ) -> Result<Self, FreezeCommittedJournalEntryError> {
+        if input.entry_index.value() == 0 {
+            return Err(FreezeCommittedJournalEntryError);
+        }
+        let authority_dependencies =
+            AuthorityDependencyCollection::from_unordered_semantic_elements(
+                AuthorityDependencyContext::new(input.registry_id, input.entry_index),
+                vec![input.receipt.input().attempt_start_journal_ref.clone()],
+            )
+            .map_err(|_| FreezeCommittedJournalEntryError)?;
+        let event_record_id =
+            EventRecordId::try_from(input.receipt.record_id().as_bytes().as_slice())
+                .expect("RecordId has EventRecordId width");
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id,
+            receipt: input.receipt,
+            authority_dependencies,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    /// The frozen event type for a committed Freeze Attempt.
+    pub fn event_type_id(&self) -> EventTypeId {
+        EventTypeId::try_from(101).expect("FREEZE_COMMITTED is registered")
+    }
+
+    /// The exact Receipt Record identity carried by this Entry.
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+
+    /// The exact publication-time Journal slot selected by compare-and-append.
+    pub fn entry_index(&self) -> JournalEntryIndex {
+        self.entry_index
+    }
+
+    /// The exact publication-time predecessor hash.
+    pub fn previous_entry_hash(&self) -> JournalEntryHash {
+        self.previous_entry_hash
+    }
+
+    /// The exact typed Receipt whose fields bind this Entry.
+    pub fn receipt(&self) -> &FreezeReceiptRecord {
+        &self.receipt
+    }
+
+    /// The canonical direct authority dependency set for this Entry.
+    pub fn authority_dependencies(&self) -> &[JournalReference] {
+        &self.authority_dependencies.elements
+    }
+
+    /// The storage-capability observation derived from the publication-time head.
+    pub fn storage_capability_class_id(&self) -> RecordId {
+        self.storage_capability_class_id
+    }
+
+    /// The environment observation derived from the publication-time head.
+    pub fn environment_observation_id(&self) -> RecordId {
+        self.environment_observation_id
+    }
+
+    /// Emits exact canonical FREEZE_COMMITTED Journal Entry bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(480);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xae);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id().value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07]);
+        bytes.extend_from_slice(&self.authority_dependencies.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x02, 0x09]);
+        encode_bstr_32(
+            &mut bytes,
+            self.receipt.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes.push(0x10);
+        encode_bstr_32(
+            &mut bytes,
+            self.receipt.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x12);
+        bytes.extend_from_slice(
+            &self
+                .receipt
+                .input()
+                .attempt_start_journal_ref
+                .authoritative_cbor(),
+        );
+        bytes
+    }
+}
+
 /// The exact structural inputs for one bounded FREEZE_COMMITTED binding check.
 ///
 /// This input deliberately contains no Manifest, Policy, storage, custody, or
