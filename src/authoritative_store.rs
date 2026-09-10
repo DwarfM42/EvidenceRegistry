@@ -218,6 +218,56 @@ pub enum SelectedReviewRequestError {
     ReplayMismatch,
 }
 
+/// Minimal semantic submission for a Store-owned selected REVIEW_RESULT producer.
+/// The Request reference is only a retained selector; the Store derives every
+/// Freeze, Manifest, Scope, Method, Anchor, operation-start, Record, and slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedReviewResultInput {
+    pub request_event_reference: JournalReference,
+    pub method_status: u64,
+    pub finding_state: u64,
+    pub reason_codes: Vec<String>,
+    pub findings: Vec<RecordId>,
+    pub reviewer_metadata: Option<String>,
+}
+
+/// Exact Store-derived output from a selected REVIEW_RESULT_RECORDED append.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedSelectedReviewResult {
+    result: ReviewResultRecord,
+    result_event_reference: JournalReference,
+    request: RecordedSelectedReviewRequest,
+}
+
+impl RecordedSelectedReviewResult {
+    pub fn result(&self) -> &ReviewResultRecord {
+        &self.result
+    }
+    pub fn result_event_reference(&self) -> &JournalReference {
+        &self.result_event_reference
+    }
+    pub fn request(&self) -> &RecordedSelectedReviewRequest {
+        &self.request
+    }
+}
+
+/// A fail-closed failure while producing or revalidating a selected Result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectedReviewResultError {
+    SelectedProfileRequired,
+    PublicationLockUnavailable,
+    Store(AuthoritativeRegistryStoreOpenError),
+    RetainedGenerationChanged,
+    Request(SelectedReviewRequestError),
+    FindingUnavailable,
+    ResultConstruction,
+    ResultPublication,
+    JournalConstruction,
+    JournalPublication,
+    JournalConflict,
+    ReplayMismatch,
+}
+
 /// An authoritative Registry store opened from its exact retained Journal and Record namespaces.
 ///
 /// The root path is only a locator. Registry identity, current head, Journal history, and Record
@@ -1563,6 +1613,116 @@ impl AuthoritativeRegistryStore {
         self.validate_selected_review_request(reference)
     }
 
+    /// Records one selected Result from a retained selected Request. Callers
+    /// select only the retained Request and bounded semantic submission; all
+    /// authority and transport bindings are derived by the Store.
+    pub fn record_selected_review_result(
+        &mut self,
+        input: SelectedReviewResultInput,
+    ) -> Result<RecordedSelectedReviewResult, SelectedReviewResultError> {
+        if self.open_profile
+            != AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            return Err(SelectedReviewResultError::SelectedProfileRequired);
+        }
+        let root_hold = self
+            .namespace_holds
+            .first()
+            .ok_or(SelectedReviewResultError::RetainedGenerationChanged)?;
+        let _publication_lock =
+            acquire_selected_authoritative_publication_lock(&self.root, root_hold)
+                .map_err(|_| SelectedReviewResultError::PublicationLockUnavailable)?;
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_review_result_reload_error)?;
+        let request = self
+            .validate_selected_review_request(input.request_event_reference.clone())
+            .map_err(SelectedReviewResultError::Request)?;
+        for finding in &input.findings {
+            let bytes = self
+                .resolve(*finding)
+                .ok_or(SelectedReviewResultError::FindingUnavailable)?;
+            StrictRecordFrame::decode_authoritative(bytes)
+                .map_err(|_| SelectedReviewResultError::FindingUnavailable)?;
+        }
+        let head = self.retained_journal.current_head_reference();
+        let context = self
+            .retained_journal
+            .resolve_reference(&head)
+            .map_err(|_| SelectedReviewResultError::ReplayMismatch)?;
+        let entry_index = head
+            .entry_index()
+            .value()
+            .checked_add(1)
+            .and_then(|value| JournalEntryIndex::try_from(value).ok())
+            .ok_or(SelectedReviewResultError::JournalConstruction)?;
+        let result = ReviewResultRecord::new_selected(ReviewResultRecordInput {
+            review_request_authority_ref: input.request_event_reference,
+            freeze_authority_ref: request.request().freeze_authority_ref().clone(),
+            manifest_id: request.request().manifest_id(),
+            review_role_id: request.request().review_role_id(),
+            review_scope_ref: request.request().review_scope_ref(),
+            review_method_ref: request.request().review_method_ref(),
+            method_status: input.method_status,
+            finding_state: input.finding_state,
+            reason_codes: input.reason_codes,
+            findings: input.findings,
+            reviewer_metadata: input.reviewer_metadata,
+            review_package_anchor_id: request.request().review_package_anchor_id(),
+            operation_start_journal_ref: request.request().operation_start_journal_ref().clone(),
+        })
+        .map_err(|_| SelectedReviewResultError::ResultConstruction)?;
+        let entry = ReviewResultJournalEntry::new(ReviewResultJournalEntryInput {
+            registry_id: head.registry_id(),
+            entry_index,
+            previous_entry_hash: head.entry_hash(),
+            result: result.clone(),
+            storage_capability_class_id: context.storage_capability_class_id(),
+            environment_observation_id: context.environment_observation_id(),
+        })
+        .map_err(|_| SelectedReviewResultError::JournalConstruction)?;
+        let entry_bytes = entry.authoritative_cbor();
+        let reference = JournalReference::new(
+            head.registry_id(),
+            entry_index,
+            JournalEntryHash::try_from(Sha256::digest(&entry_bytes).as_slice())
+                .expect("SHA-256 has exact JournalEntryHash width"),
+            entry.event_type_id(),
+            entry.event_record_id(),
+        );
+        publish_record_bytes(self, result.record_id(), &result.authoritative_cbor())
+            .map_err(|_| SelectedReviewResultError::ResultPublication)?;
+        self.revalidate_retained_generation()
+            .map_err(|_| SelectedReviewResultError::RetainedGenerationChanged)?;
+        let journal_dir = self.root.join("journal");
+        let journal_hold = self
+            .acquire_publication_directory_hold(2, "journal")
+            .map_err(|_| SelectedReviewResultError::RetainedGenerationChanged)?;
+        let journal_contents = namespace_contents_path(&journal_dir, &journal_hold)
+            .map_err(|_| SelectedReviewResultError::RetainedGenerationChanged)?;
+        match publish_journal_slot(
+            &journal_contents,
+            &journal_hold,
+            Path::new(&format!("{:020}.cbor", entry_index.value())),
+            &entry_bytes,
+        )
+        .map_err(|_| SelectedReviewResultError::JournalPublication)?
+        {
+            JournalSlotPublication::Published(_) => {}
+            JournalSlotPublication::Conflict => {
+                return Err(SelectedReviewResultError::JournalConflict)
+            }
+            JournalSlotPublication::VisibleReceiptUncertain => {
+                return Err(SelectedReviewResultError::JournalPublication)
+            }
+        }
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_review_result_reload_error)?;
+        if self.retained_journal.current_head_reference() != reference {
+            return Err(SelectedReviewResultError::ReplayMismatch);
+        }
+        self.validate_selected_review_result(reference)
+    }
+
     /// Revalidates a retained selected Request and its Store-owned Freeze/Policy inputs.
     pub fn validate_selected_review_request(
         &self,
@@ -1618,6 +1778,50 @@ impl AuthoritativeRegistryStore {
             request,
             request_event_reference,
             freeze_authority,
+        })
+    }
+
+    /// Revalidates one retained selected Result and its selected Request/Freeze
+    /// transport bindings. It establishes neither §82 nor Admission authority.
+    pub fn validate_selected_review_result(
+        &self,
+        result_event_reference: JournalReference,
+    ) -> Result<RecordedSelectedReviewResult, SelectedReviewResultError> {
+        self.revalidate_retained_generation()
+            .map_err(|_| SelectedReviewResultError::RetainedGenerationChanged)?;
+        let result_record_id = record_id_from_event_reference(&result_event_reference);
+        let result = self
+            .resolve(result_record_id)
+            .and_then(|bytes| ReviewResultRecord::decode_authoritative(bytes).ok())
+            .filter(|result| {
+                result.record_id() == result_record_id
+                    && result.review_package_anchor_binding_version() == Some(1)
+            })
+            .ok_or(SelectedReviewResultError::ReplayMismatch)?;
+        validate_review_result_recorded_binding(
+            &self.retained_journal,
+            &result_event_reference,
+            &result.authoritative_cbor(),
+        )
+        .map_err(|_| SelectedReviewResultError::ReplayMismatch)?;
+        let request = self
+            .validate_selected_review_request(result.review_request_authority_ref().clone())
+            .map_err(SelectedReviewResultError::Request)?;
+        if result.freeze_authority_ref() != request.request().freeze_authority_ref()
+            || result.manifest_id() != request.request().manifest_id()
+            || result.review_role_id() != request.request().review_role_id()
+            || result.review_scope_ref() != request.request().review_scope_ref()
+            || result.review_method_ref() != request.request().review_method_ref()
+            || result.review_package_anchor_id() != request.request().review_package_anchor_id()
+            || result.operation_start_journal_ref()
+                != request.request().operation_start_journal_ref()
+        {
+            return Err(SelectedReviewResultError::ReplayMismatch);
+        }
+        Ok(RecordedSelectedReviewResult {
+            result,
+            result_event_reference,
+            request,
         })
     }
 
@@ -2800,6 +3004,20 @@ fn map_selected_review_request_reload_error(
     }
 }
 
+fn map_selected_review_result_reload_error(
+    error: AuthoritativeReviewAdmissionAcceptanceError,
+) -> SelectedReviewResultError {
+    match error {
+        AuthoritativeReviewAdmissionAcceptanceError::Store(error) => {
+            SelectedReviewResultError::Store(error)
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged
+        | AuthoritativeReviewAdmissionAcceptanceError::Input(_) => {
+            SelectedReviewResultError::ReplayMismatch
+        }
+    }
+}
+
 fn selected_policy_authority_reference(
     journal: &RetainedJournal,
     policy_record_id: RecordId,
@@ -3514,7 +3732,7 @@ where
         const AT_FDCWD: i32 = -100;
         const EEXIST: i32 = 17;
 
-        let dot = c".";
+        let dot = CString::new(".").expect("literal path has no NUL");
         let file_descriptor = unsafe {
             openat(
                 parent_hold.as_raw_fd(),
@@ -3535,7 +3753,7 @@ where
 
         let final_path = parent.join(final_name);
         let final_name_c = CString::new(final_name.as_os_str().as_bytes()).map_err(|_| ())?;
-        let empty = c"";
+        let empty = CString::new("").expect("empty path has no NUL");
         let mut linked = unsafe {
             linkat(
                 file.as_raw_fd(),
@@ -4042,6 +4260,7 @@ fn acquire_authoritative_publication_lock_impl(
     root_hold: &fs::File,
     #[cfg(test)] mut post_lock_hook: Option<&mut PostLockHook<'_>>,
 ) -> Result<LinuxPublicationLock, ()> {
+    use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
 
     unsafe extern "C" {
@@ -4057,10 +4276,11 @@ fn acquire_authoritative_publication_lock_impl(
     const EINTR: i32 = 4;
 
     ensure_path_matches_handle(root, root_hold)?;
+    let dot = CString::new(".").expect("literal path has no NUL");
     let fd = unsafe {
         openat(
             root_hold.as_raw_fd(),
-            c".".as_ptr(),
+            dot.as_ptr(),
             O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
             0,
         )
@@ -4104,6 +4324,7 @@ fn acquire_authoritative_publication_lock(
     root: &Path,
     root_hold: &fs::File,
 ) -> Result<fs::File, ()> {
+    use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
 
     unsafe extern "C" {
@@ -4118,10 +4339,11 @@ fn acquire_authoritative_publication_lock(
     const O_DIRECTORY: i32 = 0x0010_0000;
 
     ensure_path_matches_handle(root, root_hold)?;
+    let dot = CString::new(".").expect("literal path has no NUL");
     let descriptor = unsafe {
         openat(
             root_hold.as_raw_fd(),
-            c".".as_ptr(),
+            dot.as_ptr(),
             O_RDONLY | O_CLOEXEC | O_DIRECTORY,
             0,
         )
@@ -7737,8 +7959,12 @@ fn validate_authoritative_event_records(
             }
             _ => {}
         }
-        if event_semantic_authority_is_unavailable(entry.event_type_id().value(), record_bytes)
-            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+        if event_semantic_authority_is_unavailable(
+            entry.event_type_id().value(),
+            record_bytes,
+            records,
+        )
+        .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
         {
             semantic_authority_unavailable = true;
         }
@@ -7753,6 +7979,7 @@ fn validate_authoritative_event_records(
 fn event_semantic_authority_is_unavailable(
     event_type: u16,
     record_bytes: &[u8],
+    records: &[(RecordId, Vec<u8>)],
 ) -> Result<bool, RecordDecodeError> {
     if event_type == 300 {
         // Only the exact selected marker removes the generic replay gate. The
@@ -7764,6 +7991,22 @@ fn event_semantic_authority_is_unavailable(
             .ok()
             .and_then(|request| request.terminal_authority_closure_sha256().copied())
             != Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256));
+    }
+    if event_type == 301 {
+        // This only opens the exact versioned selected Result lane after the
+        // preceding structural replay contract has bound it to a marked Request.
+        // It is not a generic Result or §82/Admission authority decision.
+        let selected = ReviewResultRecord::decode_authoritative(record_bytes)
+            .ok()
+            .filter(|result| result.review_package_anchor_binding_version() == Some(1))
+            .and_then(|result| {
+                record_bytes_for_reference(records, result.review_request_authority_ref())
+                    .ok()
+                    .and_then(|bytes| ReviewRequestRecord::decode_authoritative(bytes).ok())
+            })
+            .and_then(|request| request.terminal_authority_closure_sha256().copied())
+            == Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256);
+        return Ok(!selected);
     }
     if matches!(event_type, 200 | 301 | 302 | 303 | 500 | 501 | 600 | 700) {
         // The retained inputs do not uniquely re-establish all frozen contextual semantics for
@@ -12121,7 +12364,7 @@ os._exit(23)
     fn unsupported_contextual_event_semantics_fail_closed_before_positive_replay() {
         for event_type in [200, 300, 301, 302, 303, 500, 501, 600, 700] {
             assert_eq!(
-                event_semantic_authority_is_unavailable(event_type, &[]),
+                event_semantic_authority_is_unavailable(event_type, &[], &[]),
                 Ok(true)
             );
         }
@@ -12266,7 +12509,7 @@ os._exit(23)
                 Ok(())
             );
             assert_eq!(
-                event_semantic_authority_is_unavailable(801, &record_bytes),
+                event_semantic_authority_is_unavailable(801, &record_bytes, &[]),
                 Ok(provenance_id.is_none())
             );
             let mut identity_ids = vec![scope, method, evidence, storage, environment];

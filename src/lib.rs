@@ -20,10 +20,11 @@ pub use authoritative_store::{
     AuthoritativeReviewAdmissionRuntimeError, AuthoritativeReviewAdmissionRuntimeOutcome,
     AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error,
     DurabilityActionState, PreparedSelectedEmbeddedFreeze, RecordedSelectedReviewRequest,
-    SelectedEmbeddedFreezeCommitError, SelectedEmbeddedFreezePreparationError,
-    SelectedEmbeddedFreezePreparationInput, SelectedReviewRequestError, SelectedReviewRequestInput,
-    AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES, AUTHORITATIVE_STORE_MAX_OBJECTS,
-    AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
+    RecordedSelectedReviewResult, SelectedEmbeddedFreezeCommitError,
+    SelectedEmbeddedFreezePreparationError, SelectedEmbeddedFreezePreparationInput,
+    SelectedReviewRequestError, SelectedReviewRequestInput, SelectedReviewResultError,
+    SelectedReviewResultInput, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
+    AUTHORITATIVE_STORE_MAX_OBJECTS, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
 };
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
@@ -5349,6 +5350,142 @@ impl ReviewRequestJournalEntry {
     }
 }
 
+/// Typed inputs for one selected REVIEW_RESULT_RECORDED Journal Entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub result: ReviewResultRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewResultJournalEntryError;
+
+/// A canonical selected REVIEW_RESULT_RECORDED Journal Entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    result: ReviewResultRecord,
+    identity_dependencies: IdentityDependencyCollection,
+    authority_dependencies: AuthorityDependencyCollection,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl ReviewResultJournalEntry {
+    pub fn new(
+        input: ReviewResultJournalEntryInput,
+    ) -> Result<Self, ReviewResultJournalEntryError> {
+        if input.entry_index.value() == 0
+            || input.result.review_package_anchor_binding_version != Some(1)
+        {
+            return Err(ReviewResultJournalEntryError);
+        }
+        let event_record_id =
+            EventRecordId::try_from(input.result.record_id().as_bytes().as_slice())
+                .expect("RecordId has exact EventRecordId width");
+        let mut identities = vec![
+            IdentityDependency::record_id(input.result.manifest_id()),
+            IdentityDependency::record_id(input.result.review_scope_ref()),
+            IdentityDependency::record_id(input.result.review_method_ref()),
+            IdentityDependency::journal_anchor_id(input.result.review_package_anchor_id()),
+        ];
+        identities.extend(
+            input
+                .result
+                .findings
+                .iter()
+                .copied()
+                .map(IdentityDependency::record_id),
+        );
+        let identity_dependencies =
+            IdentityDependencyCollection::from_unordered_semantic_elements(identities)
+                .map_err(|_| ReviewResultJournalEntryError)?;
+        let authority_dependencies =
+            AuthorityDependencyCollection::from_unordered_semantic_elements(
+                AuthorityDependencyContext::new(input.registry_id, input.entry_index),
+                vec![input.result.review_request_authority_ref().clone()],
+            )
+            .map_err(|_| ReviewResultJournalEntryError)?;
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id,
+            result: input.result,
+            identity_dependencies,
+            authority_dependencies,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    pub fn event_type_id(&self) -> EventTypeId {
+        EventTypeId::try_from(301).expect("REVIEW_RESULT_RECORDED is assigned")
+    }
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+    pub fn result(&self) -> &ReviewResultRecord {
+        &self.result
+    }
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(900);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id().value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x06);
+        bytes.extend_from_slice(&self.identity_dependencies.authoritative_cbor());
+        bytes.push(0x07);
+        bytes.extend_from_slice(&self.authority_dependencies.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x05, 0x09]);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes
+    }
+}
+
+/// Typed local fields for a selected version-1 REVIEW_RESULT form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultRecordInput {
+    pub review_request_authority_ref: JournalReference,
+    pub freeze_authority_ref: JournalReference,
+    pub manifest_id: RecordId,
+    pub review_role_id: u64,
+    pub review_scope_ref: RecordId,
+    pub review_method_ref: RecordId,
+    pub method_status: u64,
+    pub finding_state: u64,
+    pub reason_codes: Vec<String>,
+    pub findings: Vec<RecordId>,
+    pub reviewer_metadata: Option<String>,
+    pub review_package_anchor_id: JournalAnchorId,
+    pub operation_start_journal_ref: JournalReference,
+}
+
+/// A rejected selected REVIEW_RESULT local construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewResultRecordError;
+
 /// The exact version-1 Review Package Anchor transport fields and predecessor
 /// Review Result fields decoded from a prospective REVIEW_RESULT Record.
 ///
@@ -5376,6 +5513,95 @@ pub struct ReviewResultRecord {
 }
 
 impl ReviewResultRecord {
+    /// Constructs exact canonical Result bytes. This does not establish Review,
+    /// Policy, §82, Admission, or publication authority.
+    pub fn new_selected(input: ReviewResultRecordInput) -> Result<Self, ReviewResultRecordError> {
+        if input.review_request_authority_ref.event_type_id().value() != 300
+            || input.freeze_authority_ref.event_type_id().value() != 101
+            || !matches!(input.review_role_id, 1..=5)
+            || !matches!(input.method_status, 1..=3)
+            || !matches!(input.finding_state, 1..=3)
+            || input
+                .reason_codes
+                .windows(2)
+                .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        {
+            return Err(ReviewResultRecordError);
+        }
+        let mut value = Self {
+            record_id: RecordId([0; ID_LENGTH]),
+            review_request_authority_ref: input.review_request_authority_ref,
+            freeze_authority_ref: input.freeze_authority_ref,
+            manifest_id: input.manifest_id,
+            review_role_id: input.review_role_id,
+            review_scope_ref: input.review_scope_ref,
+            review_method_ref: input.review_method_ref,
+            method_status: input.method_status,
+            finding_state: input.finding_state,
+            reason_codes: input.reason_codes,
+            findings: input.findings,
+            reviewer_metadata: input.reviewer_metadata,
+            review_package_anchor_id: input.review_package_anchor_id,
+            operation_start_journal_ref: input.operation_start_journal_ref,
+            review_package_anchor_binding_version: Some(1),
+        };
+        value.record_id = RecordId(
+            Sha256::digest(value.authoritative_cbor())
+                .as_slice()
+                .try_into()
+                .expect("SHA-256 has exact RecordId width"),
+        );
+        Ok(value)
+    }
+
+    /// Emits the exact canonical selected REVIEW_RESULT bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let map_header = if self.reviewer_metadata.is_some() {
+            0xb0
+        } else {
+            0xaf
+        };
+        let mut bytes = Vec::with_capacity(800);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x18, 31, 0x01, map_header, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
+        encode_journal_reference(&mut bytes, &self.review_request_authority_ref);
+        bytes.push(0x11);
+        encode_journal_reference(&mut bytes, &self.freeze_authority_ref);
+        bytes.push(0x12);
+        encode_bstr_32(&mut bytes, self.manifest_id.as_bytes());
+        bytes.push(0x13);
+        encode_uint(&mut bytes, self.review_role_id);
+        bytes.push(0x14);
+        encode_bstr_32(&mut bytes, self.review_scope_ref.as_bytes());
+        bytes.push(0x15);
+        encode_bstr_32(&mut bytes, self.review_method_ref.as_bytes());
+        bytes.push(0x16);
+        encode_uint(&mut bytes, self.method_status);
+        bytes.push(0x17);
+        encode_uint(&mut bytes, self.finding_state);
+        bytes.extend_from_slice(&[0x18, 0x18]);
+        encode_array_length(&mut bytes, self.reason_codes.len());
+        for reason in &self.reason_codes {
+            encode_text(&mut bytes, reason);
+        }
+        bytes.extend_from_slice(&[0x18, 0x19]);
+        encode_array_length(&mut bytes, self.findings.len());
+        for finding in &self.findings {
+            encode_bstr_32(&mut bytes, finding.as_bytes());
+        }
+        if let Some(metadata) = &self.reviewer_metadata {
+            bytes.extend_from_slice(&[0x18, 0x1a]);
+            encode_text(&mut bytes, metadata);
+        }
+        bytes.extend_from_slice(&[0x18, 0x1b]);
+        encode_bstr_32(&mut bytes, self.review_package_anchor_id.as_bytes());
+        bytes.extend_from_slice(&[0x18, 0x1c]);
+        encode_journal_reference(&mut bytes, &self.operation_start_journal_ref);
+        bytes.extend_from_slice(&[0x18, 0x1d, 0x01]);
+        bytes
+    }
+
     /// Strictly decodes the frozen Record Schema v0.3 version-1
     /// REVIEW_RESULT local grammar without normalizing bytes.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
@@ -5563,6 +5789,11 @@ impl ReviewResultRecord {
     /// The exact Method-status registry value carried by the Review Result.
     pub fn method_status(&self) -> u64 {
         self.method_status
+    }
+
+    /// The selected Result package-Anchor binding grammar version, if present.
+    pub fn review_package_anchor_binding_version(&self) -> Option<u64> {
+        self.review_package_anchor_binding_version
     }
 
     /// The exact Finding-state registry value carried by the Review Result.

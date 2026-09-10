@@ -8,7 +8,8 @@ use evidence_registry::{
     IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference, ManifestRecord,
     RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
     ResolvedFreezeCommittedBindingOutcome, RetainedJournal, SelectedEmbeddedFreezePreparationInput,
-    SelectedReviewRequestInput, StrictRecordFrame, TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
+    SelectedReviewRequestInput, SelectedReviewResultInput, StrictRecordFrame,
+    TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
@@ -1155,6 +1156,41 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
     assert_eq!(recorded.request().required_checks_ref(), checks_id);
     assert!(root.join("journal/00000000000000000004.cbor").is_file());
     assert!(!root.join("journal/00000000000000000005.cbor").exists());
+    assert_eq!(
+        store.record_selected_review_result(SelectedReviewResultInput {
+            request_event_reference: recorded.request_event_reference().clone(),
+            method_status: 4,
+            finding_state: 1,
+            reason_codes: Vec::new(),
+            findings: Vec::new(),
+            reviewer_metadata: None,
+        }),
+        Err(evidence_registry::SelectedReviewResultError::ResultConstruction),
+        "unsupported Result status must fail before its Record or event 301 slot is staged"
+    );
+    assert!(!root.join("journal/00000000000000000005.cbor").exists());
+    let result = store
+        .record_selected_review_result(SelectedReviewResultInput {
+            request_event_reference: recorded.request_event_reference().clone(),
+            method_status: 1,
+            finding_state: 1,
+            reason_codes: Vec::new(),
+            findings: Vec::new(),
+            reviewer_metadata: None,
+        })
+        .unwrap();
+    assert_eq!(result.result_event_reference().entry_index().value(), 5);
+    assert_eq!(
+        result.result().review_request_authority_ref(),
+        recorded.request_event_reference()
+    );
+    assert_eq!(
+        result.result().review_package_anchor_id(),
+        recorded.request().review_package_anchor_id(),
+        "Result must preserve the Request-carried package Anchor rather than refresh it at event 301"
+    );
+    assert!(root.join("journal/00000000000000000005.cbor").is_file());
+    assert!(!root.join("journal/00000000000000000006.cbor").exists());
     drop(store);
 
     let reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
@@ -1163,6 +1199,12 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
             .validate_selected_review_request(recorded.request_event_reference().clone())
             .unwrap(),
         recorded
+    );
+    assert_eq!(
+        reopened
+            .validate_selected_review_result(result.result_event_reference().clone())
+            .unwrap(),
+        result
     );
     drop(reopened);
     fs::remove_dir_all(&root).unwrap();
