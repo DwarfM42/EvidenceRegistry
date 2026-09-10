@@ -39,6 +39,8 @@ pub enum AuthoritativeRegistryStoreOpenError {
     EventRecordUnavailable,
     EventRecordBinding(EventRecordStructuralBindingError),
     EventRecordDecode,
+    /// Selected terminal cold replay exceeded its explicit retained-payload resource budget.
+    SelectedTerminalReplayResourceLimit,
     /// Frozen-valid structure requires contextual authority semantics not supplied by this runtime.
     EventSemanticAuthorityUnavailable,
     /// This platform lacks an implemented retained-generation protection adapter.
@@ -215,6 +217,7 @@ pub enum SelectedReviewRequestError {
     JournalConstruction,
     JournalPublication,
     JournalConflict,
+    ReplayResourceLimit,
     ReplayMismatch,
 }
 
@@ -366,6 +369,12 @@ impl NamespaceBudget {
 enum NamespaceReadError {
     Io,
     Invalid,
+    ResourceLimit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedTerminalReplayPayloadBudgetError {
+    FreezePrerequisiteInvalid,
     ResourceLimit,
 }
 
@@ -755,6 +764,8 @@ pub enum AuthoritativeFreezeCommittedBindingError {
     /// A selected Receipt did not satisfy the adopted selected Store, profile, policy, or
     /// currently retained EMBEDDED-payload prerequisites.
     SelectedPrerequisiteInvalid,
+    /// Revalidating a selected retained EMBEDDED payload exceeded the bounded resource envelope.
+    ResourceLimit,
     /// Frozen authority does not assign the generic gate-Scope and selected Manifest-profile
     /// semantics needed to promote exact structural bindings into positive Freeze authority.
     SemanticAuthorityUnavailable,
@@ -1474,6 +1485,19 @@ impl AuthoritativeRegistryStore {
     ) -> Result<AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError> {
         self.revalidate_retained_generation()
             .map_err(|()| AuthoritativeFreezeCommittedBindingError::RetainedGenerationChanged)?;
+        self.validate_freeze_committed_authority_from_retained_snapshot(committed_event_reference)
+    }
+
+    /// Validates a selected Freeze against one already generation-validated retained snapshot.
+    ///
+    /// This is intentionally private: callers must use the public validator above. Selected
+    /// terminal replay uses it only after `open_selected_profile` has captured and retained one
+    /// exact namespace generation, so repeated terminal records cannot turn a bounded open into
+    /// repeated full namespace revalidation.
+    fn validate_freeze_committed_authority_from_retained_snapshot(
+        &self,
+        committed_event_reference: JournalReference,
+    ) -> Result<AuthoritativeFreezeCommittedBinding, AuthoritativeFreezeCommittedBindingError> {
         match validate_resolved_freeze_committed_binding(
             &self.retained_journal,
             committed_event_reference.clone(),
@@ -1509,7 +1533,12 @@ impl AuthoritativeRegistryStore {
             &committed,
             &receipt,
         )
-        .map_err(|_| AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid)?;
+        .map_err(|error| match error {
+            SelectedEmbeddedFreezePreparationError::SourceResourceLimit => {
+                AuthoritativeFreezeCommittedBindingError::ResourceLimit
+            }
+            _ => AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid,
+        })?;
         let start_record_id =
             record_id_from_event_reference(&receipt.input().attempt_start_journal_ref);
         Ok(AuthoritativeFreezeCommittedBinding {
@@ -1523,6 +1552,31 @@ impl AuthoritativeRegistryStore {
             freeze_id: receipt.input().freeze_id,
             subject_id: receipt.input().subject_id,
             policy_record_id: receipt.input().policy_record_id,
+        })
+    }
+
+    /// Revalidates the live selected payload for an already record-validated Freeze binding.
+    /// The binding cache deliberately never stands in for this check: selected replay is only
+    /// positive while the payload currently matches the retained manifest.
+    fn validate_selected_freeze_payload_from_retained_snapshot(
+        &self,
+        freeze_authority: &AuthoritativeFreezeCommittedBinding,
+    ) -> Result<(), AuthoritativeFreezeCommittedBindingError> {
+        let manifest = self
+            .resolve(freeze_authority.manifest_record_id())
+            .and_then(|bytes| ManifestRecord::decode_authoritative(bytes).ok())
+            .filter(|manifest| manifest.record_id() == freeze_authority.manifest_record_id())
+            .ok_or(AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid)?;
+        validate_selected_embedded_payload(
+            &self.root,
+            freeze_authority.freeze_attempt_id(),
+            &manifest,
+        )
+        .map_err(|error| match error {
+            SelectedEmbeddedFreezePreparationError::SourceResourceLimit => {
+                AuthoritativeFreezeCommittedBindingError::ResourceLimit
+            }
+            _ => AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid,
         })
     }
 
@@ -1781,6 +1835,23 @@ impl AuthoritativeRegistryStore {
     ) -> Result<RecordedSelectedReviewRequest, SelectedReviewRequestError> {
         self.revalidate_retained_generation()
             .map_err(|_| SelectedReviewRequestError::RetainedGenerationChanged)?;
+        let mut freeze_cache = Vec::new();
+        let mut replay_work_bytes = 0;
+        self.validate_selected_review_request_from_retained_snapshot(
+            request_event_reference,
+            &mut freeze_cache,
+            &mut replay_work_bytes,
+            u64::MAX,
+        )
+    }
+
+    fn validate_selected_review_request_from_retained_snapshot(
+        &self,
+        request_event_reference: JournalReference,
+        freeze_cache: &mut Vec<(JournalReference, AuthoritativeFreezeCommittedBinding)>,
+        replay_work_bytes: &mut u64,
+        max_replay_work_bytes: u64,
+    ) -> Result<RecordedSelectedReviewRequest, SelectedReviewRequestError> {
         let request_record_id = record_id_from_event_reference(&request_event_reference);
         let request = self
             .resolve(request_record_id)
@@ -1798,9 +1869,48 @@ impl AuthoritativeRegistryStore {
             &request.authoritative_cbor(),
         )
         .map_err(|_| SelectedReviewRequestError::ReplayMismatch)?;
-        let freeze_authority = self
-            .validate_freeze_committed_authority(request.freeze_authority_ref().clone())
-            .map_err(SelectedReviewRequestError::FreezeAuthority)?;
+        self.reserve_selected_terminal_replay_payload_budget(
+            request.freeze_authority_ref(),
+            replay_work_bytes,
+            max_replay_work_bytes,
+        )
+        .map_err(|error| match error {
+            SelectedTerminalReplayPayloadBudgetError::FreezePrerequisiteInvalid => {
+                SelectedReviewRequestError::FreezeAuthority(
+                    AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid,
+                )
+            }
+            SelectedTerminalReplayPayloadBudgetError::ResourceLimit => {
+                SelectedReviewRequestError::ReplayResourceLimit
+            }
+        })?;
+        let freeze_authority = if let Some((_, freeze_authority)) = freeze_cache
+            .iter()
+            .find(|(reference, _)| reference == request.freeze_authority_ref())
+        {
+            self.validate_selected_freeze_payload_from_retained_snapshot(freeze_authority)
+                .map_err(|error| match error {
+                    AuthoritativeFreezeCommittedBindingError::ResourceLimit => {
+                        SelectedReviewRequestError::ReplayResourceLimit
+                    }
+                    error => SelectedReviewRequestError::FreezeAuthority(error),
+                })?;
+            freeze_authority.clone()
+        } else {
+            let freeze_authority = self
+                .validate_freeze_committed_authority_from_retained_snapshot(
+                    request.freeze_authority_ref().clone(),
+                )
+                .map_err(SelectedReviewRequestError::FreezeAuthority)?;
+            freeze_cache
+                .try_reserve(1)
+                .map_err(|_| SelectedReviewRequestError::ReplayResourceLimit)?;
+            freeze_cache.push((
+                request.freeze_authority_ref().clone(),
+                freeze_authority.clone(),
+            ));
+            freeze_authority
+        };
         if request.manifest_id() != freeze_authority.manifest_record_id()
             || request.operation_start_journal_ref() != freeze_authority.start_event_reference()
         {
@@ -1840,6 +1950,23 @@ impl AuthoritativeRegistryStore {
     ) -> Result<RecordedSelectedReviewResult, SelectedReviewResultError> {
         self.revalidate_retained_generation()
             .map_err(|_| SelectedReviewResultError::RetainedGenerationChanged)?;
+        let mut freeze_cache = Vec::new();
+        let mut replay_work_bytes = 0;
+        self.validate_selected_review_result_from_retained_snapshot(
+            result_event_reference,
+            &mut freeze_cache,
+            &mut replay_work_bytes,
+            u64::MAX,
+        )
+    }
+
+    fn validate_selected_review_result_from_retained_snapshot(
+        &self,
+        result_event_reference: JournalReference,
+        freeze_cache: &mut Vec<(JournalReference, AuthoritativeFreezeCommittedBinding)>,
+        replay_work_bytes: &mut u64,
+        max_replay_work_bytes: u64,
+    ) -> Result<RecordedSelectedReviewResult, SelectedReviewResultError> {
         let result_record_id = record_id_from_event_reference(&result_event_reference);
         let result = self
             .resolve(result_record_id)
@@ -1856,7 +1983,12 @@ impl AuthoritativeRegistryStore {
         )
         .map_err(|_| SelectedReviewResultError::ReplayMismatch)?;
         let request = self
-            .validate_selected_review_request(result.review_request_authority_ref().clone())
+            .validate_selected_review_request_from_retained_snapshot(
+                result.review_request_authority_ref().clone(),
+                freeze_cache,
+                replay_work_bytes,
+                max_replay_work_bytes,
+            )
             .map_err(SelectedReviewResultError::Request)?;
         if result.freeze_authority_ref() != request.request().freeze_authority_ref()
             || result.manifest_id() != request.request().manifest_id()
@@ -2615,6 +2747,8 @@ impl AuthoritativeRegistryStore {
     fn validate_selected_terminal_admission_replay(
         &self,
     ) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+        let mut freeze_cache = Vec::new();
+        let mut replay_work_bytes = 0;
         for (position, entry) in self.retained_journal.entries.iter().enumerate() {
             if !matches!(entry.event_type_id().value(), 302 | 303) {
                 continue;
@@ -2653,13 +2787,26 @@ impl AuthoritativeRegistryStore {
             }
 
             let recorded_result = self
-                .validate_selected_review_result(
+                .validate_selected_review_result_from_retained_snapshot(
                     admission
                         .review_result_ref()
                         .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
                         .clone(),
+                    &mut freeze_cache,
+                    &mut replay_work_bytes,
+                    AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES as u64,
                 )
-                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+                .map_err(|error| match error {
+                    SelectedReviewResultError::Request(
+                        SelectedReviewRequestError::ReplayResourceLimit,
+                    )
+                    | SelectedReviewResultError::Request(
+                        SelectedReviewRequestError::FreezeAuthority(
+                            AuthoritativeFreezeCommittedBindingError::ResourceLimit,
+                        ),
+                    ) => AuthoritativeRegistryStoreOpenError::SelectedTerminalReplayResourceLimit,
+                    _ => AuthoritativeRegistryStoreOpenError::EventRecordDecode,
+                })?;
             let request = recorded_result.request().request();
             let result = recorded_result.result();
             if admission.review_request_ref()
@@ -2771,6 +2918,41 @@ impl AuthoritativeRegistryStore {
                 return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
             }
         }
+        Ok(())
+    }
+
+    /// Reserves one complete bounded traversal allowance before every live selected Freeze walk
+    /// during one selected terminal replay. Cache hits retain a record-derived binding, not a
+    /// stable payload-generation witness, so they must revalidate the live payload too. The
+    /// conservative allowance covers empty directories, names, metadata, cloned paths, and
+    /// content—not only manifest-declared file bytes—so zero-byte payloads cannot evade the
+    /// aggregate replay-work envelope.
+    fn reserve_selected_terminal_replay_payload_budget(
+        &self,
+        committed_event_reference: &JournalReference,
+        replay_work_bytes: &mut u64,
+        max_replay_work_bytes: u64,
+    ) -> Result<(), SelectedTerminalReplayPayloadBudgetError> {
+        let receipt_record_id = record_id_from_event_reference(committed_event_reference);
+        let receipt = self
+            .resolve(receipt_record_id)
+            .and_then(|bytes| FreezeReceiptRecord::decode_authoritative(bytes).ok())
+            .filter(|receipt| receipt.record_id() == receipt_record_id)
+            .ok_or(SelectedTerminalReplayPayloadBudgetError::FreezePrerequisiteInvalid)?;
+        let _manifest = self
+            .resolve(receipt.input().manifest_id)
+            .and_then(|bytes| ManifestRecord::decode_authoritative(bytes).ok())
+            .filter(|manifest| manifest.record_id() == receipt.input().manifest_id)
+            .ok_or(SelectedTerminalReplayPayloadBudgetError::FreezePrerequisiteInvalid)?;
+        let traversal_work_bytes = u64::try_from(AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES)
+            .map_err(|_| SelectedTerminalReplayPayloadBudgetError::ResourceLimit)?;
+        let next = replay_work_bytes
+            .checked_add(traversal_work_bytes)
+            .ok_or(SelectedTerminalReplayPayloadBudgetError::ResourceLimit)?;
+        if next > max_replay_work_bytes {
+            return Err(SelectedTerminalReplayPayloadBudgetError::ResourceLimit);
+        }
+        *replay_work_bytes = next;
         Ok(())
     }
 
@@ -3530,23 +3712,26 @@ fn validate_selected_embedded_payload(
     store_root: &Path,
     attempt: FreezeAttemptId,
     manifest: &ManifestRecord,
-) -> Result<(), ()> {
+) -> Result<(), SelectedEmbeddedFreezePreparationError> {
     if manifest.input().path_identity_profile_id != 1 || manifest.input().digest_profile_id != 1 {
-        return Err(());
+        return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
     }
     let root = store_root
         .join("roots")
         .join(selected_attempt_directory_name(attempt));
-    validate_selected_exact_directory_entries(&root, &[("payload", true)])?;
+    validate_selected_exact_directory_entries(&root, &[("payload", true)])
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
     let payload = root.join("payload");
-    let retained = collect_selected_embedded_source(&payload).map_err(|_| ())?;
+    let retained = collect_selected_embedded_source(&payload)?;
     if retained.artifacts != manifest.input().artifacts
-        || u64::try_from(retained.artifacts.len()).map_err(|_| ())?
+        || u64::try_from(retained.artifacts.len())
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?
             != manifest.input().artifact_count
-        || derive_selected_regular_file_subject(&retained.artifacts).map_err(|_| ())?
+        || derive_selected_regular_file_subject(&retained.artifacts)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?
             != manifest.input().subject_id
     {
-        return Err(());
+        return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
     }
     Ok(())
 }
@@ -3557,7 +3742,8 @@ fn validate_selected_freeze_committed_prerequisites(
     resolver: &impl ExactRecordByteResolver,
     committed: &ResolvedJournalReference,
     receipt: &FreezeReceiptRecord,
-) -> Result<(), ()> {
+) -> Result<(), SelectedEmbeddedFreezePreparationError> {
+    let invalid = || SelectedEmbeddedFreezePreparationError::SourceInvalid;
     if committed.event_type_id().value() != 101
         || receipt.input().freeze_id != *receipt.input().freeze_attempt_id.as_bytes()
         || receipt.input().custody_mode_id != 1
@@ -3569,31 +3755,31 @@ fn validate_selected_freeze_committed_prerequisites(
         || receipt.input().parent_directory_flush_state != 1
         || receipt.input().filesystem_profile_ref != committed.environment_observation_id()
     {
-        return Err(());
+        return Err(invalid());
     }
     let creation_profile = resolver
         .resolve(receipt.input().creation_profile_ref)
-        .ok_or(())?;
-    let creation_profile =
-        FreezeCreationProfileRecord::decode_authoritative(creation_profile).map_err(|_| ())?;
+        .ok_or_else(invalid)?;
+    let creation_profile = FreezeCreationProfileRecord::decode_authoritative(creation_profile)
+        .map_err(|_| invalid())?;
     if creation_profile.record_id() != receipt.input().creation_profile_ref {
-        return Err(());
+        return Err(invalid());
     }
     let environment = resolver
         .resolve(receipt.input().filesystem_profile_ref)
-        .ok_or(())?;
+        .ok_or_else(invalid)?;
     let environment =
-        EnvironmentObservationRecord::decode_authoritative(environment).map_err(|_| ())?;
+        EnvironmentObservationRecord::decode_authoritative(environment).map_err(|_| invalid())?;
     if environment.record_id() != receipt.input().filesystem_profile_ref {
-        return Err(());
+        return Err(invalid());
     }
     let capability = resolver
         .resolve(committed.storage_capability_class_id())
-        .ok_or(())?;
+        .ok_or_else(invalid)?;
     let capability =
-        StorageCapabilityClassRecord::decode_authoritative(capability).map_err(|_| ())?;
+        StorageCapabilityClassRecord::decode_authoritative(capability).map_err(|_| invalid())?;
     if capability.record_id() != committed.storage_capability_class_id() {
-        return Err(());
+        return Err(invalid());
     }
     let policy = resolver
         .resolve(receipt.input().policy_record_id)
@@ -3602,30 +3788,32 @@ fn validate_selected_freeze_committed_prerequisites(
             policy.record_id() == receipt.input().policy_record_id
                 && policy.declares_freeze_commit_support()
         })
-        .ok_or(())?;
+        .ok_or_else(invalid)?;
     if !selected_freeze_policy_is_supported(&policy, resolver) {
-        return Err(());
+        return Err(invalid());
     }
     let start = retained_journal
         .resolve_reference(&receipt.input().attempt_start_journal_ref)
-        .map_err(|_| ())?;
+        .map_err(|_| invalid())?;
     if start.event_type_id().value() != 100
         || start.lifecycle_object_id() != *receipt.input().freeze_attempt_id.as_bytes()
         || derive_freeze_root(start.registry_id(), receipt.input().freeze_attempt_id)
             .intended_root_id()
-            != start.freeze_attempt_intended_root_id().ok_or(())?
+            != start
+                .freeze_attempt_intended_root_id()
+                .ok_or_else(invalid)?
     {
-        return Err(());
+        return Err(invalid());
     }
     let manifest = resolver
         .resolve(receipt.input().manifest_id)
         .and_then(|bytes| ManifestRecord::decode_authoritative(bytes).ok())
         .filter(|manifest| manifest.record_id() == receipt.input().manifest_id)
-        .ok_or(())?;
+        .ok_or_else(invalid)?;
     if manifest.input().subject_id != receipt.input().subject_id
         || policy.record_id() != receipt.input().policy_record_id
     {
-        return Err(());
+        return Err(invalid());
     }
     validate_selected_embedded_payload(store_root, receipt.input().freeze_attempt_id, &manifest)
 }
@@ -3634,6 +3822,76 @@ fn validate_selected_freeze_committed_prerequisites(
 struct SelectedEmbeddedSource {
     artifacts: Vec<ManifestArtifactEntry>,
     bytes: Vec<Vec<u8>>,
+}
+
+/// Bounds metadata retained while recursively traversing a selected payload, including empty
+/// directories which do not contribute manifest artifact bytes.
+struct SelectedEmbeddedTraversalBudget {
+    entries: usize,
+    path_bytes: usize,
+    content_bytes: usize,
+    retained_path_bytes: usize,
+}
+
+impl SelectedEmbeddedTraversalBudget {
+    fn reserve_child(
+        &mut self,
+        name: &str,
+        depth: usize,
+    ) -> Result<(), SelectedEmbeddedFreezePreparationError> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .filter(|entries| *entries <= AUTHORITATIVE_STORE_MAX_OBJECTS)
+            .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        self.path_bytes = self
+            .path_bytes
+            .checked_add(name.len())
+            .filter(|bytes| *bytes <= AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES)
+            .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        if depth > AUTHORITATIVE_STORE_MAX_OBJECTS {
+            return Err(SelectedEmbeddedFreezePreparationError::SourceResourceLimit);
+        }
+        Ok(())
+    }
+
+    fn reserve_content(
+        &mut self,
+        length: u64,
+    ) -> Result<usize, SelectedEmbeddedFreezePreparationError> {
+        let length = usize::try_from(length)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        self.content_bytes = self
+            .content_bytes
+            .checked_add(length)
+            .filter(|bytes| *bytes <= AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES)
+            .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        Ok(length)
+    }
+
+    fn reserve_retained_artifact_path(
+        &mut self,
+        path: &[Vec<u8>],
+    ) -> Result<(), SelectedEmbeddedFreezePreparationError> {
+        let component_bytes = path.iter().try_fold(0_usize, |total, component| {
+            total
+                .checked_add(component.len())
+                .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)
+        })?;
+        let component_vector_bytes = path
+            .len()
+            .checked_mul(std::mem::size_of::<Vec<u8>>())
+            .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        let retained_bytes = component_bytes
+            .checked_add(component_vector_bytes)
+            .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        self.retained_path_bytes = self
+            .retained_path_bytes
+            .checked_add(retained_bytes)
+            .filter(|bytes| *bytes <= AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES)
+            .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        Ok(())
+    }
 }
 
 fn collect_selected_embedded_source(
@@ -3645,7 +3903,18 @@ fn collect_selected_embedded_source(
         return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
     }
     let mut entries = Vec::new();
-    collect_selected_embedded_source_descendants(root, &mut Vec::new(), &mut entries)?;
+    let mut traversal_budget = SelectedEmbeddedTraversalBudget {
+        entries: 0,
+        path_bytes: 0,
+        content_bytes: 0,
+        retained_path_bytes: 0,
+    };
+    collect_selected_embedded_source_descendants(
+        root,
+        &mut Vec::new(),
+        &mut entries,
+        &mut traversal_budget,
+    )?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut artifacts = Vec::with_capacity(entries.len());
     let mut bytes = Vec::with_capacity(entries.len());
@@ -3672,6 +3941,7 @@ fn collect_selected_embedded_source_descendants(
     directory: &Path,
     prefix: &mut Vec<Vec<u8>>,
     output: &mut Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+    traversal_budget: &mut SelectedEmbeddedTraversalBudget,
 ) -> Result<(), SelectedEmbeddedFreezePreparationError> {
     let mut children = Vec::new();
     for entry in fs::read_dir(directory)
@@ -3685,6 +3955,7 @@ fn collect_selected_embedded_source_descendants(
         if name.is_empty() || matches!(name.as_str(), "." | "..") {
             return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
         }
+        traversal_budget.reserve_child(&name, prefix.len().saturating_add(1))?;
         children.push((name, entry.path()));
     }
     children.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
@@ -3696,13 +3967,17 @@ fn collect_selected_embedded_source_descendants(
         }
         prefix.push(name.into_bytes());
         if metadata.is_dir() {
-            collect_selected_embedded_source_descendants(&path, prefix, output)?;
+            collect_selected_embedded_source_descendants(&path, prefix, output, traversal_budget)?;
         } else if metadata.is_file() {
             if output.len() >= AUTHORITATIVE_STORE_MAX_OBJECTS
                 || metadata.len() > AUTHORITATIVE_STORE_MAX_OBJECT_BYTES as u64
             {
                 return Err(SelectedEmbeddedFreezePreparationError::SourceResourceLimit);
             }
+            traversal_budget.reserve_retained_artifact_path(prefix)?;
+            output
+                .try_reserve(1)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
             let mut file = OpenOptions::new()
                 .read(true)
                 .open(&path)
@@ -3717,11 +3992,18 @@ fn collect_selected_embedded_source_descendants(
             {
                 return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
             }
-            let mut bytes = Vec::with_capacity(
-                usize::try_from(opened_metadata.len())
-                    .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?,
-            );
-            file.read_to_end(&mut bytes)
+            let expected_length = traversal_budget.reserve_content(opened_metadata.len())?;
+            let maximum_read_length = u64::try_from(expected_length)
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(expected_length.saturating_add(1))
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+            Read::by_ref(&mut file)
+                .take(maximum_read_length)
+                .read_to_end(&mut bytes)
                 .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
             if bytes.len() != opened_metadata.len() as usize
                 || file
@@ -8735,6 +9017,28 @@ fn record_id_from_event_reference(reference: &JournalReference) -> RecordId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_embedded_traversal_bounds_cumulative_retained_artifact_paths() {
+        let path = (0..1024).map(|_| vec![b'x'; 1024]).collect::<Vec<_>>();
+        let per_path =
+            path.iter().map(Vec::len).sum::<usize>() + path.len() * std::mem::size_of::<Vec<u8>>();
+        let permitted = AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES / per_path;
+        let mut budget = SelectedEmbeddedTraversalBudget {
+            entries: 0,
+            path_bytes: 0,
+            content_bytes: 0,
+            retained_path_bytes: 0,
+        };
+
+        for _ in 0..permitted {
+            assert_eq!(budget.reserve_retained_artifact_path(&path), Ok(()));
+        }
+        assert_eq!(
+            budget.reserve_retained_artifact_path(&path),
+            Err(SelectedEmbeddedFreezePreparationError::SourceResourceLimit),
+        );
+    }
 
     #[cfg(target_os = "linux")]
     struct LinuxGenesisFixture {
