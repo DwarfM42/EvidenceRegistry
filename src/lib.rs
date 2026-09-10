@@ -5372,6 +5372,7 @@ pub struct ReviewResultRecord {
     reviewer_metadata: Option<String>,
     review_package_anchor_id: JournalAnchorId,
     operation_start_journal_ref: JournalReference,
+    review_package_anchor_binding_version: Option<u64>,
 }
 
 impl ReviewResultRecord {
@@ -5393,7 +5394,7 @@ impl ReviewResultRecord {
             return Err(RecordDecodeError);
         }
         let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
-        if !matches!(field_count, 14 | 15) {
+        if !matches!(field_count, 14..=16) {
             return Err(RecordDecodeError);
         }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
@@ -5467,19 +5468,31 @@ impl ReviewResultRecord {
                     .map_err(|_| RecordDecodeError)?,
             );
         }
-        let reviewer_metadata = if field_count == 15 {
-            cursor.key(26).map_err(|_| RecordDecodeError)?;
-            Some(cursor.text().map_err(|_| RecordDecodeError)?)
-        } else {
+        let next_key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let reviewer_metadata = if next_key == 26 {
+            let metadata = cursor.text().map_err(|_| RecordDecodeError)?;
+            cursor.key(27).map_err(|_| RecordDecodeError)?;
+            Some(metadata)
+        } else if next_key == 27 {
             None
+        } else {
+            return Err(RecordDecodeError);
         };
-        cursor.key(27).map_err(|_| RecordDecodeError)?;
         let review_package_anchor_id =
             JournalAnchorId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
                 .map_err(|_| RecordDecodeError)?;
         cursor.key(28).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        let review_package_anchor_binding_version = if cursor.finished() {
+            None
+        } else {
+            cursor.key(29).map_err(|_| RecordDecodeError)?;
+            if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+                return Err(RecordDecodeError);
+            }
+            Some(1)
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -5498,6 +5511,7 @@ impl ReviewResultRecord {
             reviewer_metadata,
             review_package_anchor_id,
             operation_start_journal_ref,
+            review_package_anchor_binding_version,
         })
     }
 

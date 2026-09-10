@@ -1676,7 +1676,7 @@ fn version_1_review_request_strictly_decodes_its_anchor_transport_fields() {
 }
 
 #[test]
-fn frozen_v03_review_records_accept_only_the_assigned_local_fields() {
+fn review_records_distinguish_predecessor_and_versioned_anchor_fields() {
     assert!(ReviewRequestRecord::decode_authoritative(
         &independently_construct_frozen_v03_review_request()
     )
@@ -1692,12 +1692,10 @@ fn frozen_v03_review_records_accept_only_the_assigned_local_fields() {
         ),
         Err(evidence_registry::RecordDecodeError)
     );
-    assert_eq!(
-        ReviewResultRecord::decode_authoritative(
-            &independently_construct_review_result_with_unassigned_key_29()
-        ),
-        Err(evidence_registry::RecordDecodeError)
-    );
+    assert!(ReviewResultRecord::decode_authoritative(
+        &independently_construct_review_result_with_unassigned_key_29()
+    )
+    .is_ok());
 }
 
 #[test]
