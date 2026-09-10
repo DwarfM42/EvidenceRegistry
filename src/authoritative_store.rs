@@ -4052,9 +4052,7 @@ fn collect_selected_embedded_source_descendants(
             output
                 .try_reserve(1)
                 .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
-            let mut file = OpenOptions::new()
-                .read(true)
-                .open(&path)
+            let mut file = open_identity_handle_for_regular_file(&path)
                 .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
             let opened_metadata = file
                 .metadata()
@@ -4066,6 +4064,8 @@ fn collect_selected_embedded_source_descendants(
             {
                 return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
             }
+            ensure_path_matches_handle(&path, &file)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
             let expected_length = traversal_budget.reserve_content(opened_metadata.len())?;
             let maximum_read_length = u64::try_from(expected_length)
                 .ok()
@@ -4088,6 +4088,8 @@ fn collect_selected_embedded_source_descendants(
             {
                 return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
             }
+            ensure_path_matches_handle(&path, &file)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
             output.push((prefix.clone(), bytes));
         } else {
             return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
@@ -4941,11 +4943,19 @@ fn acquire_selected_authoritative_publication_lock(
     Ok(file)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn acquire_selected_authoritative_publication_lock(
     root: &Path,
     root_hold: &fs::File,
 ) -> Result<impl std::ops::Drop, ()> {
+    acquire_authoritative_publication_lock(root, root_hold)
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_selected_authoritative_publication_lock(
+    root: &Path,
+    root_hold: &fs::File,
+) -> Result<fs::File, ()> {
     acquire_authoritative_publication_lock(root, root_hold)
 }
 
@@ -10407,6 +10417,31 @@ mod tests {
         symlink(&regular, &alias).unwrap();
         assert!(open_identity_handle_for_regular_file(&regular).is_ok());
         assert!(open_identity_handle_for_regular_file(&alias).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_selected_embedded_source_rejects_a_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-selected-source-nofollow-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let outside = root.join("outside");
+        let alias = root.join("alias");
+        fs::write(&outside, b"outside bytes").unwrap();
+        symlink(&outside, &alias).unwrap();
+
+        assert!(matches!(
+            collect_selected_embedded_source(&root),
+            Err(SelectedEmbeddedFreezePreparationError::SourceInvalid)
+        ));
+
         fs::remove_dir_all(root).unwrap();
     }
 
