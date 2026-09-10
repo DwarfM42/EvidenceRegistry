@@ -1,0 +1,459 @@
+{
+  "status": "NONNORMATIVE_EXACT_INPUT_INDEX",
+  "baseline_commit": "7854fe96753c714e3e043c418f425b2cd713ba91",
+  "baseline_tree": "8e4411936c20a85a8ffc8388d0356a01943ed091",
+  "documents": [
+    {
+      "path": "docs/AUTHORITATIVE-STORE-PROFILE-v0.1.md",
+      "blob": "6d2d3ffe03f5fec63e4293fb4d94abedb3cd2983",
+      "sha256": "5636a533debc35a2f193317413029d7116d32f8e2087a63d0ebfb51d5eebce02",
+      "bytes": 12513,
+      "intro_commit": "9e674925deecceaaeab4272f960df759b30e4512",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "blob": "5e3885ad868c15c7d39c1e03caa594fcc4c671ef",
+      "sha256": "9e67f1dd7489bbe0391d00f70aece50d0c779ba8702bdf4726bf62377b6c89ec",
+      "bytes": 10496,
+      "intro_commit": "9e674925deecceaaeab4272f960df759b30e4512",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/CROSS-REFERENCE-v0.3.md",
+      "blob": "bff7a1ed75aec750d47e29024abb618e51d38473",
+      "sha256": "e9179edcda588d317cebf07d984462a0051bf1a4e165d57f46f30d6e6d098bca",
+      "bytes": 87533,
+      "intro_commit": "d376789f741178f7dd3bd3349ea45d17612f12bd",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/CROSS-REFERENCE-v0.4.md",
+      "blob": "a360db8ef7ab876a6479dd2f40a3d564e9c13172",
+      "sha256": "14f838e543d8faf2a4f2a983902361d74b77bbec4006edeb46d425283459013e",
+      "bytes": 9379,
+      "intro_commit": "37b5030a3dc4937123fd51bede35baa3be868147",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/CROSS-REFERENCE-v0.5.md",
+      "blob": "5443c7119ce8679eb19c81d9689f854a4b2379a3",
+      "sha256": "9254d9406557163239552899bddcf5daa811d3a942e22fcc4a4411de131b6cf0",
+      "bytes": 11984,
+      "intro_commit": "b974f01a033df6673507933e86196b286c221120",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/CROSS-REFERENCE-v0.6.md",
+      "blob": "1fbf288d264e313d8d3c48c54a4495288e7366e6",
+      "sha256": "b1b071218b6c7d9411a29ce45fe614bdf78bbaa179377e8aadc7ad2017d1bdcc",
+      "bytes": 7705,
+      "intro_commit": "832f42480b6b24bf22776ff79e383817f8bf07cb",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/CROSS-REFERENCE-v0.7.md",
+      "blob": "3809b13f486f50813c3c249b01b5a3221c40a00c",
+      "sha256": "545e5ae047c2da45055bca91fbe8b69c668f371d4789a4f4445431a3e72f64cb",
+      "bytes": 3087,
+      "intro_commit": "9e674925deecceaaeab4272f960df759b30e4512",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/CROSS-REFERENCE-v0.8.md",
+      "blob": "9bda50c7c9ff41ff1d4006b8f11bc2a060d72048",
+      "sha256": "79d801ce3d51cac5b71ab62bf62c7570a104149a1c467344e0bcd98527103b83",
+      "bytes": 3756,
+      "intro_commit": "f53decc6c2fe89523c5463643fd09ac986732eb0",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/DOCUMENT-ENCODING-NOTE-v0.1.md",
+      "blob": "8deea5d5073bd9360ef197dcc320a47af833cbe3",
+      "sha256": "1c31831053388f7a83c5ab404e25d5f2459e23bb3accc54d23eaa6973ddfb0a4",
+      "bytes": 1260,
+      "intro_commit": "3498fea980b0f26b4d108488a9bbb49c08e1517b",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md",
+      "blob": "b629e1e964678d6306502cd5f0d7ede901da7269",
+      "sha256": "4778e07f27e125fd204f999c6934cfaf90bb87b47f01a47e015b9e709ca7c5f9",
+      "bytes": 122171,
+      "intro_commit": "d376789f741178f7dd3bd3349ea45d17612f12bd",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.3.md",
+      "blob": "b6078dcfa85bcc8b210141a2e97cba04f9e71a56",
+      "sha256": "2a5bab0b89bd31f92c1d7f82f82e09aa3456d410b9e30621bc657e99de4104db",
+      "bytes": 24588,
+      "intro_commit": "37b5030a3dc4937123fd51bede35baa3be868147",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.4.md",
+      "blob": "2bce98105b057551412a5f19fec7c88ee3ad9d15",
+      "sha256": "5ff7bef38f7652df904c308b3ab69bc81efcefd37cf451a175e99462b0f7d781",
+      "bytes": 29864,
+      "intro_commit": "b974f01a033df6673507933e86196b286c221120",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.5.md",
+      "blob": "df8b5ac5906e092f0afe13911580557392cf6d7a",
+      "sha256": "8f5f3d83181e35448c50dd0fbac873dffbaa642bd68f9dff7dae3e44c5519c3b",
+      "bytes": 11286,
+      "intro_commit": "89a9b9475e63c3eaef0e9990a9c276c6396c991c",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.6.md",
+      "blob": "e06ec3c514b5c57557c9edf35673f53e46eba857",
+      "sha256": "bcb7cfc7b655c2a38a3e5d1e9e3581d7ae8d7d2462dc1a27c76e7ef23ec1b3fe",
+      "bytes": 15031,
+      "intro_commit": "1ba2b18eef6b4f79011aaae2fbb0732695dcc7eb",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.7.md",
+      "blob": "82967e5ca271aeca7d3bb0963b01f11d32b415c2",
+      "sha256": "979db8b45286ba89fa4aa4929fa23da215f355064715dc0cb87998eb0dc3367c",
+      "bytes": 16410,
+      "intro_commit": "832f42480b6b24bf22776ff79e383817f8bf07cb",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.8.md",
+      "blob": "64fd8d7c45f8e1e6af0db83143668cc3c3350a41",
+      "sha256": "d401db64b4fcad9b04fb2b2f8027ee2a2aa1d861cf60d6e76b5885409051cc5e",
+      "bytes": 8388,
+      "intro_commit": "9e674925deecceaaeab4272f960df759b30e4512",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.9.md",
+      "blob": "40f22f9edfae8fd363b87b5475168d180315a891",
+      "sha256": "3b509cc086565853dcc49b8789966e1f9f1d68f2f94f8c0ac8c93f569c25e4a6",
+      "bytes": 7317,
+      "intro_commit": "f53decc6c2fe89523c5463643fd09ac986732eb0",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/FORMAL-VERIFICATION-IMPLEMENTATION-BOUNDARY-SPEC-v0.5.4.md",
+      "blob": "6e6db39bdaa71a944477a5202c3b5bfc1894f25f",
+      "sha256": "dd0d2502862100fd27e31bd0e1d1a69e036fc8a1ca045a26a06656e1e57ce318",
+      "bytes": 128795,
+      "intro_commit": "d376789f741178f7dd3bd3349ea45d17612f12bd",
+      "role": "frozen semantic baseline; later adopted deltas retain authority ownership"
+    },
+    {
+      "path": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "blob": "3a94270624cd314738f9574ec8597ccee922d707",
+      "sha256": "65813e356eaba89c638475a40c69f728123f4314040f075a09c6be34db14e114",
+      "bytes": 8768,
+      "intro_commit": "3f724caf33cafcccd8bb64745ff3725629125c09",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/FREEZE-RECORD-LIFECYCLE-v0.10.4-CROSS-REFERENCE-v0.5.md",
+      "blob": "f76b3497ed2ad2f554c0c2e60085a6d029e99e84",
+      "sha256": "c712c54e4a67d0a454d78bb38db96ece980ba8ff079e7a7936756c333e467040",
+      "bytes": 5300,
+      "intro_commit": "d9c49c29aba6675348a306b2e821c30cfc53a4b7",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "blob": "fe58eae224b8483d3e9046c27e1409f0071ec232",
+      "sha256": "ed66d1472cd87a32a501eb7fa9c290925b6102cbe1953b03cf3a6b64cba2dff8",
+      "bytes": 7327,
+      "intro_commit": "7854fe96753c714e3e043c418f425b2cd713ba91",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/FROZEN-BASELINE-SHA256.txt",
+      "blob": "2b093f2ec98dda2333d589752c517231dcb53c68",
+      "sha256": "35513584d34c603b3c06d5addec82cb517cc7396a7dc27d03f449a37f4d52f7d",
+      "bytes": 829,
+      "intro_commit": "bfb6a3529639de4223e5028b6ec9d2e39f918603",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/IDENTITY-FORMAT-v0.3.md",
+      "blob": "7195b901faf2faca3f23b2fe76859cae04399cef",
+      "sha256": "317f257139dca32e1d0a9f8aebd38eb4f831a8a069bdea95cea2d244947f4769",
+      "bytes": 93419,
+      "intro_commit": "d376789f741178f7dd3bd3349ea45d17612f12bd",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/OWNER-USE-WORKFLOW-v0.1.md",
+      "blob": "4054e97145ec6a2b8349af92d3d0e2de316474e3",
+      "sha256": "4f18746e08db09f7c9c2d1ddfae6e10d0b9a6723666a25e0f46a65a929ef9306",
+      "bytes": 825,
+      "intro_commit": "1da8a0e8248b375da4af1f55a8e62c116fbcab12",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/RECORD-SCHEMA-v0.3.md",
+      "blob": "ec6bb9a5423fca18fc91113942fd4de19531f4e3",
+      "sha256": "f12dda3c72763474c2675b2b1d4c427ddda35bfb00fa68eafd5a054ef22051b9",
+      "bytes": 124142,
+      "intro_commit": "d376789f741178f7dd3bd3349ea45d17612f12bd",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/RECORD-SCHEMA-v0.4.md",
+      "blob": "24ef8e58b675bbaec8016a5c45f026420bd38c36",
+      "sha256": "828430df8e99869021f9931ecde387c71cdb3d4e9228b6ab8e9ce8a699f32ebc",
+      "bytes": 12649,
+      "intro_commit": "24c0593814ad428ef09bf3b846bead37c1f455b3",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/RECORD-SCHEMA-v0.5.md",
+      "blob": "99531e473583ce473eec7e8944b096817e4175e0",
+      "sha256": "a821ead608c1847f721ea88a33df40c713a862d18f95f8bf04e79c955138ee99",
+      "bytes": 9046,
+      "intro_commit": "832f42480b6b24bf22776ff79e383817f8bf07cb",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/RECORD-SCHEMA-v0.6.md",
+      "blob": "88cadfb2f52c68b4b049d10f2439c0a26497eb3c",
+      "sha256": "84c11122805026829a6df5614f67c0ab3eb6e428c5f4efe4f93f06372f920951",
+      "bytes": 5989,
+      "intro_commit": "9e674925deecceaaeab4272f960df759b30e4512",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/RECORD-SCHEMA-v0.7.md",
+      "blob": "230c0f589b1e471970d54470897168be9714f8fd",
+      "sha256": "bc56fc67ad084dc9bddc50e7c97d7068becd10dfbef1339a8de8fbd060a694df",
+      "bytes": 6230,
+      "intro_commit": "f53decc6c2fe89523c5463643fd09ac986732eb0",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md"
+    },
+    {
+      "path": "docs/SPECIFICATION-GAP-CANDIDATES.md",
+      "blob": "2cfe6726915bd27311cc287c3270b6300afcb623",
+      "sha256": "bb3db31398fff95e74ea83e5f32804ab7e2000278b2121f1b8a967710f6ce8cd",
+      "bytes": 19707,
+      "intro_commit": "3be004c76975d5c78d8ace4698af1cd7f0f23dc0",
+      "role": "diagnostic/draft unless detached adoption selects exact bytes"
+    },
+    {
+      "path": "docs/TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "blob": "7780342a2e86e01b6c0cbbf6b4513735a9360cba",
+      "sha256": "7fd9503fb4a9e0b70feab17f5ec8f7a38787e9963674b509c0186e1bd419fd75",
+      "bytes": 6160,
+      "intro_commit": "f53decc6c2fe89523c5463643fd09ac986732eb0",
+      "role": "exact adopted contract input via docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md"
+    }
+  ],
+  "manifest_checks": [
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/FREEZE-RECORD-LIFECYCLE-v0.10.4-CROSS-REFERENCE-v0.5.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.4.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.5.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.3.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/IDENTITY-FORMAT-v0.3.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.3.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.4.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.5.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.6.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.6.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.7.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.8.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.6.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.7.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/AUTHORITATIVE-STORE-PROFILE-v0.1.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/FREEZE-RECORD-LIFECYCLE-v0.10.4-CROSS-REFERENCE-v0.5.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.4.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.5.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.2.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.3.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/IDENTITY-FORMAT-v0.3.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.3.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.4.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.5.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.6.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.6.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.7.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.8.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.6.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.7.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "target": "docs/AUTHORITATIVE-STORE-PROFILE-v0.1.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/FREEZE-RECORD-AUTHORITY-PATH-SUCCESSOR-PACKAGE-v0.1.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.7.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.9.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.8.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/FREEZE-RECORD-TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/RECORD-SCHEMA-v0.7.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/EVIDENCE-REGISTRY-LIFECYCLE-SPEC-v0.10.9.md",
+      "match": true
+    },
+    {
+      "manifest": "docs/TERMINAL-REVIEW-ADMISSION-SUCCESSOR-SELECTOR-PACKAGE-v0.1.md",
+      "target": "docs/CROSS-REFERENCE-v0.8.md",
+      "match": true
+    }
+  ],
+  "manifest_check_count": 40,
+  "mismatch_count": 0
+}

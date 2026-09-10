@@ -19,12 +19,29 @@ pub use authoritative_store::{
     AuthoritativeReviewAdmissionPublishedReceiptUncertain,
     AuthoritativeReviewAdmissionRuntimeError, AuthoritativeReviewAdmissionRuntimeOutcome,
     AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error,
-    DurabilityActionState, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
+    DurabilityActionState, PreparedSelectedEmbeddedFreeze, RecordedSelectedReviewRequest,
+    RecordedSelectedReviewResult, SelectedEmbeddedFreezeCommitError,
+    SelectedEmbeddedFreezePreparationError, SelectedEmbeddedFreezePreparationInput,
+    SelectedReviewAdmissionCompletionError, SelectedReviewAdmissionSection82Error,
+    SelectedReviewRequestError, SelectedReviewRequestInput, SelectedReviewResultError,
+    SelectedReviewResultInput, SelectedTerminalInspection, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
     AUTHORITATIVE_STORE_MAX_OBJECTS, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
 };
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
 const ID_LENGTH: usize = 32;
+/// SHA-256 of the adopted raw Terminal Authority Closure Core v0.1 bytes.
+///
+/// This is a selector literal, not an inferred runtime epoch or producer attestation.
+pub const TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256: [u8; ID_LENGTH] = [
+    0xcb, 0x7e, 0xe9, 0xe9, 0xe5, 0xf9, 0xd0, 0x22, 0x9d, 0xba, 0x26, 0x01, 0x2e, 0xcb, 0x52, 0x31,
+    0xc2, 0x67, 0x71, 0xa6, 0xd5, 0x4c, 0x3c, 0x95, 0x76, 0x2c, 0x10, 0x94, 0xec, 0x1f, 0xc1, 0x6d,
+];
+
+const TERMINAL_REVIEW_ADMISSION_LEGACY_SELECTOR_SHA256: [u8; ID_LENGTH] = [
+    0x65, 0x81, 0x3e, 0x35, 0x6e, 0xab, 0xa8, 0x9c, 0x63, 0x84, 0x75, 0xa4, 0x0c, 0x69, 0xf7, 0x28,
+    0x12, 0x3f, 0x43, 0x14, 0x04, 0x0f, 0x07, 0x5a, 0x09, 0xc6, 0xbe, 0x34, 0xdb, 0x14, 0xe1, 0x14,
+];
 
 #[cfg(test)]
 std::thread_local! {
@@ -531,7 +548,7 @@ impl TryFrom<u64> for RecordTypeId {
                 | 30..=32
                 | 40
                 | 50
-                | 60..=63
+                | 60..=64
                 | 70..=72
                 | 80..=90
         );
@@ -2425,6 +2442,35 @@ fn encode_bstr_32(output: &mut Vec<u8>, bytes: &[u8; ID_LENGTH]) {
     output.extend_from_slice(bytes);
 }
 
+fn encode_bstr(output: &mut Vec<u8>, bytes: &[u8]) {
+    let length = u64::try_from(bytes.len()).expect("platform usize fits into u64");
+    debug_assert!(length <= ER_UINT_MAX);
+    match length {
+        0..=23 => output.push(0x40 | length as u8),
+        24..=0xff => output.extend_from_slice(&[0x58, length as u8]),
+        0x100..=0xffff => output.extend_from_slice(&[0x59, (length >> 8) as u8, length as u8]),
+        0x1_0000..=0xffff_ffff => output.extend_from_slice(&[
+            0x5a,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+        _ => output.extend_from_slice(&[
+            0x5b,
+            (length >> 56) as u8,
+            (length >> 48) as u8,
+            (length >> 40) as u8,
+            (length >> 32) as u8,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+    }
+    output.extend_from_slice(bytes);
+}
+
 fn encode_uint(output: &mut Vec<u8>, value: u64) {
     debug_assert!(value <= ER_UINT_MAX);
     match value {
@@ -2697,6 +2743,15 @@ fn decode_journal_reference(
         reference_event,
         reference_record,
     ))
+}
+
+fn encode_journal_reference(output: &mut Vec<u8>, reference: &JournalReference) {
+    output.push(0x85);
+    encode_bstr_32(output, reference.registry_id().as_bytes());
+    encode_uint(output, reference.entry_index().value());
+    encode_bstr_32(output, reference.entry_hash().as_bytes());
+    encode_uint(output, u64::from(reference.event_type_id().value()));
+    encode_bstr_32(output, reference.event_record_id().as_bytes());
 }
 
 struct CborCursor<'a> {
@@ -3117,6 +3172,51 @@ pub struct ManifestArtifactEntry {
     pub digest_bytes: [u8; ID_LENGTH],
 }
 
+/// Derives the selected regular-file Subject projection from an already
+/// canonical Manifest artifact array. This is a pure projection only; callers
+/// must separately establish source, retained-payload, and Record authority.
+pub fn derive_selected_regular_file_subject(
+    artifacts: &[ManifestArtifactEntry],
+) -> Result<[u8; ID_LENGTH], RecordDecodeError> {
+    let mut previous_path: Option<&[Vec<u8>]> = None;
+    for artifact in artifacts {
+        if artifact.artifact_kind_id != 1
+            || artifact.digest_algorithm_id != 1
+            || artifact.path_components.is_empty()
+            || artifact.path_components.iter().any(|component| {
+                component.is_empty() || matches!(component.as_slice(), b"." | b"..")
+            })
+            || previous_path.is_some_and(|previous| previous >= artifact.path_components.as_slice())
+        {
+            return Err(RecordDecodeError);
+        }
+        previous_path = Some(&artifact.path_components);
+    }
+
+    let mut projection = Vec::with_capacity(64 + artifacts.len() * 64);
+    projection.push(0x85);
+    encode_text(&mut projection, "EvidenceRegistry.Subject.RegularFiles.v1");
+    encode_uint(&mut projection, 1);
+    encode_uint(&mut projection, 1);
+    encode_uint(&mut projection, artifacts.len() as u64);
+    encode_array_length(&mut projection, artifacts.len());
+    for artifact in artifacts {
+        projection.push(0x85);
+        encode_uint(&mut projection, artifact.artifact_kind_id);
+        encode_array_length(&mut projection, artifact.path_components.len());
+        for component in &artifact.path_components {
+            encode_bstr(&mut projection, component);
+        }
+        encode_uint(&mut projection, artifact.size_bytes);
+        encode_uint(&mut projection, artifact.digest_algorithm_id);
+        encode_bstr_32(&mut projection, &artifact.digest_bytes);
+    }
+    Ok(Sha256::digest(projection)
+        .as_slice()
+        .try_into()
+        .expect("SHA-256 always has exact Subject width"))
+}
+
 /// Typed, Record-local fields decoded from a MANIFEST Record.
 ///
 /// The selected path and digest profile semantics remain external. These fields
@@ -3140,6 +3240,66 @@ pub struct ManifestRecord {
 }
 
 impl ManifestRecord {
+    /// Constructs canonical MANIFEST Record bytes from already selected local
+    /// fields. This establishes neither source, retained-payload, profile, nor
+    /// authority facts.
+    pub fn new(input: ManifestRecordInput) -> Result<Self, RecordDecodeError> {
+        if input.artifact_count != input.artifacts.len() as u64 {
+            return Err(RecordDecodeError);
+        }
+        let mut artifact_paths = BTreeSet::new();
+        for artifact in &input.artifacts {
+            if !matches!(artifact.artifact_kind_id, 1 | 2)
+                || artifact.path_components.is_empty()
+                || artifact.path_components.iter().any(|component| {
+                    component.is_empty() || matches!(component.as_slice(), b"." | b"..")
+                })
+                || artifact.digest_algorithm_id != 1
+                || !artifact_paths.insert(artifact.path_components.clone())
+            {
+                return Err(RecordDecodeError);
+            }
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0_u8; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact canonical MANIFEST Record bytes for these local fields.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128 + self.input.artifacts.len() * 80);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x02, 0x01, 0xa7, 0x00, 0x01, 0x01, 0x02, 0x10]);
+        encode_bstr_32(&mut bytes, &self.input.subject_id);
+        encode_uint(&mut bytes, 17);
+        encode_uint(&mut bytes, self.input.artifact_count);
+        encode_uint(&mut bytes, 18);
+        encode_uint(&mut bytes, self.input.path_identity_profile_id);
+        encode_uint(&mut bytes, 19);
+        encode_uint(&mut bytes, self.input.digest_profile_id);
+        encode_uint(&mut bytes, 20);
+        encode_array_length(&mut bytes, self.input.artifacts.len());
+        for artifact in &self.input.artifacts {
+            bytes.push(0x85);
+            encode_uint(&mut bytes, artifact.artifact_kind_id);
+            encode_array_length(&mut bytes, artifact.path_components.len());
+            for component in &artifact.path_components {
+                encode_bstr(&mut bytes, component);
+            }
+            encode_uint(&mut bytes, artifact.size_bytes);
+            encode_uint(&mut bytes, artifact.digest_algorithm_id);
+            encode_bstr_32(&mut bytes, &artifact.digest_bytes);
+        }
+        bytes
+    }
+
     /// Strictly decodes the frozen MANIFEST local Record grammar without normalization.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
@@ -3218,16 +3378,17 @@ impl ManifestRecord {
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
-        Ok(Self {
-            record_id: frame.record_id(),
-            input: ManifestRecordInput {
-                subject_id,
-                artifact_count,
-                path_identity_profile_id,
-                digest_profile_id,
-                artifacts,
-            },
-        })
+        let decoded = Self::new(ManifestRecordInput {
+            subject_id,
+            artifact_count,
+            path_identity_profile_id,
+            digest_profile_id,
+            artifacts,
+        })?;
+        if decoded.record_id != frame.record_id() || decoded.authoritative_cbor() != input {
+            return Err(RecordDecodeError);
+        }
+        Ok(decoded)
     }
 
     /// The exact immutable identity of the strictly decoded MANIFEST Record.
@@ -4820,6 +4981,28 @@ pub fn validate_policy_recorded_structural_binding(
 /// identity. It does not establish Request authority, package authority,
 /// retained-Journal Anchor resolution, §82 completion, Policy satisfaction, or
 /// Admission.
+/// Typed local fields for the selected version-1 REVIEW_REQUEST form.
+///
+/// These fields are record-local only. The Store-owned producer resolves the
+/// retained Freeze and Policy authorities and derives the Anchor before using
+/// this constructor; this type does not establish any of those facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRequestRecordInput {
+    pub freeze_authority_ref: JournalReference,
+    pub manifest_id: RecordId,
+    pub review_role_id: u64,
+    pub required_checks_ref: RecordId,
+    pub policy_authority_ref: JournalReference,
+    pub review_scope_ref: RecordId,
+    pub review_method_ref: RecordId,
+    pub review_package_anchor_id: JournalAnchorId,
+    pub operation_start_journal_ref: JournalReference,
+}
+
+/// A rejected selected REVIEW_REQUEST local construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewRequestRecordError;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewRequestRecord {
     record_id: RecordId,
@@ -4832,9 +5015,72 @@ pub struct ReviewRequestRecord {
     review_method_ref: RecordId,
     review_package_anchor_id: JournalAnchorId,
     operation_start_journal_ref: JournalReference,
+    terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
 }
 
 impl ReviewRequestRecord {
+    /// Constructs the exact selected version-1 Request encoding.
+    ///
+    /// This fixes the selected marker but makes no Freeze, Policy, Anchor,
+    /// evaluation, admission, or publication claim.
+    pub fn new_selected(input: ReviewRequestRecordInput) -> Result<Self, ReviewRequestRecordError> {
+        if !matches!(input.review_role_id, 1..=5)
+            || input.freeze_authority_ref.event_type_id().value() != 101
+            || input.policy_authority_ref.event_type_id().value() != 400
+        {
+            return Err(ReviewRequestRecordError);
+        }
+        let mut value = Self {
+            record_id: RecordId([0; ID_LENGTH]),
+            freeze_authority_ref: input.freeze_authority_ref,
+            manifest_id: input.manifest_id,
+            review_role_id: input.review_role_id,
+            required_checks_ref: input.required_checks_ref,
+            policy_authority_ref: input.policy_authority_ref,
+            review_scope_ref: input.review_scope_ref,
+            review_method_ref: input.review_method_ref,
+            review_package_anchor_id: input.review_package_anchor_id,
+            operation_start_journal_ref: input.operation_start_journal_ref,
+            terminal_authority_closure_sha256: Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256),
+        };
+        value.record_id = RecordId(
+            Sha256::digest(value.authoritative_cbor())
+                .as_slice()
+                .try_into()
+                .expect("SHA-256 always has the exact RecordId width"),
+        );
+        Ok(value)
+    }
+
+    /// Emits the exact canonical selected Request Record bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        debug_assert_eq!(RECORD_DOMAIN.len(), 26);
+        let mut bytes = Vec::with_capacity(600);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x18, 30, 0x01, 0xad, 0x00, 0x01, 0x01, 0x18, 30, 0x10]);
+        encode_journal_reference(&mut bytes, &self.freeze_authority_ref);
+        bytes.push(0x11);
+        encode_bstr_32(&mut bytes, self.manifest_id.as_bytes());
+        bytes.push(0x12);
+        encode_uint(&mut bytes, self.review_role_id);
+        bytes.push(0x13);
+        encode_bstr_32(&mut bytes, self.required_checks_ref.as_bytes());
+        bytes.push(0x14);
+        encode_journal_reference(&mut bytes, &self.policy_authority_ref);
+        bytes.push(0x15);
+        encode_bstr_32(&mut bytes, self.review_scope_ref.as_bytes());
+        bytes.push(0x16);
+        encode_bstr_32(&mut bytes, self.review_method_ref.as_bytes());
+        bytes.push(0x17);
+        encode_bstr_32(&mut bytes, self.review_package_anchor_id.as_bytes());
+        bytes.extend_from_slice(&[0x18, 0x18]);
+        encode_journal_reference(&mut bytes, &self.operation_start_journal_ref);
+        bytes.extend_from_slice(&[0x18, 0x19, 0x01, 0x18, 0x1a]);
+        encode_bstr_32(&mut bytes, &TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256);
+        bytes
+    }
+
     /// Strictly decodes the frozen Record Schema v0.3 version-1
     /// REVIEW_REQUEST local grammar without normalizing bytes.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
@@ -4852,7 +5098,10 @@ impl ReviewRequestRecord {
         {
             return Err(RecordDecodeError);
         }
-        cursor.map_exact(11).map_err(|_| RecordDecodeError)?;
+        let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(field_count, 11 | 13) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
         if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
             return Err(RecordDecodeError);
@@ -4895,6 +5144,20 @@ impl ReviewRequestRecord {
         cursor.key(24).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        let terminal_authority_closure_sha256 = if field_count == 13 {
+            cursor.key(25).map_err(|_| RecordDecodeError)?;
+            if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+                return Err(RecordDecodeError);
+            }
+            cursor.key(26).map_err(|_| RecordDecodeError)?;
+            let marker = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            (marker == TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+                .then_some(marker)
+                .ok_or(RecordDecodeError)
+                .map(Some)?
+        } else {
+            None
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -4909,6 +5172,7 @@ impl ReviewRequestRecord {
             review_method_ref,
             review_package_anchor_id,
             operation_start_journal_ref,
+            terminal_authority_closure_sha256,
         })
     }
 
@@ -4961,7 +5225,267 @@ impl ReviewRequestRecord {
     pub fn operation_start_journal_ref(&self) -> &JournalReference {
         &self.operation_start_journal_ref
     }
+
+    /// Returns the exact selected Request marker when this Request selected that route.
+    pub fn terminal_authority_closure_sha256(&self) -> Option<&[u8; ID_LENGTH]> {
+        self.terminal_authority_closure_sha256.as_ref()
+    }
 }
+
+/// Typed inputs for a selected REVIEW_REQUEST_RECORDED Journal Entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRequestJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub request: ReviewRequestRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+/// A rejected selected REVIEW_REQUEST_RECORDED Entry construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewRequestJournalEntryError;
+
+/// A canonical selected REVIEW_REQUEST_RECORDED Journal Entry.
+///
+/// This construction binds exact typed local dependencies. It does not
+/// establish the selected Freeze or Policy prerequisites, evaluate the Policy,
+/// or publish the Entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRequestJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    request: ReviewRequestRecord,
+    identity_dependencies: IdentityDependencyCollection,
+    authority_dependencies: AuthorityDependencyCollection,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl ReviewRequestJournalEntry {
+    /// Constructs the selected Request event from its exact selected Request Record.
+    pub fn new(
+        input: ReviewRequestJournalEntryInput,
+    ) -> Result<Self, ReviewRequestJournalEntryError> {
+        if input.entry_index.value() == 0
+            || input.request.terminal_authority_closure_sha256()
+                != Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+        {
+            return Err(ReviewRequestJournalEntryError);
+        }
+        let event_record_id =
+            EventRecordId::try_from(input.request.record_id().as_bytes().as_slice())
+                .expect("RecordId has the exact EventRecordId width");
+        let identity_dependencies =
+            IdentityDependencyCollection::from_unordered_semantic_elements(vec![
+                IdentityDependency::record_id(input.request.manifest_id()),
+                IdentityDependency::record_id(input.request.required_checks_ref()),
+                IdentityDependency::record_id(input.request.review_scope_ref()),
+                IdentityDependency::record_id(input.request.review_method_ref()),
+                IdentityDependency::journal_anchor_id(input.request.review_package_anchor_id()),
+            ])
+            .map_err(|_| ReviewRequestJournalEntryError)?;
+        let authority_dependencies =
+            AuthorityDependencyCollection::from_unordered_semantic_elements(
+                AuthorityDependencyContext::new(input.registry_id, input.entry_index),
+                vec![
+                    input.request.freeze_authority_ref().clone(),
+                    input.request.policy_authority_ref().clone(),
+                ],
+            )
+            .map_err(|_| ReviewRequestJournalEntryError)?;
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id,
+            request: input.request,
+            identity_dependencies,
+            authority_dependencies,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    pub fn event_type_id(&self) -> EventTypeId {
+        EventTypeId::try_from(300).expect("REVIEW_REQUEST_RECORDED is assigned")
+    }
+
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+
+    pub fn request(&self) -> &ReviewRequestRecord {
+        &self.request
+    }
+
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(900);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id().value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x06);
+        bytes.extend_from_slice(&self.identity_dependencies.authoritative_cbor());
+        bytes.push(0x07);
+        bytes.extend_from_slice(&self.authority_dependencies.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x04, 0x09]);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes
+    }
+}
+
+/// Typed inputs for one selected REVIEW_RESULT_RECORDED Journal Entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub result: ReviewResultRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewResultJournalEntryError;
+
+/// A canonical selected REVIEW_RESULT_RECORDED Journal Entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    result: ReviewResultRecord,
+    identity_dependencies: IdentityDependencyCollection,
+    authority_dependencies: AuthorityDependencyCollection,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl ReviewResultJournalEntry {
+    pub fn new(
+        input: ReviewResultJournalEntryInput,
+    ) -> Result<Self, ReviewResultJournalEntryError> {
+        if input.entry_index.value() == 0
+            || input.result.review_package_anchor_binding_version != Some(1)
+        {
+            return Err(ReviewResultJournalEntryError);
+        }
+        let event_record_id =
+            EventRecordId::try_from(input.result.record_id().as_bytes().as_slice())
+                .expect("RecordId has exact EventRecordId width");
+        let mut identities = vec![
+            IdentityDependency::record_id(input.result.manifest_id()),
+            IdentityDependency::record_id(input.result.review_scope_ref()),
+            IdentityDependency::record_id(input.result.review_method_ref()),
+            IdentityDependency::journal_anchor_id(input.result.review_package_anchor_id()),
+        ];
+        identities.extend(
+            input
+                .result
+                .findings
+                .iter()
+                .copied()
+                .map(IdentityDependency::record_id),
+        );
+        let identity_dependencies =
+            IdentityDependencyCollection::from_unordered_semantic_elements(identities)
+                .map_err(|_| ReviewResultJournalEntryError)?;
+        let authority_dependencies =
+            AuthorityDependencyCollection::from_unordered_semantic_elements(
+                AuthorityDependencyContext::new(input.registry_id, input.entry_index),
+                vec![input.result.review_request_authority_ref().clone()],
+            )
+            .map_err(|_| ReviewResultJournalEntryError)?;
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id,
+            result: input.result,
+            identity_dependencies,
+            authority_dependencies,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    pub fn event_type_id(&self) -> EventTypeId {
+        EventTypeId::try_from(301).expect("REVIEW_RESULT_RECORDED is assigned")
+    }
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+    pub fn result(&self) -> &ReviewResultRecord {
+        &self.result
+    }
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(900);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xac);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id().value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x06);
+        bytes.extend_from_slice(&self.identity_dependencies.authoritative_cbor());
+        bytes.push(0x07);
+        bytes.extend_from_slice(&self.authority_dependencies.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x05, 0x09]);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes
+    }
+}
+
+/// Typed local fields for a selected version-1 REVIEW_RESULT form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewResultRecordInput {
+    pub review_request_authority_ref: JournalReference,
+    pub freeze_authority_ref: JournalReference,
+    pub manifest_id: RecordId,
+    pub review_role_id: u64,
+    pub review_scope_ref: RecordId,
+    pub review_method_ref: RecordId,
+    pub method_status: u64,
+    pub finding_state: u64,
+    pub reason_codes: Vec<String>,
+    pub findings: Vec<RecordId>,
+    pub reviewer_metadata: Option<String>,
+    pub review_package_anchor_id: JournalAnchorId,
+    pub operation_start_journal_ref: JournalReference,
+}
+
+/// A rejected selected REVIEW_RESULT local construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewResultRecordError;
 
 /// The exact version-1 Review Package Anchor transport fields and predecessor
 /// Review Result fields decoded from a prospective REVIEW_RESULT Record.
@@ -4986,9 +5510,99 @@ pub struct ReviewResultRecord {
     reviewer_metadata: Option<String>,
     review_package_anchor_id: JournalAnchorId,
     operation_start_journal_ref: JournalReference,
+    review_package_anchor_binding_version: Option<u64>,
 }
 
 impl ReviewResultRecord {
+    /// Constructs exact canonical Result bytes. This does not establish Review,
+    /// Policy, §82, Admission, or publication authority.
+    pub fn new_selected(input: ReviewResultRecordInput) -> Result<Self, ReviewResultRecordError> {
+        if input.review_request_authority_ref.event_type_id().value() != 300
+            || input.freeze_authority_ref.event_type_id().value() != 101
+            || !matches!(input.review_role_id, 1..=5)
+            || !matches!(input.method_status, 1..=3)
+            || !matches!(input.finding_state, 1..=3)
+            || input
+                .reason_codes
+                .windows(2)
+                .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        {
+            return Err(ReviewResultRecordError);
+        }
+        let mut value = Self {
+            record_id: RecordId([0; ID_LENGTH]),
+            review_request_authority_ref: input.review_request_authority_ref,
+            freeze_authority_ref: input.freeze_authority_ref,
+            manifest_id: input.manifest_id,
+            review_role_id: input.review_role_id,
+            review_scope_ref: input.review_scope_ref,
+            review_method_ref: input.review_method_ref,
+            method_status: input.method_status,
+            finding_state: input.finding_state,
+            reason_codes: input.reason_codes,
+            findings: input.findings,
+            reviewer_metadata: input.reviewer_metadata,
+            review_package_anchor_id: input.review_package_anchor_id,
+            operation_start_journal_ref: input.operation_start_journal_ref,
+            review_package_anchor_binding_version: Some(1),
+        };
+        value.record_id = RecordId(
+            Sha256::digest(value.authoritative_cbor())
+                .as_slice()
+                .try_into()
+                .expect("SHA-256 has exact RecordId width"),
+        );
+        Ok(value)
+    }
+
+    /// Emits the exact canonical selected REVIEW_RESULT bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let map_header = if self.reviewer_metadata.is_some() {
+            0xb0
+        } else {
+            0xaf
+        };
+        let mut bytes = Vec::with_capacity(800);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x18, 31, 0x01, map_header, 0x00, 0x01, 0x01, 0x18, 31, 0x10]);
+        encode_journal_reference(&mut bytes, &self.review_request_authority_ref);
+        bytes.push(0x11);
+        encode_journal_reference(&mut bytes, &self.freeze_authority_ref);
+        bytes.push(0x12);
+        encode_bstr_32(&mut bytes, self.manifest_id.as_bytes());
+        bytes.push(0x13);
+        encode_uint(&mut bytes, self.review_role_id);
+        bytes.push(0x14);
+        encode_bstr_32(&mut bytes, self.review_scope_ref.as_bytes());
+        bytes.push(0x15);
+        encode_bstr_32(&mut bytes, self.review_method_ref.as_bytes());
+        bytes.push(0x16);
+        encode_uint(&mut bytes, self.method_status);
+        bytes.push(0x17);
+        encode_uint(&mut bytes, self.finding_state);
+        bytes.extend_from_slice(&[0x18, 0x18]);
+        encode_array_length(&mut bytes, self.reason_codes.len());
+        for reason in &self.reason_codes {
+            encode_text(&mut bytes, reason);
+        }
+        bytes.extend_from_slice(&[0x18, 0x19]);
+        encode_array_length(&mut bytes, self.findings.len());
+        for finding in &self.findings {
+            encode_bstr_32(&mut bytes, finding.as_bytes());
+        }
+        if let Some(metadata) = &self.reviewer_metadata {
+            bytes.extend_from_slice(&[0x18, 0x1a]);
+            encode_text(&mut bytes, metadata);
+        }
+        bytes.extend_from_slice(&[0x18, 0x1b]);
+        encode_bstr_32(&mut bytes, self.review_package_anchor_id.as_bytes());
+        bytes.extend_from_slice(&[0x18, 0x1c]);
+        encode_journal_reference(&mut bytes, &self.operation_start_journal_ref);
+        bytes.extend_from_slice(&[0x18, 0x1d, 0x01]);
+        bytes
+    }
+
     /// Strictly decodes the frozen Record Schema v0.3 version-1
     /// REVIEW_RESULT local grammar without normalizing bytes.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
@@ -5007,7 +5621,7 @@ impl ReviewResultRecord {
             return Err(RecordDecodeError);
         }
         let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
-        if !matches!(field_count, 14 | 15) {
+        if !matches!(field_count, 14..=16) {
             return Err(RecordDecodeError);
         }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
@@ -5081,19 +5695,31 @@ impl ReviewResultRecord {
                     .map_err(|_| RecordDecodeError)?,
             );
         }
-        let reviewer_metadata = if field_count == 15 {
-            cursor.key(26).map_err(|_| RecordDecodeError)?;
-            Some(cursor.text().map_err(|_| RecordDecodeError)?)
-        } else {
+        let next_key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let reviewer_metadata = if next_key == 26 {
+            let metadata = cursor.text().map_err(|_| RecordDecodeError)?;
+            cursor.key(27).map_err(|_| RecordDecodeError)?;
+            Some(metadata)
+        } else if next_key == 27 {
             None
+        } else {
+            return Err(RecordDecodeError);
         };
-        cursor.key(27).map_err(|_| RecordDecodeError)?;
         let review_package_anchor_id =
             JournalAnchorId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
                 .map_err(|_| RecordDecodeError)?;
         cursor.key(28).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        let review_package_anchor_binding_version = if cursor.finished() {
+            None
+        } else {
+            cursor.key(29).map_err(|_| RecordDecodeError)?;
+            if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+                return Err(RecordDecodeError);
+            }
+            Some(1)
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -5112,6 +5738,7 @@ impl ReviewResultRecord {
             reviewer_metadata,
             review_package_anchor_id,
             operation_start_journal_ref,
+            review_package_anchor_binding_version,
         })
     }
 
@@ -5165,6 +5792,11 @@ impl ReviewResultRecord {
         self.method_status
     }
 
+    /// The selected Result package-Anchor binding grammar version, if present.
+    pub fn review_package_anchor_binding_version(&self) -> Option<u64> {
+        self.review_package_anchor_binding_version
+    }
+
     /// The exact Finding-state registry value carried by the Review Result.
     pub fn finding_state(&self) -> u64 {
         self.finding_state
@@ -5208,6 +5840,7 @@ pub struct ReviewAdmissionRecord {
     policy_authority_ref: JournalReference,
     reason_codes: Vec<String>,
     operation_start_journal_ref: JournalReference,
+    terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
 }
 
 impl ReviewAdmissionRecord {
@@ -5215,6 +5848,26 @@ impl ReviewAdmissionRecord {
     /// already-resolved references. This local constructor does not establish
     /// that the selected disposition is lawful or publish an event.
     pub fn new(input: ReviewAdmissionRecordInput) -> Result<Self, ReviewAdmissionRecordError> {
+        Self::new_with_terminal_authority_closure(input, None)
+    }
+
+    /// Constructs the selected terminal form bound to both assigned selectors.
+    ///
+    /// This only constructs the exact Record-local selected encoding; it does
+    /// not establish a lawful disposition or publish a Journal event.
+    pub fn new_selected(
+        input: ReviewAdmissionRecordInput,
+    ) -> Result<Self, ReviewAdmissionRecordError> {
+        Self::new_with_terminal_authority_closure(
+            input,
+            Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256),
+        )
+    }
+
+    fn new_with_terminal_authority_closure(
+        input: ReviewAdmissionRecordInput,
+        terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
+    ) -> Result<Self, ReviewAdmissionRecordError> {
         if !matches!(input.disposition_id, 1 | 2)
             || input.review_request_ref.event_type_id().value() != 300
             || input.review_result_ref.event_type_id().value() != 301
@@ -5235,6 +5888,7 @@ impl ReviewAdmissionRecord {
             policy_authority_ref: input.policy_authority_ref,
             reason_codes: input.reason_codes,
             operation_start_journal_ref: input.operation_start_journal_ref,
+            terminal_authority_closure_sha256,
         };
         record.record_id =
             RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
@@ -5249,7 +5903,11 @@ impl ReviewAdmissionRecord {
         bytes.extend_from_slice(RECORD_DOMAIN);
         encode_uint(&mut bytes, 32);
         bytes.push(1);
-        bytes.push(0xa8);
+        bytes.push(if self.terminal_authority_closure_sha256.is_some() {
+            0xaa
+        } else {
+            0xa8
+        });
         bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
         encode_uint(&mut bytes, 32);
         encode_uint(&mut bytes, 16);
@@ -5267,6 +5925,15 @@ impl ReviewAdmissionRecord {
         }
         encode_uint(&mut bytes, 23);
         bytes.extend_from_slice(&self.operation_start_journal_ref.authoritative_cbor());
+        if let Some(selector) = self.terminal_authority_closure_sha256 {
+            encode_uint(&mut bytes, 24);
+            encode_bstr_32(
+                &mut bytes,
+                &TERMINAL_REVIEW_ADMISSION_LEGACY_SELECTOR_SHA256,
+            );
+            encode_uint(&mut bytes, 25);
+            encode_bstr_32(&mut bytes, &selector);
+        }
         bytes
     }
 
@@ -5287,7 +5954,10 @@ impl ReviewAdmissionRecord {
         {
             return Err(RecordDecodeError);
         }
-        cursor.map_exact(8).map_err(|_| RecordDecodeError)?;
+        let body_field_count = cursor.map().map_err(|_| RecordDecodeError)?;
+        if !matches!(body_field_count, 8 | 10) {
+            return Err(RecordDecodeError);
+        }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
         if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
             return Err(RecordDecodeError);
@@ -5337,6 +6007,22 @@ impl ReviewAdmissionRecord {
         cursor.key(23).map_err(|_| RecordDecodeError)?;
         let operation_start_journal_ref =
             decode_journal_reference(&mut cursor).map_err(|_| RecordDecodeError)?;
+        let terminal_authority_closure_sha256 = if body_field_count == 10 {
+            cursor.key(24).map_err(|_| RecordDecodeError)?;
+            if cursor.bstr_32().map_err(|_| RecordDecodeError)?
+                != TERMINAL_REVIEW_ADMISSION_LEGACY_SELECTOR_SHA256
+            {
+                return Err(RecordDecodeError);
+            }
+            cursor.key(25).map_err(|_| RecordDecodeError)?;
+            let selector = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+            if selector != TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256 {
+                return Err(RecordDecodeError);
+            }
+            Some(selector)
+        } else {
+            None
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -5348,6 +6034,7 @@ impl ReviewAdmissionRecord {
             policy_authority_ref,
             reason_codes,
             operation_start_journal_ref,
+            terminal_authority_closure_sha256,
         })
     }
 
@@ -5384,6 +6071,11 @@ impl ReviewAdmissionRecord {
     /// The exact Record-local operation-start chronology reference.
     pub fn operation_start_journal_ref(&self) -> &JournalReference {
         &self.operation_start_journal_ref
+    }
+
+    /// The exact selected-terminal Core digest when both selector fields are present.
+    pub fn terminal_authority_closure_sha256(&self) -> Option<&[u8; ID_LENGTH]> {
+        self.terminal_authority_closure_sha256.as_ref()
     }
 }
 
@@ -6248,6 +6940,133 @@ impl FreezeAttemptStartRecord {
     }
 }
 
+/// Typed inputs for a FREEZE_ATTEMPT_STARTED Journal Entry.
+///
+/// This construction layer derives the event's lifecycle and Record bindings
+/// from the exact typed START Record. It neither allocates an Attempt nor
+/// publishes an event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub start_record: FreezeAttemptStartRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+/// A rejected FREEZE_ATTEMPT_STARTED Journal Entry construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartJournalEntryError;
+
+/// A canonical FREEZE_ATTEMPT_STARTED Journal Entry, not a publication effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    start_record: FreezeAttemptStartRecord,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl FreezeAttemptStartJournalEntry {
+    /// Constructs the event-100 Entry derived from one exact START Record.
+    pub fn new(
+        input: FreezeAttemptStartJournalEntryInput,
+    ) -> Result<Self, FreezeAttemptStartJournalEntryError> {
+        if input.entry_index.value() == 0 {
+            return Err(FreezeAttemptStartJournalEntryError);
+        }
+        let event_record_id =
+            EventRecordId::try_from(input.start_record.record_id().as_bytes().as_slice())
+                .expect("RecordId has EventRecordId width");
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id,
+            start_record: input.start_record,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    /// The frozen event type for a Freeze Attempt start.
+    pub fn event_type_id(&self) -> EventTypeId {
+        EventTypeId::try_from(100).expect("FREEZE_ATTEMPT_STARTED is registered")
+    }
+
+    /// The exact typed START Record identity carried by this Entry.
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+
+    /// The exact publication-time Journal slot selected by compare-and-append.
+    pub fn entry_index(&self) -> JournalEntryIndex {
+        self.entry_index
+    }
+
+    /// The exact publication-time predecessor hash.
+    pub fn previous_entry_hash(&self) -> JournalEntryHash {
+        self.previous_entry_hash
+    }
+
+    /// The exact typed START Record whose fields bind this Entry.
+    pub fn start_record(&self) -> &FreezeAttemptStartRecord {
+        &self.start_record
+    }
+
+    /// The storage-capability observation derived from the publication-time head.
+    pub fn storage_capability_class_id(&self) -> RecordId {
+        self.storage_capability_class_id
+    }
+
+    /// The environment observation derived from the publication-time head.
+    pub fn environment_observation_id(&self) -> RecordId {
+        self.environment_observation_id
+    }
+
+    /// Emits exact canonical FREEZE_ATTEMPT_STARTED Journal Entry bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(320);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xae);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id().value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x02, 0x09]);
+        encode_bstr_32(
+            &mut bytes,
+            self.start_record.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes.push(0x10);
+        encode_bstr_32(
+            &mut bytes,
+            self.start_record.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x11);
+        encode_bstr_32(
+            &mut bytes,
+            self.start_record.input().intended_root_id.as_bytes(),
+        );
+        bytes
+    }
+}
+
 /// Typed, Record-local fields decoded from a FREEZE_RECEIPT Record.
 ///
 /// These fields establish only the strict local Record grammar and exact Record
@@ -6270,6 +7089,7 @@ pub struct FreezeReceiptRecordInput {
     pub parent_directory_flush_state: u64,
     pub platform_strongest_available: bool,
     pub requested_commit_durability_ref: Option<RecordId>,
+    pub terminal_authority_closure_sha256: Option<[u8; ID_LENGTH]>,
     pub created_by_tool_version: String,
 }
 
@@ -6281,6 +7101,92 @@ pub struct FreezeReceiptRecord {
 }
 
 impl FreezeReceiptRecord {
+    /// Constructs canonical FREEZE_RECEIPT Record bytes from locally valid fields.
+    ///
+    /// This establishes only local grammar and Record identity. It does not
+    /// establish policy, authority, admission, durability, custody, or lifecycle
+    /// truth.
+    pub fn new(input: FreezeReceiptRecordInput) -> Result<Self, RecordDecodeError> {
+        if !matches!(input.custody_mode_id, 1 | 2)
+            || !matches!(input.file_content_flush_state, 1..=3)
+            || !matches!(input.atomic_publish_no_replace_state, 1..=3)
+            || !matches!(input.parent_directory_flush_state, 1..=3)
+            || input
+                .terminal_authority_closure_sha256
+                .is_some_and(|marker| marker != TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+        {
+            return Err(RecordDecodeError);
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0_u8; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact canonical FREEZE_RECEIPT Record bytes for these local fields.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let field_count = 17
+            + usize::from(self.input.requested_commit_durability_ref.is_some())
+            + usize::from(self.input.terminal_authority_closure_sha256.is_some());
+        let mut bytes = Vec::with_capacity(512);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x04, 0x01]);
+        encode_map_length(&mut bytes, field_count);
+        encode_uint(&mut bytes, 0);
+        encode_uint(&mut bytes, 1);
+        encode_uint(&mut bytes, 1);
+        encode_uint(&mut bytes, 4);
+        encode_uint(&mut bytes, 16);
+        encode_bstr_32(&mut bytes, self.input.freeze_attempt_id.as_bytes());
+        encode_uint(&mut bytes, 17);
+        encode_bstr_32(&mut bytes, &self.input.freeze_id);
+        encode_uint(&mut bytes, 18);
+        encode_journal_reference(&mut bytes, &self.input.attempt_start_journal_ref);
+        encode_uint(&mut bytes, 19);
+        encode_bstr_32(&mut bytes, &self.input.subject_id);
+        encode_uint(&mut bytes, 20);
+        encode_bstr_32(&mut bytes, self.input.manifest_id.as_bytes());
+        encode_uint(&mut bytes, 21);
+        encode_uint(&mut bytes, self.input.custody_mode_id);
+        encode_uint(&mut bytes, 22);
+        encode_bstr_32(&mut bytes, self.input.creation_profile_ref.as_bytes());
+        encode_uint(&mut bytes, 23);
+        encode_uint(&mut bytes, self.input.path_identity_profile_id);
+        encode_uint(&mut bytes, 24);
+        encode_bstr_32(&mut bytes, self.input.filesystem_profile_ref.as_bytes());
+        encode_uint(&mut bytes, 25);
+        encode_bstr_32(&mut bytes, self.input.policy_record_id.as_bytes());
+        encode_uint(&mut bytes, 26);
+        encode_uint(&mut bytes, self.input.file_content_flush_state);
+        encode_uint(&mut bytes, 27);
+        encode_uint(&mut bytes, self.input.atomic_publish_no_replace_state);
+        encode_uint(&mut bytes, 28);
+        encode_uint(&mut bytes, self.input.parent_directory_flush_state);
+        encode_uint(&mut bytes, 29);
+        bytes.push(if self.input.platform_strongest_available {
+            0xf5
+        } else {
+            0xf4
+        });
+        if let Some(durability) = self.input.requested_commit_durability_ref {
+            encode_uint(&mut bytes, 30);
+            encode_bstr_32(&mut bytes, durability.as_bytes());
+        }
+        encode_uint(&mut bytes, 31);
+        encode_text(&mut bytes, &self.input.created_by_tool_version);
+        if let Some(marker) = self.input.terminal_authority_closure_sha256 {
+            encode_uint(&mut bytes, 32);
+            encode_bstr_32(&mut bytes, &marker);
+        }
+        bytes
+    }
+
     /// Strictly decodes the frozen FREEZE_RECEIPT local Record grammar without normalization.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
@@ -6298,7 +7204,7 @@ impl FreezeReceiptRecord {
             return Err(RecordDecodeError);
         }
         let field_count = cursor.map().map_err(|_| RecordDecodeError)?;
-        if !matches!(field_count, 17 | 18) {
+        if !matches!(field_count, 17..=19) {
             return Err(RecordDecodeError);
         }
         cursor.key(0).map_err(|_| RecordDecodeError)?;
@@ -6360,17 +7266,33 @@ impl FreezeReceiptRecord {
         }
         cursor.key(29).map_err(|_| RecordDecodeError)?;
         let platform_strongest_available = cursor.bool().map_err(|_| RecordDecodeError)?;
-        let requested_commit_durability_ref = if field_count == 18 {
-            cursor.key(30).map_err(|_| RecordDecodeError)?;
-            Some(
+        let next_key = cursor.uint().map_err(|_| RecordDecodeError)?;
+        let requested_commit_durability_ref = if next_key == 30 {
+            let durability = Some(
                 RecordId::try_from(cursor.bstr_32().map_err(|_| RecordDecodeError)?.as_slice())
                     .map_err(|_| RecordDecodeError)?,
-            )
-        } else {
+            );
+            cursor.key(31).map_err(|_| RecordDecodeError)?;
+            durability
+        } else if next_key == 31 {
             None
+        } else {
+            return Err(RecordDecodeError);
         };
-        cursor.key(31).map_err(|_| RecordDecodeError)?;
         let created_by_tool_version = cursor.text().map_err(|_| RecordDecodeError)?;
+        let terminal_authority_closure_sha256 = match field_count {
+            17 => None,
+            18 if requested_commit_durability_ref.is_some() => None,
+            18 | 19 => {
+                cursor.key(32).map_err(|_| RecordDecodeError)?;
+                let marker = cursor.bstr_32().map_err(|_| RecordDecodeError)?;
+                (marker == TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+                    .then_some(marker)
+                    .ok_or(RecordDecodeError)
+                    .map(Some)?
+            }
+            _ => return Err(RecordDecodeError),
+        };
         if !cursor.finished() {
             return Err(RecordDecodeError);
         }
@@ -6392,6 +7314,7 @@ impl FreezeReceiptRecord {
                 parent_directory_flush_state,
                 platform_strongest_available,
                 requested_commit_durability_ref,
+                terminal_authority_closure_sha256,
                 created_by_tool_version,
             },
         })
@@ -6405,6 +7328,157 @@ impl FreezeReceiptRecord {
     /// Returns the exact typed Receipt fields without inferring external context.
     pub fn input(&self) -> &FreezeReceiptRecordInput {
         &self.input
+    }
+
+    /// Returns the exact selected Freeze marker when this Receipt selected that route.
+    pub fn terminal_authority_closure_sha256(&self) -> Option<&[u8; ID_LENGTH]> {
+        self.input.terminal_authority_closure_sha256.as_ref()
+    }
+}
+
+/// Typed inputs for a FREEZE_COMMITTED Journal Entry.
+///
+/// This construction layer derives terminal event bindings from one exact
+/// Receipt. It neither resolves the Receipt's prerequisites nor publishes an
+/// event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeCommittedJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub receipt: FreezeReceiptRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+/// A rejected FREEZE_COMMITTED Journal Entry construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreezeCommittedJournalEntryError;
+
+/// A canonical FREEZE_COMMITTED Journal Entry, not a publication effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeCommittedJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    receipt: FreezeReceiptRecord,
+    authority_dependencies: AuthorityDependencyCollection,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl FreezeCommittedJournalEntry {
+    /// Constructs the event-101 Entry whose sole direct authority is the
+    /// Receipt's exact retained START reference.
+    pub fn new(
+        input: FreezeCommittedJournalEntryInput,
+    ) -> Result<Self, FreezeCommittedJournalEntryError> {
+        if input.entry_index.value() == 0 {
+            return Err(FreezeCommittedJournalEntryError);
+        }
+        let authority_dependencies =
+            AuthorityDependencyCollection::from_unordered_semantic_elements(
+                AuthorityDependencyContext::new(input.registry_id, input.entry_index),
+                vec![input.receipt.input().attempt_start_journal_ref.clone()],
+            )
+            .map_err(|_| FreezeCommittedJournalEntryError)?;
+        let event_record_id =
+            EventRecordId::try_from(input.receipt.record_id().as_bytes().as_slice())
+                .expect("RecordId has EventRecordId width");
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id,
+            receipt: input.receipt,
+            authority_dependencies,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    /// The frozen event type for a committed Freeze Attempt.
+    pub fn event_type_id(&self) -> EventTypeId {
+        EventTypeId::try_from(101).expect("FREEZE_COMMITTED is registered")
+    }
+
+    /// The exact Receipt Record identity carried by this Entry.
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+
+    /// The exact publication-time Journal slot selected by compare-and-append.
+    pub fn entry_index(&self) -> JournalEntryIndex {
+        self.entry_index
+    }
+
+    /// The exact publication-time predecessor hash.
+    pub fn previous_entry_hash(&self) -> JournalEntryHash {
+        self.previous_entry_hash
+    }
+
+    /// The exact typed Receipt whose fields bind this Entry.
+    pub fn receipt(&self) -> &FreezeReceiptRecord {
+        &self.receipt
+    }
+
+    /// The canonical direct authority dependency set for this Entry.
+    pub fn authority_dependencies(&self) -> &[JournalReference] {
+        &self.authority_dependencies.elements
+    }
+
+    /// The storage-capability observation derived from the publication-time head.
+    pub fn storage_capability_class_id(&self) -> RecordId {
+        self.storage_capability_class_id
+    }
+
+    /// The environment observation derived from the publication-time head.
+    pub fn environment_observation_id(&self) -> RecordId {
+        self.environment_observation_id
+    }
+
+    /// Emits exact canonical FREEZE_COMMITTED Journal Entry bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(480);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xae);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id().value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07]);
+        bytes.extend_from_slice(&self.authority_dependencies.authoritative_cbor());
+        bytes.extend_from_slice(&[0x08, 0x02, 0x09]);
+        encode_bstr_32(
+            &mut bytes,
+            self.receipt.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes.push(0x10);
+        encode_bstr_32(
+            &mut bytes,
+            self.receipt.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x12);
+        bytes.extend_from_slice(
+            &self
+                .receipt
+                .input()
+                .attempt_start_journal_ref
+                .authoritative_cbor(),
+        );
+        bytes
     }
 }
 
@@ -6442,6 +7516,8 @@ pub enum FreezeCommittedBindingError {
     IntendedRootMismatch,
     /// The START, Receipt, and terminal event do not bind one Freeze Attempt identity.
     FreezeAttemptMismatch,
+    /// A selected Receipt's Freeze ID is not the exact START Freeze Attempt ID copy.
+    SelectedFreezeIdMismatch,
     /// The Receipt and START do not preserve the same exact subject identity.
     SubjectMismatch,
     /// The Receipt and START do not preserve the same exact Policy identity.
@@ -6469,6 +7545,19 @@ pub fn validate_freeze_committed_binding(
         != input.freeze_receipt_record.input.freeze_attempt_id
     {
         return Err(FreezeCommittedBindingError::FreezeAttemptMismatch);
+    }
+    if input
+        .freeze_receipt_record
+        .terminal_authority_closure_sha256()
+        .is_some()
+        && input.freeze_receipt_record.input.freeze_id
+            != *input
+                .freeze_attempt_start_record
+                .input
+                .freeze_attempt_id
+                .as_bytes()
+    {
+        return Err(FreezeCommittedBindingError::SelectedFreezeIdMismatch);
     }
     let committed = input
         .retained_journal
@@ -6820,6 +7909,418 @@ impl GenesisRecord {
     }
 }
 
+/// The one exact static parameter Record for the selected Freeze creation profile.
+///
+/// This Record is content addressed only; it is not an event or evidence that a
+/// Freeze creation procedure completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeCreationProfileRecord {
+    record_id: RecordId,
+}
+
+impl FreezeCreationProfileRecord {
+    /// Constructs the sole assigned type-64/profile-1 parameter Record.
+    pub fn new() -> Result<Self, RecordDecodeError> {
+        let bytes = Self::exact_cbor();
+        Self::decode_authoritative(&bytes)
+    }
+
+    fn exact_cbor() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(48);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[
+            0x18, 0x40, 0x01, 0xa3, 0x00, 0x01, 0x01, 0x18, 0x40, 0x10, 0x01,
+        ]);
+        bytes
+    }
+
+    /// Emits the sole canonical type-64/profile-1 Record byte sequence.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        Self::exact_cbor()
+    }
+
+    /// The identity of the exact static parameter Record.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// Strictly decodes only the exact assigned type-64/profile-1 Record.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 64
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(3).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 64 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 || !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        if input != Self::exact_cbor() {
+            return Err(RecordDecodeError);
+        }
+        let record_id = RecordId::try_from(Sha256::digest(input).as_slice())
+            .expect("SHA-256 has exact RecordId width");
+        Ok(Self { record_id })
+    }
+}
+
+/// Required local fields of a type-60 STORAGE_CAPABILITY_CLASS Record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageCapabilityClassRecordInput {
+    pub filesystem_transport: String,
+    pub sync_management: String,
+    pub placeholder_capability: u64,
+    pub exclusive_create_capability: u64,
+    pub no_replace_publication_capability: u64,
+    pub locking_capability: u64,
+    pub atomic_rename_capability: u64,
+    pub file_flush_capability: u64,
+    pub directory_flush_capability: u64,
+}
+
+/// The exact-byte, local type-60 STORAGE_CAPABILITY_CLASS grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageCapabilityClassRecord {
+    record_id: RecordId,
+    input: StorageCapabilityClassRecordInput,
+}
+
+impl StorageCapabilityClassRecord {
+    /// Constructs a complete local capability-class Record without asserting
+    /// that its described probes were performed.
+    pub fn new(input: StorageCapabilityClassRecordInput) -> Result<Self, RecordDecodeError> {
+        if !is_canonical_text_length(input.filesystem_transport.len() as u64)
+            || !is_canonical_text_length(input.sync_management.len() as u64)
+            || ![
+                input.placeholder_capability,
+                input.exclusive_create_capability,
+                input.no_replace_publication_capability,
+                input.locking_capability,
+                input.atomic_rename_capability,
+                input.file_flush_capability,
+                input.directory_flush_capability,
+            ]
+            .iter()
+            .all(|value| matches!(value, 1..=3))
+        {
+            return Err(RecordDecodeError);
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact deterministic-CBOR type-60 Record bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x18, 0x3c, 0x01, 0xab, 0x00, 0x01, 0x01, 0x18, 0x3c]);
+        bytes.push(0x10);
+        encode_text(&mut bytes, &self.input.filesystem_transport);
+        bytes.push(0x11);
+        encode_text(&mut bytes, &self.input.sync_management);
+        for (key, value) in [
+            (18, self.input.placeholder_capability),
+            (19, self.input.exclusive_create_capability),
+            (20, self.input.no_replace_publication_capability),
+            (21, self.input.locking_capability),
+            (22, self.input.atomic_rename_capability),
+            (23, self.input.file_flush_capability),
+            (24, self.input.directory_flush_capability),
+        ] {
+            encode_uint(&mut bytes, key);
+            encode_uint(&mut bytes, value);
+        }
+        bytes
+    }
+
+    /// Returns the complete local Record fields.
+    pub fn input(&self) -> &StorageCapabilityClassRecordInput {
+        &self.input
+    }
+
+    /// Returns SHA-256 of the exact Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// Strictly decodes only the complete required type-60 field set.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 60
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        cursor.map_exact(11).map_err(|_| RecordDecodeError)?;
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 60 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let filesystem_transport = cursor.text().map_err(|_| RecordDecodeError)?;
+        cursor.key(17).map_err(|_| RecordDecodeError)?;
+        let sync_management = cursor.text().map_err(|_| RecordDecodeError)?;
+        let mut capabilities = [0; 7];
+        for (offset, value) in capabilities.iter_mut().enumerate() {
+            cursor
+                .key(18 + offset as u64)
+                .map_err(|_| RecordDecodeError)?;
+            *value = cursor.uint().map_err(|_| RecordDecodeError)?;
+        }
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        let decoded = Self::new(StorageCapabilityClassRecordInput {
+            filesystem_transport,
+            sync_management,
+            placeholder_capability: capabilities[0],
+            exclusive_create_capability: capabilities[1],
+            no_replace_publication_capability: capabilities[2],
+            locking_capability: capabilities[3],
+            atomic_rename_capability: capabilities[4],
+            file_flush_capability: capabilities[5],
+            directory_flush_capability: capabilities[6],
+        })?;
+        (decoded.authoritative_cbor() == input)
+            .then_some(decoded)
+            .ok_or(RecordDecodeError)
+    }
+}
+
+/// Required and optional local fields of a type-61 ENVIRONMENT_OBSERVATION Record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentObservationRecordInput {
+    pub os_name: String,
+    pub os_version: Option<String>,
+    pub filesystem_reported_name: Option<String>,
+    pub driver_details: Option<String>,
+    pub mount_identity: Option<Vec<u8>>,
+    pub volume_identity: Option<Vec<u8>>,
+    pub resolved_registry_storage_identity: Option<Vec<u8>>,
+    pub probe_tool_version: String,
+    pub observation_limitations: Vec<String>,
+}
+
+/// The exact-byte, local type-61 ENVIRONMENT_OBSERVATION grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentObservationRecord {
+    record_id: RecordId,
+    input: EnvironmentObservationRecordInput,
+}
+
+impl EnvironmentObservationRecord {
+    /// Constructs a local observation Record without claiming that probes,
+    /// capabilities, or a current filesystem state were established.
+    pub fn new(input: EnvironmentObservationRecordInput) -> Result<Self, RecordDecodeError> {
+        let texts = [
+            Some(&input.os_name),
+            input.os_version.as_ref(),
+            input.filesystem_reported_name.as_ref(),
+            input.driver_details.as_ref(),
+            Some(&input.probe_tool_version),
+        ];
+        if texts.into_iter().flatten().any(|text| {
+            u64::try_from(text.len()).map_or(true, |length| !is_canonical_text_length(length))
+        }) || input.observation_limitations.iter().any(|text| {
+            u64::try_from(text.len()).map_or(true, |length| !is_canonical_text_length(length))
+        }) || input
+            .observation_limitations
+            .windows(2)
+            .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        {
+            return Err(RecordDecodeError);
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact deterministic-CBOR type-61 Record bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let optional_count = [
+            self.input.os_version.is_some(),
+            self.input.filesystem_reported_name.is_some(),
+            self.input.driver_details.is_some(),
+            self.input.mount_identity.is_some(),
+            self.input.volume_identity.is_some(),
+            self.input.resolved_registry_storage_identity.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        let mut bytes = Vec::with_capacity(192);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[
+            0x18,
+            0x3d,
+            0x01,
+            0xa0 | (5 + optional_count) as u8,
+            0x00,
+            0x01,
+            0x01,
+            0x18,
+            0x3d,
+        ]);
+        bytes.push(0x10);
+        encode_text(&mut bytes, &self.input.os_name);
+        if let Some(value) = &self.input.os_version {
+            bytes.push(0x11);
+            encode_text(&mut bytes, value);
+        }
+        if let Some(value) = &self.input.filesystem_reported_name {
+            bytes.push(0x12);
+            encode_text(&mut bytes, value);
+        }
+        if let Some(value) = &self.input.driver_details {
+            bytes.push(0x13);
+            encode_text(&mut bytes, value);
+        }
+        for (key, value) in [
+            (20, self.input.mount_identity.as_ref()),
+            (21, self.input.volume_identity.as_ref()),
+            (22, self.input.resolved_registry_storage_identity.as_ref()),
+        ] {
+            if let Some(value) = value {
+                encode_uint(&mut bytes, key);
+                encode_bstr(&mut bytes, value);
+            }
+        }
+        bytes.extend_from_slice(&[0x17]);
+        encode_text(&mut bytes, &self.input.probe_tool_version);
+        bytes.extend_from_slice(&[0x18, 0x18]);
+        encode_array_length(&mut bytes, self.input.observation_limitations.len());
+        for limitation in &self.input.observation_limitations {
+            encode_text(&mut bytes, limitation);
+        }
+        bytes
+    }
+
+    /// Returns the complete local observation fields.
+    pub fn input(&self) -> &EnvironmentObservationRecordInput {
+        &self.input
+    }
+
+    /// Returns SHA-256 of the exact Record bytes.
+    pub fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    /// Strictly decodes only assigned type-61 fields without normalization.
+    pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
+        let mut cursor = CborCursor::new(input);
+        cursor.array_exact(4).map_err(|_| RecordDecodeError)?;
+        cursor
+            .text_exact(RECORD_DOMAIN)
+            .map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 61
+            || cursor.uint().map_err(|_| RecordDecodeError)? != 1
+        {
+            return Err(RecordDecodeError);
+        }
+        if !(5..=11).contains(&cursor.map().map_err(|_| RecordDecodeError)?) {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(0).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 1 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(1).map_err(|_| RecordDecodeError)?;
+        if cursor.uint().map_err(|_| RecordDecodeError)? != 61 {
+            return Err(RecordDecodeError);
+        }
+        cursor.key(16).map_err(|_| RecordDecodeError)?;
+        let os_name = cursor.text().map_err(|_| RecordDecodeError)?;
+        let mut optional_text = |key| -> Result<Option<String>, RecordDecodeError> {
+            if cursor.input.get(cursor.offset) == Some(&key) {
+                cursor.key(u64::from(key)).map_err(|_| RecordDecodeError)?;
+                cursor.text().map(Some).map_err(|_| RecordDecodeError)
+            } else {
+                Ok(None)
+            }
+        };
+        let os_version = optional_text(17)?;
+        let filesystem_reported_name = optional_text(18)?;
+        let driver_details = optional_text(19)?;
+        let mut optional_bstr = |key| -> Result<Option<Vec<u8>>, RecordDecodeError> {
+            if cursor.input.get(cursor.offset) == Some(&key) {
+                cursor.key(u64::from(key)).map_err(|_| RecordDecodeError)?;
+                cursor.bstr().map(Some).map_err(|_| RecordDecodeError)
+            } else {
+                Ok(None)
+            }
+        };
+        let mount_identity = optional_bstr(20)?;
+        let volume_identity = optional_bstr(21)?;
+        let resolved_registry_storage_identity = optional_bstr(22)?;
+        cursor.key(23).map_err(|_| RecordDecodeError)?;
+        let probe_tool_version = cursor.text().map_err(|_| RecordDecodeError)?;
+        cursor.key(24).map_err(|_| RecordDecodeError)?;
+        let limitation_count = cursor.array().map_err(|_| RecordDecodeError)?;
+        if limitation_count > cursor.remaining() {
+            return Err(RecordDecodeError);
+        }
+        let mut observation_limitations = Vec::with_capacity(limitation_count);
+        for _ in 0..limitation_count {
+            observation_limitations.push(cursor.text().map_err(|_| RecordDecodeError)?);
+        }
+        if !cursor.finished() {
+            return Err(RecordDecodeError);
+        }
+        let decoded = Self::new(EnvironmentObservationRecordInput {
+            os_name,
+            os_version,
+            filesystem_reported_name,
+            driver_details,
+            mount_identity,
+            volume_identity,
+            resolved_registry_storage_identity,
+            probe_tool_version,
+            observation_limitations,
+        })?;
+        (decoded.authoritative_cbor() == input)
+            .then_some(decoded)
+            .ok_or(RecordDecodeError)
+    }
+}
+
 /// An active identity-dependency kind from Identity Format v0.3 §32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IdentityDependencyKind {
@@ -6975,6 +8476,34 @@ fn encode_array_length(output: &mut Vec<u8>, length: usize) {
         ]),
         _ => output.extend_from_slice(&[
             0x9b,
+            (length >> 56) as u8,
+            (length >> 48) as u8,
+            (length >> 40) as u8,
+            (length >> 32) as u8,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+    }
+}
+
+fn encode_map_length(output: &mut Vec<u8>, length: usize) {
+    let length = u64::try_from(length).expect("platform usize fits into u64");
+    debug_assert!(length <= ER_UINT_MAX);
+    match length {
+        0..=23 => output.push(0xa0 | length as u8),
+        24..=0xff => output.extend_from_slice(&[0xb8, length as u8]),
+        0x100..=0xffff => output.extend_from_slice(&[0xb9, (length >> 8) as u8, length as u8]),
+        0x1_0000..=0xffff_ffff => output.extend_from_slice(&[
+            0xba,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+        _ => output.extend_from_slice(&[
+            0xbb,
             (length >> 56) as u8,
             (length >> 48) as u8,
             (length >> 40) as u8,

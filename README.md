@@ -10,7 +10,7 @@ EvidenceRegistry lets you inspect exact Record bytes and replay a retained Journ
 - **Journal history:** caller-ordered entries, exact hashes/references, and the implemented state-only transition/reconstruction rules.
 - **Local storage:** the Rust store API validates a bounded, exact namespace and retained generation. It is not a general evidence database or collection service.
 
-**Not currently available:** positive Freeze semantic authority or successful terminal Review Admission. The public runtime has typed gates and terminal machinery, but current semantic gates prevent that route from reaching publication. Neither an API name containing `authoritative` nor an outcome enum variant establishes a reachable positive result.
+The Rust library implements one narrow, Store-owned selected terminal-closure lane: selected EMBEDDED Freeze, selected Review Request and Result, selected §82 derivation, and selected Admission publication. It is not exposed by the Journal-only CLI, does not upgrade legacy or generic paths, and is not a production or cross-platform qualification claim. Neither an API name containing `authoritative` nor an outcome enum variant establishes a reachable positive result outside that exact selected profile.
 
 ## Installation
 
@@ -82,7 +82,11 @@ For retained replay, authoritative-store opening, and Review Admission integrati
   records/<lowercase-64-hex-record-id>.cbor
 ```
 
-`AuthoritativeRegistryStore::open(root)` and validation APIs are bounded read/derivation seams; inspect the [store implementation](src/authoritative_store.rs) for exact limits. Current `validate_freeze_committed_authority` fails closed at `SemanticAuthorityUnavailable` after structural checks. Terminal publication machinery exists, but the public `complete_authoritative_review_admission` route cannot currently reach successful publication. Do not treat it as a usable publishing API or probe a live/sole-copy Registry with it; any future reachable mutation requires explicit exact-root authorization and readback.
+`AuthoritativeRegistryStore::open(root)` is the legacy three-namespace read/derivation seam. The selected profile instead requires the exact `registry/`, `journal/`, `records/`, `roots/`, and `coordination/{freeze,staging}/` namespace, validates its selected terminal chain on every cold open, and remains bounded by the Store limits in [the implementation](src/authoritative_store.rs). It does not upgrade legacy or generic histories.
+
+The selected APIs are Store-derived boundaries: `initialize_selected_profile`, `prepare_selected_embedded_freeze`, `commit_prepared_selected_embedded_freeze`, `record_selected_review_request`, `record_selected_review_result`, `derive_selected_review_admission_section_82`, and `complete_selected_review_admission`. Inputs select only the narrow documented semantic choices; Records, references, anchors, journal positions, and publication state are derived from retained Store state. `inspect_selected_terminal(root)` performs a separate selected cold reopen and reports a captured retained head plus the latest retained selected Admission, if any. It is read-only and cannot turn a historical `PublishedReceiptUncertain` outcome into `Published`, attest historical flushes, or report the filesystem after its captured view.
+
+Do not probe a live or sole-copy Registry with any mutation API. Every write requires explicit exact-root authorization, a selected-capable adapter, and the route's own required readback. The implementation has not established a universal durability, custody, trusted-producer, or cross-platform qualification claim.
 
 ### Policy results are different layers
 
@@ -92,7 +96,7 @@ For retained replay, authoritative-store opening, and Review Admission integrati
 | Completed Policy (§46) | `Satisfied`, `GateUnsatisfied`, `GateIndeterminate`: composed completion, not a publication receipt. |
 | Preterminal/context gate | `PreTerminal`, `PolicyContextPrecondition`: no completed Policy result; not `GateUnsatisfied` or `GateIndeterminate`. |
 
-Section 83 maps **completed** `Satisfied` to accepted and **completed** `GateUnsatisfied`/`GateIndeterminate` to rejected; disposition alone is not an Admission Record or Journal append. The retained Policy evaluator currently always returns a preterminal authority-input failure. These type definitions are not examples of a successfully completed authority lane.
+Section 83 maps **completed** `Satisfied` to accepted and **completed** `GateUnsatisfied`/`GateIndeterminate` to rejected; disposition alone is not an Admission Record or Journal append. Generic Policy applicability remains unavailable and generic completion remains preterminal. The selected terminal route evaluates only its fixed adopted Scope/evaluator constraints; it does not provide a general evaluator library or generic Scope inference.
 
 ### AI and downstream consumers
 
