@@ -1052,6 +1052,25 @@ impl AuthoritativeRegistryStore {
                 .map_err(|_| AuthoritativeRegistryStoreOpenError::RootNamespaceInvalid)?;
         }
         validate_authoritative_event_records(&retained_journal, &records)?;
+        if open_profile == AuthoritativeRegistryStoreOpenProfile::LegacyThreeNamespace
+            && retained_journal.entries.iter().any(|entry| {
+                matches!(entry.event_type_id().value(), 302 | 303)
+                    && records
+                        .binary_search_by(|(record_id, _)| {
+                            record_id.as_bytes().cmp(entry.event_record_id().as_bytes())
+                        })
+                        .ok()
+                        .and_then(|index| {
+                            ReviewAdmissionRecord::decode_authoritative(&records[index].1).ok()
+                        })
+                        .is_some_and(|admission| {
+                            admission.terminal_authority_closure_sha256()
+                                == Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+                        })
+            })
+        {
+            return Err(AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable);
+        }
 
         let mut retained_file_witnesses = Vec::with_capacity(
             1_usize
@@ -1117,7 +1136,7 @@ impl AuthoritativeRegistryStore {
             namespace_holds.extend([roots_hold, coordination_hold, freeze_hold, staging_hold]);
         }
 
-        Ok(Self {
+        let store = Self {
             root,
             open_profile,
             retained_journal,
@@ -1127,7 +1146,13 @@ impl AuthoritativeRegistryStore {
             live_instance_identity: Arc::new(AuthoritativeRegistryStoreInstanceIdentity {
                 outstanding_review_admissions: AtomicUsize::new(0),
             }),
-        })
+        };
+        if store.open_profile
+            == AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            store.validate_selected_terminal_admission_replay()?;
+        }
+        Ok(store)
     }
 
     /// The canonical root locator from which this store's authority namespaces were opened.
@@ -2565,6 +2590,174 @@ impl AuthoritativeRegistryStore {
         Err(AuthoritativeReviewAdmissionRuntimeError::Publication(
             AuthoritativeReviewAdmissionPublicationError::PublicationConflictExhausted,
         ))
+    }
+
+    /// Replays every retained selected terminal Admission from exact retained inputs.
+    ///
+    /// A terminal marker is only a format selector. It cannot replace the
+    /// selected Request/Result, §82, §46, §83, and exact-record reconstruction
+    /// checks performed here after the selected Store has retained all current
+    /// namespace witnesses.
+    fn validate_selected_terminal_admission_replay(
+        &self,
+    ) -> Result<(), AuthoritativeRegistryStoreOpenError> {
+        for (position, entry) in self.retained_journal.entries.iter().enumerate() {
+            if !matches!(entry.event_type_id().value(), 302 | 303) {
+                continue;
+            }
+            let event_reference = JournalReference::new(
+                entry.registry_id(),
+                entry.entry_index(),
+                entry.entry_hash(),
+                entry.event_type_id(),
+                entry.event_record_id(),
+            );
+            let record_id = record_id_from_event_reference(&event_reference);
+            let admission_bytes = self
+                .resolve(record_id)
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let admission = ReviewAdmissionRecord::decode_authoritative(admission_bytes)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            if admission.terminal_authority_closure_sha256()
+                != Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+            {
+                continue;
+            }
+            let predecessor = position
+                .checked_sub(1)
+                .and_then(|index| self.retained_journal.entries.get(index))
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let operation_start = JournalReference::new(
+                predecessor.registry_id(),
+                predecessor.entry_index(),
+                predecessor.entry_hash(),
+                predecessor.event_type_id(),
+                predecessor.event_record_id(),
+            );
+            if admission.operation_start_journal_ref() != &operation_start {
+                return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+            }
+
+            let recorded_result = self
+                .validate_selected_review_result(
+                    admission
+                        .review_result_ref()
+                        .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+                        .clone(),
+                )
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let request = recorded_result.request().request();
+            let result = recorded_result.result();
+            if admission.review_request_ref()
+                != Some(recorded_result.request().request_event_reference())
+                || admission.policy_authority_ref()
+                    != Some(recorded_result.request().policy_authority_ref())
+            {
+                return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+            }
+            let request_bytes = request.authoritative_cbor();
+            let result_bytes = result.authoritative_cbor();
+            let returned_anchor = resolve_retained_review_package_anchor_input(
+                &self.retained_journal,
+                recorded_result.request().request_event_reference(),
+                &request_bytes,
+                recorded_result.result_event_reference(),
+                &result_bytes,
+            )
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let predecessor_anchor = JournalAnchor::new(
+                operation_start.registry_id(),
+                operation_start.entry_index(),
+                operation_start.entry_hash(),
+                1,
+            )
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let anchor_comparison = if returned_anchor == predecessor_anchor {
+                JournalAnchorHistoryComparison::AnchorEqualsCurrentHead
+            } else {
+                match compare_retained_journal_anchor_history(
+                    &self.retained_journal,
+                    &returned_anchor,
+                ) {
+                    JournalAnchorHistoryComparison::AnchorIsValidAncestor
+                    | JournalAnchorHistoryComparison::AnchorEqualsCurrentHead => {
+                        JournalAnchorHistoryComparison::AnchorIsValidAncestor
+                    }
+                    _ => return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode),
+                }
+            };
+            let policy_bytes = self
+                .resolve(record_id_from_event_reference(
+                    request.policy_authority_ref(),
+                ))
+                .ok_or(AuthoritativeRegistryStoreOpenError::EventRecordDecode)?
+                .to_vec();
+            let policy = ReviewAdmissionPolicyRecord::decode_authoritative(&policy_bytes)
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            if !selected_review_policy_is_supported(&policy, self) {
+                return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+            }
+            let policy_context_prerequisites =
+                validate_review_admission_policy_context_prerequisites(
+                    &self.retained_journal,
+                    request.policy_authority_ref(),
+                    &policy_bytes,
+                    &request_bytes,
+                    &result_bytes,
+                    self,
+                )
+                .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            let section_82 = AuthoritativeReviewAdmissionSection82 {
+                operation_start_journal_ref: operation_start,
+                request_event_reference: recorded_result
+                    .request()
+                    .request_event_reference()
+                    .clone(),
+                result_event_reference: recorded_result.result_event_reference().clone(),
+                request: request.clone(),
+                result: result.clone(),
+                policy,
+                policy_bytes,
+                returned_anchor,
+                anchor_comparison,
+                policy_context_prerequisites,
+                freeze_authority: recorded_result.request().freeze_authority().clone(),
+            };
+            let completion = evaluate_selected_review_admission_policy_profile(&section_82);
+            let disposition_id = match completion.result() {
+                ReviewAdmissionCompletedPolicyResult::Satisfied => 1,
+                ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+                | ReviewAdmissionCompletedPolicyResult::GateIndeterminate => 2,
+            };
+            let mut reason_codes = result.reason_codes().to_vec();
+            reason_codes.push(
+                match completion.result() {
+                    ReviewAdmissionCompletedPolicyResult::Satisfied => "POLICY_SATISFIED",
+                    ReviewAdmissionCompletedPolicyResult::GateUnsatisfied => {
+                        "POLICY_GATE_UNSATISFIED"
+                    }
+                    ReviewAdmissionCompletedPolicyResult::GateIndeterminate => {
+                        "POLICY_GATE_INDETERMINATE"
+                    }
+                }
+                .to_owned(),
+            );
+            reason_codes.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            reason_codes.dedup();
+            let expected = ReviewAdmissionRecord::new_selected(ReviewAdmissionRecordInput {
+                disposition_id,
+                review_request_ref: section_82.request_event_reference().clone(),
+                review_result_ref: section_82.result_event_reference().clone(),
+                policy_authority_ref: section_82.policy_authority_ref().clone(),
+                reason_codes,
+                operation_start_journal_ref: section_82.operation_start_journal_ref().clone(),
+            })
+            .map_err(|_| AuthoritativeRegistryStoreOpenError::EventRecordDecode)?;
+            if expected.authoritative_cbor() != admission_bytes {
+                return Err(AuthoritativeRegistryStoreOpenError::EventRecordDecode);
+            }
+        }
+        Ok(())
     }
 
     fn open_for_review_admission_runtime(

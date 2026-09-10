@@ -13,9 +13,9 @@ use evidence_registry::{
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
-    AuthoritativeRegistryStore, EnvironmentObservationRecord, EnvironmentObservationRecordInput,
-    GenesisJournalEntry, GenesisRecord, GenesisRecordInput, StorageCapabilityClassRecord,
-    StorageCapabilityClassRecordInput,
+    AuthoritativeRegistryStore, AuthoritativeRegistryStoreOpenError, EnvironmentObservationRecord,
+    EnvironmentObservationRecordInput, GenesisJournalEntry, GenesisRecord, GenesisRecordInput,
+    StorageCapabilityClassRecord, StorageCapabilityClassRecordInput,
 };
 use sha2::{Digest, Sha256};
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -1265,6 +1265,13 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         "a persisted selected Admission must cold-replay as the retained head"
     );
     drop(terminal_reopened);
+    assert!(
+        matches!(
+            AuthoritativeRegistryStore::open(&root),
+            Err(AuthoritativeRegistryStoreOpenError::EventSemanticAuthorityUnavailable)
+        ),
+        "the legacy profile must not interpret a selected terminal marker chain"
+    );
     fs::remove_dir_all(&root).unwrap();
     let _ = fs::remove_dir_all(&source);
 }
