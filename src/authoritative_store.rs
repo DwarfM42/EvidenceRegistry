@@ -1177,9 +1177,9 @@ impl AuthoritativeRegistryStore {
         retained_generation_guards
             .try_reserve_exact(retained_file_witnesses.len())
             .map_err(|_| AuthoritativeRegistryStoreOpenError::NamespaceResourceLimit)?;
-        for witness in &retained_file_witnesses {
+        for witness in retained_file_witnesses {
             retained_generation_guards.push(
-                open_retained_file_guard(witness)
+                into_retained_file_guard(witness)
                     .map_err(|_| AuthoritativeRegistryStoreOpenError::RetainedGenerationChanged)?,
             );
         }
@@ -5879,6 +5879,29 @@ fn open_retained_file_guard(source: &RetainedFileWitness) -> Result<RetainedFile
     }
     revalidate_retained_file_witness(&mut guard)?;
     Ok(guard)
+}
+
+#[cfg(target_os = "macos")]
+fn into_retained_file_guard(mut witness: RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    const LOCK_SH: i32 = 1;
+    const LOCK_NB: i32 = 4;
+
+    if unsafe { flock(witness.file.as_raw_fd(), LOCK_SH | LOCK_NB) } != 0 {
+        return Err(());
+    }
+    revalidate_retained_file_witness(&mut witness)?;
+    Ok(witness)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn into_retained_file_guard(witness: RetainedFileWitness) -> Result<RetainedFileWitness, ()> {
+    open_retained_file_guard(&witness)
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]

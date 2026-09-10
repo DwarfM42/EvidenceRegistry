@@ -15,7 +15,7 @@ re-verifiable, not to require a successor or impose a new specification rule.
 The [existing detached freeze record](../docs/FREEZE-RECORD-LIFECYCLE-v0.10.4-CROSS-REFERENCE-v0.5.md)
 already demonstrates exact package binding, preserved candidate status, review
 bindings, Owner disposition, and separation from implementation qualification.
-The [README](../README.md#governing-documents) explains authority selection.
+The [README](../README.md#governing-authority-and-provenance) explains authority selection.
 This checklist adds a repeatable handoff and evidence-availability check; it does
 not replace either document or infer adoption from similar version histories.
 
