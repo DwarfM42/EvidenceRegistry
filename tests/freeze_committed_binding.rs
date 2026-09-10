@@ -8,7 +8,7 @@ use evidence_registry::{
     IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference, ManifestRecord,
     RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
     ResolvedFreezeCommittedBindingOutcome, RetainedJournal, SelectedEmbeddedFreezePreparationInput,
-    StrictRecordFrame, TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
+    SelectedReviewRequestInput, StrictRecordFrame, TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
@@ -792,6 +792,78 @@ fn freeze_commit_policy_bytes(
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn selected_review_scope_bytes(profile_id: u8) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[
+        0x14, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x14, 0x10, profile_id, 0x11, 0x01, 0x12, 0x40,
+    ]);
+    bytes
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn selected_review_policy_bytes(
+    operation_start: &JournalReference,
+    gate_scope_ref: RecordId,
+    review_scope_ref: RecordId,
+    review_method_ref: RecordId,
+    required_checks_ref: RecordId,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[0x18, 0x28, 0x01, 0xa6, 0x00, 0x01, 0x01, 0x18, 0x28, 0x10]);
+    append_bstr_32(&mut bytes, gate_scope_ref.as_bytes());
+    bytes.extend_from_slice(&[0x11, 0x81, 0xa5, 0x00, 0x01, 0x01]);
+    append_bstr_32(&mut bytes, review_scope_ref.as_bytes());
+    bytes.push(0x02);
+    append_bstr_32(&mut bytes, review_method_ref.as_bytes());
+    bytes.push(0x03);
+    append_bstr_32(&mut bytes, required_checks_ref.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x01, 0x18, 0x1d]);
+    append_reference(&mut bytes, operation_start);
+    bytes.extend_from_slice(&[0x18, 0x1e, 0x82, 0x02, 0x05]);
+    bytes
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn selected_review_policy_entry(
+    registry_id: RegistryId,
+    previous_entry_hash: JournalEntryHash,
+    policy_record_id: RecordId,
+    identity_records: &[RecordId],
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+) -> Vec<u8> {
+    let mut identities = identity_records.to_vec();
+    identities.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    identities.dedup();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+    bytes.extend_from_slice(b"EvidenceRegistry.JournalEntry.v1");
+    bytes.extend_from_slice(&[0xac, 0x00, 0x01, 0x01]);
+    append_bstr_32(&mut bytes, registry_id.as_bytes());
+    bytes.extend_from_slice(&[0x02, 0x03, 0x03]);
+    append_bstr_32(&mut bytes, previous_entry_hash.as_bytes());
+    bytes.extend_from_slice(&[0x04, 0x19, 0x01, 0x90, 0x05]);
+    append_bstr_32(&mut bytes, policy_record_id.as_bytes());
+    bytes.push(0x06);
+    bytes.push(0x80 + u8::try_from(identities.len()).unwrap());
+    for identity in identities {
+        bytes.extend_from_slice(&[0x82, 0x01]);
+        append_bstr_32(&mut bytes, identity.as_bytes());
+    }
+    bytes.extend_from_slice(&[0x07, 0x80, 0x08, 0x07, 0x09]);
+    append_bstr_32(&mut bytes, policy_record_id.as_bytes());
+    bytes.push(0x0a);
+    append_bstr_32(&mut bytes, storage_capability_class_id.as_bytes());
+    bytes.push(0x0b);
+    append_bstr_32(&mut bytes, environment_observation_id.as_bytes());
+    bytes
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn selected_embedded_preparation_derives_start_root_and_retained_payload() {
     let root = std::env::current_dir()
@@ -966,6 +1038,133 @@ fn selected_embedded_preparation_commits_and_cold_replays_a_selected_freeze() {
         "cold selected Freeze replay must re-verify current retained payload bytes"
     );
     drop(corrupted);
+    fs::remove_dir_all(&root).unwrap();
+    let _ = fs::remove_dir_all(&source);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_review_request_is_store_derived_and_cold_replays() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "evidence-registry-selected-review-request-{}-{}",
+            std::process::id(),
+            NEXT_AUTHORITATIVE_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+    let source = root.with_extension("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), b"selected review request payload").unwrap();
+    let registry_id = RegistryId::try_from(id(0x72).as_slice()).unwrap();
+    let store = AuthoritativeRegistryStore::initialize_selected_profile(
+        &root,
+        registry_id,
+        "selected-review-request-test",
+    )
+    .unwrap();
+    let freeze_scope_bytes = selected_freeze_scope_bytes();
+    let freeze_scope_id = RecordId::try_from(sha256(&freeze_scope_bytes).as_slice()).unwrap();
+    write_record(&root, freeze_scope_id, &freeze_scope_bytes);
+    let freeze_policy_bytes = freeze_commit_policy_bytes(
+        &store.retained_journal().current_head_reference(),
+        freeze_scope_id,
+    );
+    let freeze_policy_id = RecordId::try_from(sha256(&freeze_policy_bytes).as_slice()).unwrap();
+    write_record(&root, freeze_policy_id, &freeze_policy_bytes);
+    drop(store);
+
+    let mut store = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let prepared = store
+        .prepare_selected_embedded_freeze(SelectedEmbeddedFreezePreparationInput {
+            source_root: source.clone(),
+            freeze_attempt_id: FreezeAttemptId::try_from(id(0x92).as_slice()).unwrap(),
+            policy_record_id: freeze_policy_id,
+        })
+        .unwrap();
+    let freeze = store
+        .commit_prepared_selected_embedded_freeze(prepared)
+        .unwrap();
+    let head = store.retained_journal().current_head_reference();
+    let context = store.retained_journal().resolve_reference(&head).unwrap();
+    let gate_scope_bytes = selected_review_scope_bytes(1);
+    let review_scope_bytes = selected_review_scope_bytes(1);
+    let method_bytes = selected_review_scope_bytes(3);
+    let checks_bytes = selected_review_scope_bytes(4);
+    let gate_scope_id = RecordId::try_from(sha256(&gate_scope_bytes).as_slice()).unwrap();
+    let review_scope_id = RecordId::try_from(sha256(&review_scope_bytes).as_slice()).unwrap();
+    let method_id = RecordId::try_from(sha256(&method_bytes).as_slice()).unwrap();
+    let checks_id = RecordId::try_from(sha256(&checks_bytes).as_slice()).unwrap();
+    let review_policy_bytes = selected_review_policy_bytes(
+        freeze.start_event_reference(),
+        gate_scope_id,
+        review_scope_id,
+        method_id,
+        checks_id,
+    );
+    let review_policy_id = RecordId::try_from(sha256(&review_policy_bytes).as_slice()).unwrap();
+    let policy_entry = selected_review_policy_entry(
+        registry_id,
+        head.entry_hash(),
+        review_policy_id,
+        &[gate_scope_id, review_scope_id, method_id, checks_id],
+        context.storage_capability_class_id(),
+        context.environment_observation_id(),
+    );
+    drop(store);
+    for (record_id, bytes) in [
+        (gate_scope_id, gate_scope_bytes),
+        (review_scope_id, review_scope_bytes),
+        (method_id, method_bytes),
+        (checks_id, checks_bytes),
+        (review_policy_id, review_policy_bytes),
+    ] {
+        write_record(&root, record_id, &bytes);
+    }
+    fs::write(root.join("journal/00000000000000000003.cbor"), policy_entry).unwrap();
+
+    let mut store = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    assert_eq!(
+        store.record_selected_review_request(SelectedReviewRequestInput {
+            freeze_authority: freeze.clone(),
+            review_policy_record_id: review_policy_id,
+            review_role_id: 2,
+        }),
+        Err(evidence_registry::SelectedReviewRequestError::SelectorUnavailable),
+        "an unregistered caller role must fail before a Request Record or Journal slot is staged"
+    );
+    assert!(!root.join("journal/00000000000000000004.cbor").exists());
+    let recorded = store
+        .record_selected_review_request(SelectedReviewRequestInput {
+            freeze_authority: freeze.clone(),
+            review_policy_record_id: review_policy_id,
+            review_role_id: 1,
+        })
+        .unwrap();
+    assert_eq!(recorded.request_event_reference().entry_index().value(), 4);
+    assert_eq!(
+        recorded.request().freeze_authority_ref(),
+        freeze.committed_event_reference()
+    );
+    assert_eq!(
+        recorded.request().manifest_id(),
+        freeze.manifest_record_id()
+    );
+    assert_eq!(recorded.request().review_scope_ref(), review_scope_id);
+    assert_eq!(recorded.request().review_method_ref(), method_id);
+    assert_eq!(recorded.request().required_checks_ref(), checks_id);
+    assert!(root.join("journal/00000000000000000004.cbor").is_file());
+    assert!(!root.join("journal/00000000000000000005.cbor").exists());
+    drop(store);
+
+    let reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    assert_eq!(
+        reopened
+            .validate_selected_review_request(recorded.request_event_reference().clone())
+            .unwrap(),
+        recorded
+    );
+    drop(reopened);
     fs::remove_dir_all(&root).unwrap();
     let _ = fs::remove_dir_all(&source);
 }

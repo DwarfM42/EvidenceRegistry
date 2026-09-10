@@ -150,6 +150,74 @@ pub enum SelectedEmbeddedFreezeCommitError {
     PositiveReplay(AuthoritativeFreezeCommittedBindingError),
 }
 
+/// Minimal semantic input for a Store-owned selected REVIEW_REQUEST producer.
+///
+/// The Freeze witness is opaque and revalidated against current retained Store
+/// state. The caller can select only a retained Review Policy identity and one
+/// registered role; the Store derives its exact Policy event, selector
+/// requirement, package Anchor, Request bytes, and Journal state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedReviewRequestInput {
+    pub freeze_authority: AuthoritativeFreezeCommittedBinding,
+    pub review_policy_record_id: RecordId,
+    pub review_role_id: u64,
+}
+
+/// Exact Store-derived output from a selected REVIEW_REQUEST_RECORDED append.
+///
+/// This is Request transport/binding evidence only. It is not a Result,
+/// §82 completion, Policy satisfaction, Admission, or terminal publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedSelectedReviewRequest {
+    request: ReviewRequestRecord,
+    request_event_reference: JournalReference,
+    policy_authority_ref: JournalReference,
+    freeze_authority: AuthoritativeFreezeCommittedBinding,
+}
+
+impl RecordedSelectedReviewRequest {
+    pub fn request(&self) -> &ReviewRequestRecord {
+        &self.request
+    }
+
+    pub fn request_event_reference(&self) -> &JournalReference {
+        &self.request_event_reference
+    }
+
+    pub fn policy_authority_ref(&self) -> &JournalReference {
+        &self.policy_authority_ref
+    }
+
+    pub fn freeze_authority(&self) -> &AuthoritativeFreezeCommittedBinding {
+        &self.freeze_authority
+    }
+}
+
+/// A fail-closed failure while producing or revalidating a selected Request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectedReviewRequestError {
+    SelectedProfileRequired,
+    PublicationLockUnavailable,
+    Store(AuthoritativeRegistryStoreOpenError),
+    RetainedGenerationChanged,
+    FreezeAuthority(AuthoritativeFreezeCommittedBindingError),
+    FreezeWitnessMismatch,
+    PolicyUnavailable,
+    PolicyInvalid,
+    PolicyUnsupported,
+    PolicyAuthorityMissing,
+    PolicyAuthorityAmbiguous,
+    SelectorUnavailable,
+    SelectorAmbiguous,
+    AnchorConstruction,
+    RequestConstruction,
+    RequestPublication,
+    JournalConstruction,
+    JournalPublication,
+    JournalConflict,
+    ReplayMismatch,
+}
+
 /// An authoritative Registry store opened from its exact retained Journal and Record namespaces.
 ///
 /// The root path is only a locator. Registry identity, current head, Journal history, and Record
@@ -1357,6 +1425,202 @@ impl AuthoritativeRegistryStore {
         })
     }
 
+    /// Records one selected REVIEW_REQUEST from Store-resolved Freeze and Policy state.
+    ///
+    /// The caller cannot supply a Request body, Policy event reference, selector
+    /// fields, Anchor, operation-start reference, or Journal slot. Successful
+    /// recording establishes only the bounded selected Request transport and
+    /// retained binding; it does not ingest a Result or complete Admission.
+    pub fn record_selected_review_request(
+        &mut self,
+        input: SelectedReviewRequestInput,
+    ) -> Result<RecordedSelectedReviewRequest, SelectedReviewRequestError> {
+        if self.open_profile
+            != AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            return Err(SelectedReviewRequestError::SelectedProfileRequired);
+        }
+        let root_hold = self
+            .namespace_holds
+            .first()
+            .ok_or(SelectedReviewRequestError::RetainedGenerationChanged)?;
+        let _publication_lock =
+            acquire_selected_authoritative_publication_lock(&self.root, root_hold)
+                .map_err(|_| SelectedReviewRequestError::PublicationLockUnavailable)?;
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_review_request_reload_error)?;
+
+        let freeze_authority = self
+            .validate_freeze_committed_authority(
+                input.freeze_authority.committed_event_reference().clone(),
+            )
+            .map_err(SelectedReviewRequestError::FreezeAuthority)?;
+        if freeze_authority != input.freeze_authority {
+            return Err(SelectedReviewRequestError::FreezeWitnessMismatch);
+        }
+        let policy_reference = selected_policy_authority_reference(
+            &self.retained_journal,
+            input.review_policy_record_id,
+        )?;
+        let policy_bytes = self
+            .resolve(input.review_policy_record_id)
+            .ok_or(SelectedReviewRequestError::PolicyUnavailable)?;
+        let policy = ReviewAdmissionPolicyRecord::decode_authoritative(policy_bytes)
+            .map_err(|_| SelectedReviewRequestError::PolicyInvalid)?;
+        if policy.record_id() != input.review_policy_record_id
+            || policy.operation_start_journal_ref() != freeze_authority.start_event_reference()
+            || !selected_review_policy_is_supported(&policy, self)
+        {
+            return Err(SelectedReviewRequestError::PolicyUnsupported);
+        }
+        let requirement = selected_review_policy_requirement(&policy, input.review_role_id)?;
+        for record_id in [
+            requirement.required_checks_ref(),
+            requirement.review_scope_ref(),
+            requirement.review_method_ref(),
+        ] {
+            let bytes = self
+                .resolve(record_id)
+                .ok_or(SelectedReviewRequestError::SelectorUnavailable)?;
+            StrictRecordFrame::decode_authoritative(bytes)
+                .map_err(|_| SelectedReviewRequestError::SelectorUnavailable)?;
+        }
+        let head = self.retained_journal.current_head_reference();
+        let context = self
+            .retained_journal
+            .resolve_reference(&head)
+            .map_err(|_| SelectedReviewRequestError::ReplayMismatch)?;
+        let anchor =
+            JournalAnchor::new(head.registry_id(), head.entry_index(), head.entry_hash(), 1)
+                .map_err(|_| SelectedReviewRequestError::AnchorConstruction)?;
+        let entry_index = head
+            .entry_index()
+            .value()
+            .checked_add(1)
+            .and_then(|value| JournalEntryIndex::try_from(value).ok())
+            .ok_or(SelectedReviewRequestError::JournalConstruction)?;
+        let request = ReviewRequestRecord::new_selected(ReviewRequestRecordInput {
+            freeze_authority_ref: freeze_authority.committed_event_reference().clone(),
+            manifest_id: freeze_authority.manifest_record_id(),
+            review_role_id: input.review_role_id,
+            required_checks_ref: requirement.required_checks_ref(),
+            policy_authority_ref: policy_reference.clone(),
+            review_scope_ref: requirement.review_scope_ref(),
+            review_method_ref: requirement.review_method_ref(),
+            review_package_anchor_id: anchor.anchor_id(),
+            operation_start_journal_ref: freeze_authority.start_event_reference().clone(),
+        })
+        .map_err(|_| SelectedReviewRequestError::RequestConstruction)?;
+        let entry = ReviewRequestJournalEntry::new(ReviewRequestJournalEntryInput {
+            registry_id: head.registry_id(),
+            entry_index,
+            previous_entry_hash: head.entry_hash(),
+            request: request.clone(),
+            storage_capability_class_id: context.storage_capability_class_id(),
+            environment_observation_id: context.environment_observation_id(),
+        })
+        .map_err(|_| SelectedReviewRequestError::JournalConstruction)?;
+        let entry_bytes = entry.authoritative_cbor();
+        let reference = JournalReference::new(
+            head.registry_id(),
+            entry_index,
+            JournalEntryHash::try_from(Sha256::digest(&entry_bytes).as_slice())
+                .expect("SHA-256 has the exact JournalEntryHash width"),
+            entry.event_type_id(),
+            entry.event_record_id(),
+        );
+        publish_record_bytes(self, request.record_id(), &request.authoritative_cbor())
+            .map_err(|_| SelectedReviewRequestError::RequestPublication)?;
+        self.revalidate_retained_generation()
+            .map_err(|_| SelectedReviewRequestError::RetainedGenerationChanged)?;
+        let journal_dir = self.root.join("journal");
+        let journal_hold = self
+            .acquire_publication_directory_hold(2, "journal")
+            .map_err(|_| SelectedReviewRequestError::RetainedGenerationChanged)?;
+        let journal_contents = namespace_contents_path(&journal_dir, &journal_hold)
+            .map_err(|_| SelectedReviewRequestError::RetainedGenerationChanged)?;
+        match publish_journal_slot(
+            &journal_contents,
+            &journal_hold,
+            Path::new(&format!("{:020}.cbor", entry_index.value())),
+            &entry_bytes,
+        )
+        .map_err(|_| SelectedReviewRequestError::JournalPublication)?
+        {
+            JournalSlotPublication::Published(_) => {}
+            JournalSlotPublication::Conflict => {
+                return Err(SelectedReviewRequestError::JournalConflict)
+            }
+            JournalSlotPublication::VisibleReceiptUncertain => {
+                return Err(SelectedReviewRequestError::JournalPublication)
+            }
+        }
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_review_request_reload_error)?;
+        if self.retained_journal.current_head_reference() != reference {
+            return Err(SelectedReviewRequestError::ReplayMismatch);
+        }
+        self.validate_selected_review_request(reference)
+    }
+
+    /// Revalidates a retained selected Request and its Store-owned Freeze/Policy inputs.
+    pub fn validate_selected_review_request(
+        &self,
+        request_event_reference: JournalReference,
+    ) -> Result<RecordedSelectedReviewRequest, SelectedReviewRequestError> {
+        self.revalidate_retained_generation()
+            .map_err(|_| SelectedReviewRequestError::RetainedGenerationChanged)?;
+        let request_record_id = record_id_from_event_reference(&request_event_reference);
+        let request = self
+            .resolve(request_record_id)
+            .and_then(|bytes| ReviewRequestRecord::decode_authoritative(bytes).ok())
+            .filter(|request| request.record_id() == request_record_id)
+            .ok_or(SelectedReviewRequestError::ReplayMismatch)?;
+        if request.terminal_authority_closure_sha256()
+            != Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+        {
+            return Err(SelectedReviewRequestError::PolicyUnsupported);
+        }
+        validate_review_request_recorded_binding(
+            &self.retained_journal,
+            &request_event_reference,
+            &request.authoritative_cbor(),
+        )
+        .map_err(|_| SelectedReviewRequestError::ReplayMismatch)?;
+        let freeze_authority = self
+            .validate_freeze_committed_authority(request.freeze_authority_ref().clone())
+            .map_err(SelectedReviewRequestError::FreezeAuthority)?;
+        if request.manifest_id() != freeze_authority.manifest_record_id()
+            || request.operation_start_journal_ref() != freeze_authority.start_event_reference()
+        {
+            return Err(SelectedReviewRequestError::ReplayMismatch);
+        }
+        let policy_record_id = record_id_from_event_reference(request.policy_authority_ref());
+        let policy = self
+            .resolve(policy_record_id)
+            .and_then(|bytes| ReviewAdmissionPolicyRecord::decode_authoritative(bytes).ok())
+            .filter(|policy| policy.record_id() == policy_record_id)
+            .ok_or(SelectedReviewRequestError::PolicyInvalid)?;
+        if policy.operation_start_journal_ref() != freeze_authority.start_event_reference()
+            || !selected_review_policy_is_supported(&policy, self)
+        {
+            return Err(SelectedReviewRequestError::PolicyUnsupported);
+        }
+        let requirement = selected_review_policy_requirement(&policy, request.review_role_id())?;
+        if request.required_checks_ref() != requirement.required_checks_ref()
+            || request.review_scope_ref() != requirement.review_scope_ref()
+            || request.review_method_ref() != requirement.review_method_ref()
+        {
+            return Err(SelectedReviewRequestError::ReplayMismatch);
+        }
+        Ok(RecordedSelectedReviewRequest {
+            policy_authority_ref: request.policy_authority_ref().clone(),
+            request,
+            request_event_reference,
+            freeze_authority,
+        })
+    }
+
     /// Accepts one bounded opaque Request/Result presentation and binds the exact authoritative
     /// store head at the same successful acceptance boundary.
     pub fn accept_authoritative_review_admission(
@@ -2518,6 +2782,81 @@ fn map_selected_embedded_commit_reload_error(
             SelectedEmbeddedFreezeCommitError::ReplayMismatch
         }
     }
+}
+
+fn map_selected_review_request_reload_error(
+    error: AuthoritativeReviewAdmissionAcceptanceError,
+) -> SelectedReviewRequestError {
+    match error {
+        AuthoritativeReviewAdmissionAcceptanceError::Store(error) => {
+            SelectedReviewRequestError::Store(error)
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged => {
+            SelectedReviewRequestError::ReplayMismatch
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::Input(_) => {
+            SelectedReviewRequestError::ReplayMismatch
+        }
+    }
+}
+
+fn selected_policy_authority_reference(
+    journal: &RetainedJournal,
+    policy_record_id: RecordId,
+) -> Result<JournalReference, SelectedReviewRequestError> {
+    let mut selected = None;
+    for entry in &journal.entries {
+        if entry.event_type_id().value() != 400
+            || entry.event_record_id().as_bytes() != policy_record_id.as_bytes()
+        {
+            continue;
+        }
+        let reference = JournalReference::new(
+            entry.registry_id(),
+            entry.entry_index(),
+            entry.entry_hash(),
+            entry.event_type_id(),
+            entry.event_record_id(),
+        );
+        if selected.replace(reference).is_some() {
+            return Err(SelectedReviewRequestError::PolicyAuthorityAmbiguous);
+        }
+    }
+    selected.ok_or(SelectedReviewRequestError::PolicyAuthorityMissing)
+}
+
+fn selected_review_policy_is_supported(
+    policy: &ReviewAdmissionPolicyRecord,
+    resolver: &impl ExactRecordByteResolver,
+) -> bool {
+    policy.supported_context_ids() == [2, 5]
+        && resolver
+            .resolve(policy.gate_scope_ref())
+            .and_then(|bytes| ScopeRecord::decode_authoritative(bytes).ok())
+            .is_some_and(|scope| {
+                scope.record_id() == policy.gate_scope_ref()
+                    && scope.input().scope_profile_id == 1
+                    && scope.input().scope_profile_version == 1
+                    && scope.input().scope_payload.is_empty()
+                    && scope.input().scope_label.is_none()
+            })
+}
+
+fn selected_review_policy_requirement(
+    policy: &ReviewAdmissionPolicyRecord,
+    review_role_id: u64,
+) -> Result<ReviewAdmissionReviewRequirement, SelectedReviewRequestError> {
+    let mut selected = None;
+    for requirement in policy
+        .review_requirements()
+        .iter()
+        .filter(|requirement| requirement.review_role_id() == review_role_id)
+    {
+        if selected.replace(requirement.clone()).is_some() {
+            return Err(SelectedReviewRequestError::SelectorAmbiguous);
+        }
+    }
+    selected.ok_or(SelectedReviewRequestError::SelectorUnavailable)
 }
 
 fn selected_freeze_policy_is_supported(
@@ -7415,10 +7754,18 @@ fn event_semantic_authority_is_unavailable(
     event_type: u16,
     record_bytes: &[u8],
 ) -> Result<bool, RecordDecodeError> {
-    if matches!(
-        event_type,
-        200 | 300 | 301 | 302 | 303 | 500 | 501 | 600 | 700
-    ) {
+    if event_type == 300 {
+        // Only the exact selected marker removes the generic replay gate. The
+        // Store-owned selected producer and validator re-establish the full
+        // Freeze/Policy/Anchor prerequisites before returning a Request witness.
+        // Malformed bytes remain unavailable here so the caller's earlier
+        // structural validator retains the more precise decode classification.
+        return Ok(ReviewRequestRecord::decode_authoritative(record_bytes)
+            .ok()
+            .and_then(|request| request.terminal_authority_closure_sha256().copied())
+            != Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256));
+    }
+    if matches!(event_type, 200 | 301 | 302 | 303 | 500 | 501 | 600 | 700) {
         // The retained inputs do not uniquely re-establish all frozen contextual semantics for
         // these families: Verification-to-Freeze/Manifest continuity remains incomplete; generic
         // Review Request, Review Result, Review Admission, and Closeout Policy satisfaction require
