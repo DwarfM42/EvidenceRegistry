@@ -3,9 +3,10 @@ use evidence_registry::{
     validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
     ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
     FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
-    FreezeReceiptRecord, IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference,
-    RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
+    FreezeReceiptRecord, FreezeReceiptRecordInput, IntendedRootId, JournalEntryHash,
+    JournalEntryIndex, JournalReference, RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
     ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
+    TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use evidence_registry::{
@@ -426,6 +427,58 @@ fn fixed_start_fixture() -> (
         EventRecordId::try_from(hex_id(START_RECORD_ID_HEX).as_slice()).unwrap(),
     );
     (journal, registry_id, start_record, start_reference)
+}
+
+#[test]
+fn freeze_receipt_constructs_the_same_canonical_local_bytes_that_it_decodes() {
+    let expected_bytes = hex_bytes(RECEIPT_HEX);
+    let expected = FreezeReceiptRecord::decode_authoritative(&expected_bytes).unwrap();
+    let input = expected.input();
+
+    let constructed = FreezeReceiptRecord::new(FreezeReceiptRecordInput {
+        freeze_attempt_id: input.freeze_attempt_id,
+        freeze_id: input.freeze_id,
+        attempt_start_journal_ref: input.attempt_start_journal_ref.clone(),
+        subject_id: input.subject_id,
+        manifest_id: input.manifest_id,
+        custody_mode_id: input.custody_mode_id,
+        creation_profile_ref: input.creation_profile_ref,
+        path_identity_profile_id: input.path_identity_profile_id,
+        filesystem_profile_ref: input.filesystem_profile_ref,
+        policy_record_id: input.policy_record_id,
+        file_content_flush_state: input.file_content_flush_state,
+        atomic_publish_no_replace_state: input.atomic_publish_no_replace_state,
+        parent_directory_flush_state: input.parent_directory_flush_state,
+        platform_strongest_available: input.platform_strongest_available,
+        requested_commit_durability_ref: input.requested_commit_durability_ref,
+        terminal_authority_closure_sha256: input.terminal_authority_closure_sha256,
+        created_by_tool_version: input.created_by_tool_version.clone(),
+    })
+    .unwrap();
+
+    assert_eq!(constructed.authoritative_cbor(), expected_bytes);
+    assert_eq!(constructed.record_id(), expected.record_id());
+    assert_eq!(constructed, expected);
+}
+
+#[test]
+fn freeze_receipt_constructor_preserves_optional_and_selected_forms_without_downgrade() {
+    let expected = FreezeReceiptRecord::decode_authoritative(&hex_bytes(RECEIPT_HEX)).unwrap();
+    let mut input = expected.input().clone();
+    input.requested_commit_durability_ref = Some(RecordId::try_from(id(0x90).as_slice()).unwrap());
+    input.terminal_authority_closure_sha256 = Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256);
+
+    let constructed = FreezeReceiptRecord::new(input.clone()).unwrap();
+    let decoded =
+        FreezeReceiptRecord::decode_authoritative(&constructed.authoritative_cbor()).unwrap();
+    assert_eq!(decoded.input(), &input);
+    assert_eq!(
+        decoded.terminal_authority_closure_sha256(),
+        Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+    );
+
+    input.terminal_authority_closure_sha256 = Some([0_u8; 32]);
+    assert!(FreezeReceiptRecord::new(input).is_err());
 }
 
 fn replace_unique(bytes: &mut [u8], needle: &[u8], replacement_at_offset: usize, replacement: u8) {

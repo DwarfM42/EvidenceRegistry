@@ -2740,6 +2740,15 @@ fn decode_journal_reference(
     ))
 }
 
+fn encode_journal_reference(output: &mut Vec<u8>, reference: &JournalReference) {
+    output.push(0x85);
+    encode_bstr_32(output, reference.registry_id().as_bytes());
+    encode_uint(output, reference.entry_index().value());
+    encode_bstr_32(output, reference.entry_hash().as_bytes());
+    encode_uint(output, u64::from(reference.event_type_id().value()));
+    encode_bstr_32(output, reference.event_record_id().as_bytes());
+}
+
 struct CborCursor<'a> {
     input: &'a [u8],
     offset: usize,
@@ -6513,6 +6522,92 @@ pub struct FreezeReceiptRecord {
 }
 
 impl FreezeReceiptRecord {
+    /// Constructs canonical FREEZE_RECEIPT Record bytes from locally valid fields.
+    ///
+    /// This establishes only local grammar and Record identity. It does not
+    /// establish policy, authority, admission, durability, custody, or lifecycle
+    /// truth.
+    pub fn new(input: FreezeReceiptRecordInput) -> Result<Self, RecordDecodeError> {
+        if !matches!(input.custody_mode_id, 1 | 2)
+            || !matches!(input.file_content_flush_state, 1..=3)
+            || !matches!(input.atomic_publish_no_replace_state, 1..=3)
+            || !matches!(input.parent_directory_flush_state, 1..=3)
+            || input
+                .terminal_authority_closure_sha256
+                .is_some_and(|marker| marker != TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+        {
+            return Err(RecordDecodeError);
+        }
+        let mut record = Self {
+            record_id: RecordId::try_from([0_u8; ID_LENGTH].as_slice())
+                .expect("RecordId has exact fixed width"),
+            input,
+        };
+        record.record_id =
+            RecordId::try_from(Sha256::digest(record.authoritative_cbor()).as_slice())
+                .expect("SHA-256 has exact RecordId width");
+        Ok(record)
+    }
+
+    /// Emits the exact canonical FREEZE_RECEIPT Record bytes for these local fields.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let field_count = 17
+            + usize::from(self.input.requested_commit_durability_ref.is_some())
+            + usize::from(self.input.terminal_authority_closure_sha256.is_some());
+        let mut bytes = Vec::with_capacity(512);
+        bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+        bytes.extend_from_slice(RECORD_DOMAIN);
+        bytes.extend_from_slice(&[0x04, 0x01]);
+        encode_map_length(&mut bytes, field_count);
+        encode_uint(&mut bytes, 0);
+        encode_uint(&mut bytes, 1);
+        encode_uint(&mut bytes, 1);
+        encode_uint(&mut bytes, 4);
+        encode_uint(&mut bytes, 16);
+        encode_bstr_32(&mut bytes, self.input.freeze_attempt_id.as_bytes());
+        encode_uint(&mut bytes, 17);
+        encode_bstr_32(&mut bytes, &self.input.freeze_id);
+        encode_uint(&mut bytes, 18);
+        encode_journal_reference(&mut bytes, &self.input.attempt_start_journal_ref);
+        encode_uint(&mut bytes, 19);
+        encode_bstr_32(&mut bytes, &self.input.subject_id);
+        encode_uint(&mut bytes, 20);
+        encode_bstr_32(&mut bytes, self.input.manifest_id.as_bytes());
+        encode_uint(&mut bytes, 21);
+        encode_uint(&mut bytes, self.input.custody_mode_id);
+        encode_uint(&mut bytes, 22);
+        encode_bstr_32(&mut bytes, self.input.creation_profile_ref.as_bytes());
+        encode_uint(&mut bytes, 23);
+        encode_uint(&mut bytes, self.input.path_identity_profile_id);
+        encode_uint(&mut bytes, 24);
+        encode_bstr_32(&mut bytes, self.input.filesystem_profile_ref.as_bytes());
+        encode_uint(&mut bytes, 25);
+        encode_bstr_32(&mut bytes, self.input.policy_record_id.as_bytes());
+        encode_uint(&mut bytes, 26);
+        encode_uint(&mut bytes, self.input.file_content_flush_state);
+        encode_uint(&mut bytes, 27);
+        encode_uint(&mut bytes, self.input.atomic_publish_no_replace_state);
+        encode_uint(&mut bytes, 28);
+        encode_uint(&mut bytes, self.input.parent_directory_flush_state);
+        encode_uint(&mut bytes, 29);
+        bytes.push(if self.input.platform_strongest_available {
+            0xf5
+        } else {
+            0xf4
+        });
+        if let Some(durability) = self.input.requested_commit_durability_ref {
+            encode_uint(&mut bytes, 30);
+            encode_bstr_32(&mut bytes, durability.as_bytes());
+        }
+        encode_uint(&mut bytes, 31);
+        encode_text(&mut bytes, &self.input.created_by_tool_version);
+        if let Some(marker) = self.input.terminal_authority_closure_sha256 {
+            encode_uint(&mut bytes, 32);
+            encode_bstr_32(&mut bytes, &marker);
+        }
+        bytes
+    }
+
     /// Strictly decodes the frozen FREEZE_RECEIPT local Record grammar without normalization.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
@@ -7656,6 +7751,34 @@ fn encode_array_length(output: &mut Vec<u8>, length: usize) {
         ]),
         _ => output.extend_from_slice(&[
             0x9b,
+            (length >> 56) as u8,
+            (length >> 48) as u8,
+            (length >> 40) as u8,
+            (length >> 32) as u8,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+    }
+}
+
+fn encode_map_length(output: &mut Vec<u8>, length: usize) {
+    let length = u64::try_from(length).expect("platform usize fits into u64");
+    debug_assert!(length <= ER_UINT_MAX);
+    match length {
+        0..=23 => output.push(0xa0 | length as u8),
+        24..=0xff => output.extend_from_slice(&[0xb8, length as u8]),
+        0x100..=0xffff => output.extend_from_slice(&[0xb9, (length >> 8) as u8, length as u8]),
+        0x1_0000..=0xffff_ffff => output.extend_from_slice(&[
+            0xba,
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ]),
+        _ => output.extend_from_slice(&[
+            0xbb,
             (length >> 56) as u8,
             (length >> 48) as u8,
             (length >> 40) as u8,
