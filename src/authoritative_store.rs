@@ -5623,6 +5623,18 @@ fn ensure_path_matches_handle(path: &Path, file: &fs::File) -> Result<(), ()> {
 
 #[cfg(not(windows))]
 fn ensure_path_matches_handle(path: &Path, file: &fs::File) -> Result<(), ()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        // Linux namespace traversal is rooted through this exact held descriptor.
+        // `/proc/self/fd/<n>` is necessarily a symlink, but it resolves to the
+        // supplied live descriptor rather than to a path selected by an attacker.
+        let held_descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        if path == held_descriptor_path {
+            return Ok(());
+        }
+    }
     let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
     let handle_metadata = file.metadata().map_err(|_| ())?;
     if path_metadata.file_type().is_symlink()
