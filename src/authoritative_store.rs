@@ -277,6 +277,20 @@ pub enum SelectedReviewAdmissionSection82Error {
     Section82(AuthoritativeReviewAdmissionSection82Error),
 }
 
+/// A fail-closed failure while completing and publishing the selected
+/// REVIEW_ADMISSION route. The selected route is the only runtime surface
+/// permitted to interpret the frozen profile-1 exact gate Scope relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectedReviewAdmissionCompletionError {
+    SelectedProfileRequired,
+    PublicationLockUnavailable,
+    Store(AuthoritativeRegistryStoreOpenError),
+    RetainedGenerationChanged,
+    Reload(AuthoritativeReviewAdmissionAcceptanceError),
+    Section82(SelectedReviewAdmissionSection82Error),
+    Runtime(AuthoritativeReviewAdmissionRuntimeError),
+}
+
 /// An authoritative Registry store opened from its exact retained Journal and Record namespaces.
 ///
 /// The root path is only a locator. Registry identity, current head, Journal history, and Record
@@ -2063,14 +2077,6 @@ impl AuthoritativeRegistryStore {
         })
     }
 
-    /// Executes authoritative §82, §46, §83, terminal construction, and durable publication.
-    ///
-    /// Terminal publication requires cross-process publisher serialization and retained-object
-    /// revalidation through Record and Journal publication. Windows uses deny-share guards; Linux
-    /// and macOS use cooperative `flock` serialization plus exact identity and byte revalidation.
-    /// Unix adapters do not constrain a same-principal writer that ignores the protocol. Linux
-    /// explicitly unlocks on orderly owner drop; macOS retains the bare File/O_CLOEXEC lifecycle
-    /// and does not promise release while a fork-without-exec child retains its descriptor.
     pub fn complete_authoritative_review_admission(
         &mut self,
         accepted: AcceptedAuthoritativeReviewAdmission,
@@ -2084,12 +2090,66 @@ impl AuthoritativeRegistryStore {
                 ));
             }
         };
-        if frozen_generic_policy_scope_applicability_unavailable() {
+        self.complete_review_admission_after_section_82(section_82, false, false)
+    }
+
+    /// Completes the selected profile-1 exact-Scope terminal route from one
+    /// retained selected REVIEW_RESULT event. The Store holds the publication
+    /// lock while it reloads, revalidates §82, evaluates §46, derives §83, and
+    /// constructs and appends the selected Admission event.
+    pub fn complete_selected_review_admission(
+        &mut self,
+        result_event_reference: JournalReference,
+    ) -> Result<AuthoritativeReviewAdmissionRuntimeOutcome, SelectedReviewAdmissionCompletionError>
+    {
+        if self.open_profile
+            != AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            return Err(SelectedReviewAdmissionCompletionError::SelectedProfileRequired);
+        }
+        let root_hold = self
+            .namespace_holds
+            .first()
+            .ok_or(SelectedReviewAdmissionCompletionError::RetainedGenerationChanged)?;
+        let _publication_lock =
+            acquire_selected_authoritative_publication_lock(&self.root, root_hold)
+                .map_err(|()| SelectedReviewAdmissionCompletionError::PublicationLockUnavailable)?;
+        self.reload_authoritative_namespaces()
+            .map_err(SelectedReviewAdmissionCompletionError::Reload)?;
+        let section_82 = self
+            .derive_selected_review_admission_section_82(result_event_reference)
+            .map_err(SelectedReviewAdmissionCompletionError::Section82)?;
+        self.complete_review_admission_after_section_82(section_82, true, true)
+            .map_err(SelectedReviewAdmissionCompletionError::Runtime)
+    }
+
+    /// Executes authoritative §46, §83, terminal construction, and durable publication after
+    /// the caller has established an exact §82 witness. `selected_profile` is only supplied by
+    /// the locked selected entry point above; the generic path cannot select profile semantics.
+    ///
+    /// Terminal publication requires cross-process publisher serialization and retained-object
+    /// revalidation through Record and Journal publication. Windows uses deny-share guards; Linux
+    /// and macOS use cooperative `flock` serialization plus exact identity and byte revalidation.
+    /// Unix adapters do not constrain a same-principal writer that ignores the protocol. Linux
+    /// explicitly unlocks on orderly owner drop; macOS retains the bare File/O_CLOEXEC lifecycle
+    /// and does not promise release while a fork-without-exec child retains its descriptor.
+    fn complete_review_admission_after_section_82(
+        &mut self,
+        section_82: AuthoritativeReviewAdmissionSection82,
+        selected_profile: bool,
+        publication_lock_held: bool,
+    ) -> Result<AuthoritativeReviewAdmissionRuntimeOutcome, AuthoritativeReviewAdmissionRuntimeError>
+    {
+        if !selected_profile && frozen_generic_policy_scope_applicability_unavailable() {
             return Ok(AuthoritativeReviewAdmissionRuntimeOutcome::PreTerminal(
                 AuthoritativeReviewAdmissionSection82Error::PolicyScopeApplicabilityUnavailable,
             ));
         }
-        let policy_completion = evaluate_unfrozen_review_admission_policy_profile(&section_82);
+        let policy_completion = if selected_profile {
+            evaluate_selected_review_admission_policy_profile(&section_82)
+        } else {
+            evaluate_unfrozen_review_admission_policy_profile(&section_82)
+        };
         let policy_route =
             ReviewAdmissionPolicy46RouteOutcome::Completed(policy_completion.clone());
         let disposition = derive_review_admission_section_83_disposition(&policy_route);
@@ -2114,14 +2174,19 @@ impl AuthoritativeRegistryStore {
         reason_codes.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         reason_codes.dedup();
 
-        let admission_record = ReviewAdmissionRecord::new(ReviewAdmissionRecordInput {
+        let admission_input = ReviewAdmissionRecordInput {
             disposition_id,
             review_request_ref: section_82.request_event_reference().clone(),
             review_result_ref: section_82.result_event_reference().clone(),
             policy_authority_ref: section_82.policy_authority_ref().clone(),
             reason_codes,
             operation_start_journal_ref: section_82.operation_start_journal_ref().clone(),
-        })
+        };
+        let admission_record = if selected_profile {
+            ReviewAdmissionRecord::new_selected(admission_input)
+        } else {
+            ReviewAdmissionRecord::new(admission_input)
+        }
         .map_err(|_| {
             AuthoritativeReviewAdmissionRuntimeError::Publication(
                 AuthoritativeReviewAdmissionPublicationError::AdmissionRecord,
@@ -2133,12 +2198,17 @@ impl AuthoritativeRegistryStore {
                 AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
             ),
         )?;
-        let _publication_lock = acquire_authoritative_publication_lock(&self.root, root_hold)
-            .map_err(|()| {
-                AuthoritativeReviewAdmissionRuntimeError::Publication(
-                    AuthoritativeReviewAdmissionPublicationError::PublicationLockUnavailable,
-                )
-            })?;
+        let _publication_lock = if publication_lock_held {
+            None
+        } else {
+            Some(
+                acquire_authoritative_publication_lock(&self.root, root_hold).map_err(|()| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::PublicationLockUnavailable,
+                    )
+                })?,
+            )
+        };
 
         for _ in 0..MAX_AUTHORITATIVE_PUBLICATION_RETRIES {
             self.reload_authoritative_namespaces()
@@ -2180,11 +2250,14 @@ impl AuthoritativeRegistryStore {
                     )
                 })?;
             let journal_entry_bytes = journal_entry.authoritative_cbor();
-            let mut preflight_store = Self::open(&self.root).map_err(|error| {
-                AuthoritativeReviewAdmissionRuntimeError::Publication(
-                    AuthoritativeReviewAdmissionPublicationError::Store(error),
-                )
-            })?;
+            let mut preflight_store =
+                Self::open_for_review_admission_runtime(&self.root, selected_profile).map_err(
+                    |error| {
+                        AuthoritativeReviewAdmissionRuntimeError::Publication(
+                            AuthoritativeReviewAdmissionPublicationError::Store(error),
+                        )
+                    },
+                )?;
             if preflight_store.retained_journal.current_head_reference() != current_head {
                 continue;
             }
@@ -2196,11 +2269,14 @@ impl AuthoritativeRegistryStore {
                         AuthoritativeReviewAdmissionPublicationError::LifecyclePreflight(error),
                     )
                 })?;
-            let mut publication_store = Self::open(&self.root).map_err(|error| {
-                AuthoritativeReviewAdmissionRuntimeError::Publication(
-                    AuthoritativeReviewAdmissionPublicationError::Store(error),
-                )
-            })?;
+            let mut publication_store =
+                Self::open_for_review_admission_runtime(&self.root, selected_profile).map_err(
+                    |error| {
+                        AuthoritativeReviewAdmissionRuntimeError::Publication(
+                            AuthoritativeReviewAdmissionPublicationError::Store(error),
+                        )
+                    },
+                )?;
             if publication_store.retained_journal.current_head_reference() != current_head {
                 continue;
             }
@@ -2370,7 +2446,10 @@ impl AuthoritativeRegistryStore {
             publication_store
                 .retained_file_witnesses
                 .push(journal_witness);
-            let replayed = post_visibility_try!(Self::open(&self.root));
+            let replayed = post_visibility_try!(Self::open_for_review_admission_runtime(
+                &self.root,
+                selected_profile,
+            ));
             if replayed.namespace_holds.len() != publication_store.namespace_holds.len()
                 || replayed
                     .namespace_holds
@@ -2428,6 +2507,17 @@ impl AuthoritativeRegistryStore {
         Err(AuthoritativeReviewAdmissionRuntimeError::Publication(
             AuthoritativeReviewAdmissionPublicationError::PublicationConflictExhausted,
         ))
+    }
+
+    fn open_for_review_admission_runtime(
+        root: &Path,
+        selected_profile: bool,
+    ) -> Result<Self, AuthoritativeRegistryStoreOpenError> {
+        if selected_profile {
+            Self::open_selected_profile(root)
+        } else {
+            Self::open(root)
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2906,6 +2996,44 @@ fn evaluate_unfrozen_review_admission_policy_profile(
         section_82.result(),
         section_82.anchor_comparison(),
     )
+}
+
+/// Evaluates the frozen selected profile's exact gate Scope rule. The selected
+/// entry point has already established the exact `[2, 5]` Policy context and
+/// profile-specific Request/Result carriers before invoking this evaluator.
+fn evaluate_selected_review_admission_policy_profile(
+    section_82: &AuthoritativeReviewAdmissionSection82,
+) -> ReviewAdmissionPolicy46Completion {
+    let mut completion = evaluate_profile_requirements_without_generic_scope(
+        section_82.policy(),
+        section_82.request(),
+        section_82.result(),
+        section_82.anchor_comparison(),
+    );
+    let prerequisites = section_82.policy_context_prerequisites();
+    completion
+        .evaluator_results
+        .push(ReviewAdmissionIndividualEvaluatorResult {
+            evaluator_id: 1015,
+            outcome: pass_or_fail(
+                prerequisites.gate_scope_ref() == prerequisites.common_review_scope_ref(),
+            ),
+        });
+    completion.result =
+        if completion
+            .evaluator_results
+            .iter()
+            .any(|result| result.outcome() == ReviewAdmissionIndividualEvaluatorOutcome::Fail)
+        {
+            ReviewAdmissionCompletedPolicyResult::GateUnsatisfied
+        } else if completion.evaluator_results.iter().any(|result| {
+            result.outcome() == ReviewAdmissionIndividualEvaluatorOutcome::Indeterminate
+        }) {
+            ReviewAdmissionCompletedPolicyResult::GateIndeterminate
+        } else {
+            ReviewAdmissionCompletedPolicyResult::Satisfied
+        };
+    completion
 }
 
 fn evaluate_profile_requirements_without_generic_scope(
@@ -6259,7 +6387,7 @@ fn validate_review_admission_record_schema(
     let mut failed_roles = 0_u16;
     for _ in 0..field_count {
         let key = cursor.uint().map_err(|_| RecordDecodeError)?;
-        if !(16..=23).contains(&key) {
+        if !(16..=25).contains(&key) {
             return Err(RecordDecodeError);
         }
         present |= 1_u64
@@ -6285,12 +6413,28 @@ fn validate_review_admission_record_schema(
             }
             22 => decode_sorted_text_set(&mut cursor)?,
             23 => decode_journal_reference_value(&mut cursor)?,
+            24 => {
+                if cursor.bstr_32().map_err(|_| RecordDecodeError)?
+                    != TERMINAL_REVIEW_ADMISSION_LEGACY_SELECTOR_SHA256
+                {
+                    return Err(RecordDecodeError);
+                }
+            }
+            25 => {
+                if cursor.bstr_32().map_err(|_| RecordDecodeError)?
+                    != TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256
+                {
+                    return Err(RecordDecodeError);
+                }
+            }
             _ => return Err(RecordDecodeError),
         }
     }
     let required = (1_u64 << 16) | (1_u64 << 22) | (1_u64 << 23);
+    let selected_markers = (1_u64 << 24) | (1_u64 << 25);
     if !cursor.finished()
         || present & required != required
+        || (present & selected_markers != 0 && present & selected_markers != selected_markers)
         || !matches!((event_type, disposition), (302, Some(1)) | (303, Some(2)))
     {
         return Err(RecordDecodeError);
@@ -8038,6 +8182,35 @@ fn event_semantic_authority_is_unavailable(
         // It is not a generic Result or §82/Admission authority decision.
         let selected = ReviewResultRecord::decode_authoritative(record_bytes)
             .ok()
+            .filter(|result| result.review_package_anchor_binding_version() == Some(1))
+            .and_then(|result| {
+                record_bytes_for_reference(records, result.review_request_authority_ref())
+                    .ok()
+                    .and_then(|bytes| ReviewRequestRecord::decode_authoritative(bytes).ok())
+            })
+            .and_then(|request| request.terminal_authority_closure_sha256().copied())
+            == Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256);
+        return Ok(!selected);
+    }
+    if matches!(event_type, 302 | 303) {
+        // A terminal selected Admission is replayable only when its own marker
+        // and the entire selected Result-to-Request carrier chain are present.
+        // `validate_review_admission_event_bindings` has already checked the
+        // exact event, dependency, and record-local bindings before this gate.
+        let selected = ReviewAdmissionRecord::decode_authoritative(record_bytes)
+            .ok()
+            .and_then(|admission| {
+                (admission.terminal_authority_closure_sha256()
+                    == Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256))
+                .then_some(admission)
+            })
+            .and_then(|admission| {
+                admission.review_result_ref().and_then(|reference| {
+                    record_bytes_for_reference(records, reference)
+                        .ok()
+                        .and_then(|bytes| ReviewResultRecord::decode_authoritative(bytes).ok())
+                })
+            })
             .filter(|result| result.review_package_anchor_binding_version() == Some(1))
             .and_then(|result| {
                 record_bytes_for_reference(records, result.review_request_authority_ref())

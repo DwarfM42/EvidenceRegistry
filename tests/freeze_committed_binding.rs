@@ -1233,7 +1233,36 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         !root.join("journal/00000000000000000006.cbor").exists(),
         "selected §82 derivation is nonpublishing and must not append Admission event 302"
     );
+    let publication = reopened
+        .complete_selected_review_admission(result.result_event_reference().clone())
+        .unwrap();
+    let publication = match publication {
+        evidence_registry::AuthoritativeReviewAdmissionRuntimeOutcome::Published(publication) => {
+            publication
+        }
+        outcome => panic!("selected complete route must publish, got {outcome:?}"),
+    };
+    assert_eq!(publication.journal_reference().entry_index().value(), 6);
+    assert_eq!(publication.journal_reference().event_type_id().value(), 302);
+    assert_eq!(publication.admission_record().disposition_id(), 1);
+    assert_eq!(
+        publication
+            .admission_record()
+            .terminal_authority_closure_sha256(),
+        Some(&evidence_registry::TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+    );
+    assert!(root.join("journal/00000000000000000006.cbor").is_file());
+    assert!(!root.join("journal/00000000000000000007.cbor").exists());
     drop(reopened);
+    let terminal_reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    assert_eq!(
+        terminal_reopened
+            .retained_journal()
+            .current_head_reference(),
+        publication.journal_reference().clone(),
+        "a persisted selected Admission must cold-replay as the retained head"
+    );
+    drop(terminal_reopened);
     fs::remove_dir_all(&root).unwrap();
     let _ = fs::remove_dir_all(&source);
 }
