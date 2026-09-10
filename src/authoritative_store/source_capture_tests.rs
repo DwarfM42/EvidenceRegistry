@@ -237,6 +237,39 @@ impl Fixture {
             })
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cold_reopen_can_prepare_a_second_distinct_embedded_freeze() {
+    let mut fixture = Fixture::new();
+    let first = fixture.prepare().unwrap();
+    drop(first);
+
+    let Fixture {
+        base,
+        source,
+        store,
+        policy,
+    } = fixture;
+    let root = base.join("store");
+    drop(store);
+
+    let mut reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let second =
+        reopened.prepare_selected_embedded_freeze(SelectedEmbeddedFreezePreparationInput {
+            source_root: source,
+            freeze_attempt_id: FreezeAttemptId::try_from(&[0x89; 32][..]).unwrap(),
+            policy_record_id: policy,
+        });
+    assert!(
+        second.is_ok(),
+        "a cold selected Store must retain its generation through a second preparation: {second:?}"
+    );
+    reopened.revalidate_retained_generation().unwrap();
+    drop(reopened);
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[cfg(windows)]
 #[test]
 fn source_capture_preparation_retains_root_between_passes() {

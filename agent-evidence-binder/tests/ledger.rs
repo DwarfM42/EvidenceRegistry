@@ -414,6 +414,13 @@ fn fixture() -> (Sandbox, Vec<u8>, usize) {
     let bytes = fs::read(root.ledger()).unwrap();
     (root, bytes, first_end)
 }
+
+fn assert_corrupt_ledger(path: PathBuf) {
+    let opened = LedgerWriter::open(path);
+    assert!(matches!(&opened, Err(LedgerError::Corrupt(_))));
+    drop(opened);
+}
+
 #[test]
 fn actual_torn_length_payload_and_digest_keep_valid_prefix_never_truncate() {
     let (root, bytes, first_end) = fixture();
@@ -436,18 +443,13 @@ fn actual_torn_length_payload_and_digest_keep_valid_prefix_never_truncate() {
                 kind: BoundaryKind::Torn
             })
         );
-        assert!(matches!(
-            LedgerWriter::open(root.ledger()),
-            Err(LedgerError::Corrupt(_))
-        ));
+        drop(r);
+        assert_corrupt_ledger(root.ledger());
         assert_eq!(fs::read(root.ledger()).unwrap(), bytes[..end]);
     }
     for n in 0..8 {
         fs::write(root.ledger(), &bytes[..n]).unwrap();
-        assert!(matches!(
-            LedgerWriter::open(root.ledger()),
-            Err(LedgerError::Corrupt(_))
-        ));
+        assert_corrupt_ledger(root.ledger());
     }
 }
 #[test]
@@ -497,11 +499,9 @@ fn bad_digest_sequence_prevhash_request_attempt_and_order_stop_at_boundary() {
         fs::write(root.ledger(), &modified).unwrap();
         let r = read_ledger(root.ledger()).unwrap();
         assert_eq!(r.frames.len(), 1);
-        assert_eq!(r.boundary.unwrap().kind, kind);
-        assert!(matches!(
-            LedgerWriter::open(root.ledger()),
-            Err(LedgerError::Corrupt(_))
-        ));
+        assert_eq!(r.boundary.as_ref().unwrap().kind, kind);
+        drop(r);
+        assert_corrupt_ledger(root.ledger());
         assert_eq!(fs::read(root.ledger()).unwrap(), modified);
     }
     let mut bad = bytes.clone();

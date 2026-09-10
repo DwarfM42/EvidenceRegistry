@@ -4677,21 +4677,24 @@ fn publish_record_bytes(
         }
     }
     let records_dir = store.root.join("records");
+    let retained_records_hold = store.namespace_holds.get(3).ok_or(())?;
+    let retained_records_contents = namespace_contents_path(&records_dir, retained_records_hold)?;
     let records_hold = store.acquire_publication_directory_hold(3, "records")?;
     ensure_path_matches_handle(&records_dir, &records_hold)?;
     let records_contents = namespace_contents_path(&records_dir, &records_hold)?;
     let final_name = record_filename(record_id);
     let final_path = records_contents.join(&final_name);
+    let retained_final_path = retained_records_contents.join(&final_name);
     if final_path.exists() {
         let position = if let Some(position) = store
             .retained_file_witnesses
             .iter()
-            .position(|witness| witness.path == final_path)
+            .position(|witness| witness.path == retained_final_path)
         {
             position
         } else {
-            let read =
-                read_regular_file(&final_path, &mut NamespaceBudget::new()).map_err(|_| ())?;
+            let read = read_regular_file(&retained_final_path, &mut NamespaceBudget::new())
+                .map_err(|_| ())?;
             if read.bytes != bytes {
                 return Err(());
             }
@@ -4727,7 +4730,11 @@ fn publish_record_bytes(
         });
     }
     match publish_new_immutable_file(&records_dir, &records_hold, Path::new(&final_name), bytes)? {
-        ImmutablePublicationOutcome::Published(publication) => Ok(publication),
+        ImmutablePublicationOutcome::Published(mut publication) => {
+            publication.retained_witness.path = retained_final_path;
+            revalidate_retained_file_witness(&mut publication.retained_witness)?;
+            Ok(publication)
+        }
         ImmutablePublicationOutcome::Conflict
         | ImmutablePublicationOutcome::VisibleReceiptUncertain => Err(()),
     }

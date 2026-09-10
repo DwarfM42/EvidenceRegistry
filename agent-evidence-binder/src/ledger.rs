@@ -624,6 +624,10 @@ impl LedgerWriter {
         }
         let report = parse(&mut file)?;
         if let Some(b) = &report.boundary {
+            // Release the acquired advisory lock explicitly before surfacing a
+            // corrupt prefix. This avoids retaining a process-local flock on
+            // Unix while the caller continues adversarial boundary checks.
+            file.unlock()?;
             return Err(LedgerError::Corrupt(b.clone()));
         }
         let mut state = State::default();
@@ -760,6 +764,7 @@ pub fn read_ledger(path: impl AsRef<Path>) -> Result<ReadReport> {
     check_identity(&file, &path, false)?;
     let report = parse(&mut file)?;
     check_identity(&file, &path, false)?;
+    file.unlock()?;
     Ok(report)
 }
 fn parse(file: &mut File) -> Result<ReadReport> {

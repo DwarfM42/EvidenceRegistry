@@ -2,6 +2,12 @@ use super::*;
 use crate::ledger::{CommandLimits, Event};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
+fn canonical_temp_dir() -> std::path::PathBuf {
+    // macOS may expose its temporary directory through /var, a symlink to
+    // /private/var. The ledger deliberately rejects linked path components,
+    // so fixtures must create their owned paths below the canonical directory.
+    std::fs::canonicalize(std::env::temp_dir()).unwrap()
+}
 #[cfg(windows)]
 thread_local! {
     static HELD_COMPLETION_WRITER: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
@@ -10,7 +16,7 @@ fn probe(hook: TestHook, expected: &str) {
     probe_with(Some(hook), None, expected);
 }
 fn probe_with(hook: Option<TestHook>, completion_hook: Option<CompletionHook>, expected: &str) {
-    let root = std::env::temp_dir().join(format!(
+    let root = canonical_temp_dir().join(format!(
         "binder-process-fault-{}-{}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -109,7 +115,7 @@ fn surviving_writable_object_prevents_completion_and_persists_hold_fault() {
 #[cfg(windows)]
 #[test]
 fn same_object_transition_keeps_originals_until_both_leaf_checks_succeed() {
-    let root = std::env::temp_dir().join(format!(
+    let root = canonical_temp_dir().join(format!(
         "binder-transition-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -230,7 +236,7 @@ thread_local! {
 
 #[test]
 fn ledger_tamper_before_next_observation_is_not_preemptive_containment() {
-    let root = std::env::temp_dir().join(format!(
+    let root = canonical_temp_dir().join(format!(
         "binder-tamper-order-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
