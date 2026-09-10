@@ -1193,7 +1193,7 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
     assert!(!root.join("journal/00000000000000000006.cbor").exists());
     drop(store);
 
-    let reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let mut reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
     assert_eq!(
         reopened
             .validate_selected_review_request(recorded.request_event_reference().clone())
@@ -1205,6 +1205,33 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
             .validate_selected_review_result(result.result_event_reference().clone())
             .unwrap(),
         result
+    );
+    assert_eq!(
+        reopened.derive_selected_review_admission_section_82(
+            recorded.request_event_reference().clone(),
+        ),
+        Err(
+            evidence_registry::SelectedReviewAdmissionSection82Error::Result(
+                evidence_registry::SelectedReviewResultError::ReplayMismatch,
+            )
+        ),
+        "a Request reference cannot be substituted for the Store-resolved Result"
+    );
+    assert!(!root.join("journal/00000000000000000006.cbor").exists());
+    let section_82 = reopened
+        .derive_selected_review_admission_section_82(result.result_event_reference().clone())
+        .unwrap();
+    assert_eq!(
+        section_82.request_event_reference(),
+        recorded.request_event_reference()
+    );
+    assert_eq!(
+        section_82.result_event_reference(),
+        result.result_event_reference()
+    );
+    assert!(
+        !root.join("journal/00000000000000000006.cbor").exists(),
+        "selected §82 derivation is nonpublishing and must not append Admission event 302"
     );
     drop(reopened);
     fs::remove_dir_all(&root).unwrap();

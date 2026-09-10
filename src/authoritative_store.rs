@@ -268,6 +268,15 @@ pub enum SelectedReviewResultError {
     ReplayMismatch,
 }
 
+/// A fail-closed failure while deriving the selected nonpublishing §82 witness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectedReviewAdmissionSection82Error {
+    SelectedProfileRequired,
+    Result(SelectedReviewResultError),
+    Acceptance(AuthoritativeReviewAdmissionAcceptanceError),
+    Section82(AuthoritativeReviewAdmissionSection82Error),
+}
+
 /// An authoritative Registry store opened from its exact retained Journal and Record namespaces.
 ///
 /// The root path is only a locator. Registry identity, current head, Journal history, and Record
@@ -1823,6 +1832,37 @@ impl AuthoritativeRegistryStore {
             result_event_reference,
             request,
         })
+    }
+
+    /// Derives the exact selected §82 witness from one retained Result event.
+    ///
+    /// The caller supplies no Request/Result bytes, Freeze/Policy/Anchor references, evaluator
+    /// outcome, Admission body, or publication target. This method never evaluates §46, derives
+    /// §83, constructs an Admission Record, or appends events 302/303.
+    pub fn derive_selected_review_admission_section_82(
+        &mut self,
+        result_event_reference: JournalReference,
+    ) -> Result<AuthoritativeReviewAdmissionSection82, SelectedReviewAdmissionSection82Error> {
+        if self.open_profile
+            != AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            return Err(SelectedReviewAdmissionSection82Error::SelectedProfileRequired);
+        }
+        let result = self
+            .validate_selected_review_result(result_event_reference)
+            .map_err(SelectedReviewAdmissionSection82Error::Result)?;
+        let request_bytes = result.request().request().authoritative_cbor();
+        let result_bytes = result.result().authoritative_cbor();
+        let accepted = self
+            .accept_authoritative_review_admission(
+                result.request().request_event_reference().clone(),
+                &request_bytes,
+                result.result_event_reference().clone(),
+                &result_bytes,
+            )
+            .map_err(SelectedReviewAdmissionSection82Error::Acceptance)?;
+        self.complete_authoritative_review_admission_section_82(accepted)
+            .map_err(SelectedReviewAdmissionSection82Error::Section82)
     }
 
     /// Accepts one bounded opaque Request/Result presentation and binds the exact authoritative
