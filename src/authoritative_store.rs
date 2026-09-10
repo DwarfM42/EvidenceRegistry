@@ -5,6 +5,8 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 #[cfg(not(target_os = "macos"))]
 use std::io::{Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 /// Maximum bytes admitted from any single authoritative namespace object.
@@ -5625,14 +5627,29 @@ fn ensure_path_matches_handle(path: &Path, file: &fs::File) -> Result<(), ()> {
 fn ensure_path_matches_handle(path: &Path, file: &fs::File) -> Result<(), ()> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
-
-        // Linux namespace traversal is rooted through this exact held descriptor.
-        // `/proc/self/fd/<n>` is necessarily a symlink, but it resolves to the
-        // supplied live descriptor rather than to a path selected by an attacker.
-        let held_descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        if path == held_descriptor_path {
-            return Ok(());
+        let proc_fd_root = Path::new("/proc/self/fd");
+        if let Ok(relative) = path.strip_prefix(proc_fd_root) {
+            let components = relative.components().collect::<Vec<_>>();
+            if components.len() == 1 {
+                if let Component::Normal(descriptor) = components[0] {
+                    if !descriptor.is_empty()
+                        && descriptor.as_encoded_bytes().iter().all(u8::is_ascii_digit)
+                    {
+                        // Linux namespace traversal is rooted through a live
+                        // `/proc/self/fd/<n>` descriptor. That proc entry is
+                        // necessarily a symlink, so authenticate its resolved
+                        // target against the supplied held handle instead.
+                        let path_metadata = fs::metadata(path).map_err(|_| ())?;
+                        let handle_metadata = file.metadata().map_err(|_| ())?;
+                        if metadata_is_reparse(&path_metadata)
+                            || !metadata_identity_matches(&path_metadata, &handle_metadata)
+                        {
+                            return Err(());
+                        }
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
     let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
