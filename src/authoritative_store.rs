@@ -2340,6 +2340,15 @@ impl AuthoritativeRegistryStore {
                     AuthoritativeReviewAdmissionPublicationError::SemanticPreflight,
                 )
             })?;
+            if selected_profile {
+                preflight_store
+                    .validate_selected_terminal_admission_replay()
+                    .map_err(|_| {
+                        AuthoritativeReviewAdmissionRuntimeError::Publication(
+                            AuthoritativeReviewAdmissionPublicationError::SemanticPreflight,
+                        )
+                    })?;
+            }
             let mut publication_store =
                 Self::open_for_review_admission_runtime(&self.root, selected_profile).map_err(
                     |error| {
@@ -2496,6 +2505,11 @@ impl AuthoritativeRegistryStore {
                 &publication_store.retained_journal,
                 &publication_store.records,
             ));
+            if selected_profile {
+                post_visibility_try!(
+                    publication_store.validate_selected_terminal_admission_replay()
+                );
+            }
             if authenticate_published_journal_reference(
                 &publication_store.retained_journal,
                 &journal_reference,
