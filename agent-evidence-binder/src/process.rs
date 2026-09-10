@@ -6,7 +6,8 @@
 //! smaller declarations fail before spawn. `output_files`/`output_bytes` are
 //! enforced separately by Store capture, NOT by monitoring arbitrary child files.
 //! Null stdin; prompts may be explicit bounded literal command arguments only.
-//! Windows requires an absolute `.exe` (no implicit batch-file shell).
+//! Every platform requires an absolute executable; Windows additionally requires
+//! an `.exe` (no implicit PATH lookup or batch-file shell).
 //!
 //! There are no reader threads, wait-with-output buffers or blocking child joins.
 //! Windows peeks owned pipes before reading available bytes; Unix uses nonblocking
@@ -205,11 +206,12 @@ fn run_inner(
             io::Error::new(io::ErrorKind::Unsupported, "unsupported_descriptor_budget").into(),
         );
     }
-    #[cfg(windows)]
-    if !Path::new(&intent.command[0]).is_absolute()
-        || !Path::new(&intent.command[0])
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+    let executable = Path::new(&intent.command[0]);
+    if !executable.is_absolute()
+        || (cfg!(windows)
+            && !executable
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")))
     {
         writer.append_observation(
             attempt_id,
@@ -217,7 +219,9 @@ fn run_inner(
                 code: "unsupported_executable".into(),
             },
         )?;
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "absolute_exe_required").into());
+        return Err(
+            io::Error::new(io::ErrorKind::Unsupported, "absolute_executable_required").into(),
+        );
     }
     let root = Path::new(&intent.approved_output_root);
     let stdout = root.join(STDOUT_NAME);

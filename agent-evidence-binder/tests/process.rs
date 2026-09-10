@@ -503,6 +503,28 @@ fn implicit_batch_shell_is_rejected_before_spawn() {
     assert!(!s.0.join("out/marker").exists());
     assert!(w.report().frames.iter().any(|f| matches!(&f.event, Event::Observation(Observation::SpawnFailed { code }) if code == "unsupported_executable")));
 }
+#[cfg(unix)]
+#[test]
+fn relative_executable_is_rejected_before_path_lookup() {
+    let s = Sandbox::new();
+    let mut w = s.writer();
+    let mut intent = s.intent("fixture_marker");
+    intent.command[0] = "fixture_success".into();
+    assert!(
+        run_managed(
+            &mut w,
+            request(),
+            "relative",
+            intent,
+            &AtomicBool::new(false)
+        )
+        .is_err(),
+        "relative executable was accepted for PATH lookup"
+    );
+    assert!(!s.0.join("out/marker").exists());
+    assert!(!s.0.join("out/binder-stdout.bin").exists());
+    assert!(w.report().frames.iter().any(|f| matches!(&f.event, Event::Observation(Observation::SpawnFailed { code }) if code == "unsupported_executable")));
+}
 #[test]
 fn failed_intent_has_no_spawn_or_spool_side_effect() {
     let s = Sandbox::new();

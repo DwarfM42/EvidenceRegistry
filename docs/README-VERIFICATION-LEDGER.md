@@ -47,9 +47,11 @@ that evidence root, but hashes alone are not a substitute for retained output.
   but that local checkout did not satisfy the README's clean-checkout
   precondition. It is therefore useful execution evidence, not final candidate
   qualification.
-- `docs/HERMES-BINDER-DOGFOOD-d4f9f4d8.md` records the separate actual Windows
-  Hermes run on implementation commit `d4f9f4d8` and its all-attempt boundary.
-  It is not a replacement for the exact-final-tree rerun.
+- `docs/HERMES-BINDER-DOGFOOD-98b7646.md` records the separate actual Windows
+  Hermes run on implementation commit `98b7646`, including isolated launcher
+  probes, preserved failed roots, a fresh accepted Request-first path, and cold
+  inspection. It is not a replacement for exact-final-documentation-tree rerun
+  or native multi-platform qualification.
 
 After the final source/documentation tree is committed, create a new machine
 record beneath `target/` using every field above. The final handoff must name
