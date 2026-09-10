@@ -19,8 +19,10 @@ pub use authoritative_store::{
     AuthoritativeReviewAdmissionPublishedReceiptUncertain,
     AuthoritativeReviewAdmissionRuntimeError, AuthoritativeReviewAdmissionRuntimeOutcome,
     AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error,
-    DurabilityActionState, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
-    AUTHORITATIVE_STORE_MAX_OBJECTS, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
+    DurabilityActionState, PreparedSelectedEmbeddedFreeze, SelectedEmbeddedFreezeCommitError,
+    SelectedEmbeddedFreezePreparationError, SelectedEmbeddedFreezePreparationInput,
+    AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES, AUTHORITATIVE_STORE_MAX_OBJECTS,
+    AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
 };
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
@@ -543,7 +545,7 @@ impl TryFrom<u64> for RecordTypeId {
                 | 30..=32
                 | 40
                 | 50
-                | 60..=63
+                | 60..=64
                 | 70..=72
                 | 80..=90
         );

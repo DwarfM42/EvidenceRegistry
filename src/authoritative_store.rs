@@ -59,6 +59,97 @@ pub enum AuthoritativeRegistryStoreInitializeError {
     Reopen(AuthoritativeRegistryStoreOpenError),
 }
 
+/// Minimal caller-supplied material for one selected EMBEDDED Freeze preparation.
+///
+/// Every Record, Journal, root, payload, Subject, and event identity is derived by the Store.
+/// `source_root` is an untrusted source locator, not a retained or publishable destination.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedEmbeddedFreezePreparationInput {
+    pub source_root: PathBuf,
+    pub freeze_attempt_id: FreezeAttemptId,
+    pub policy_record_id: RecordId,
+}
+
+/// Exact Store-derived artifacts from a successful selected EMBEDDED Freeze preparation.
+///
+/// This is a START-and-payload preparation result only. It is not a Receipt, event 101, positive
+/// Freeze authority, Policy completion, review admission, or terminal publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSelectedEmbeddedFreeze {
+    start_record: FreezeAttemptStartRecord,
+    start_event_reference: JournalReference,
+    manifest_record_id: RecordId,
+    payload_directory: PathBuf,
+}
+
+impl PreparedSelectedEmbeddedFreeze {
+    pub fn start_record(&self) -> &FreezeAttemptStartRecord {
+        &self.start_record
+    }
+
+    pub fn start_event_reference(&self) -> &JournalReference {
+        &self.start_event_reference
+    }
+
+    /// The exact Store-derived MANIFEST identity for the retained payload inventory.
+    pub fn manifest_record_id(&self) -> RecordId {
+        self.manifest_record_id
+    }
+
+    /// The Store-owned retained payload directory for diagnostic local access.
+    pub fn payload_directory(&self) -> &Path {
+        &self.payload_directory
+    }
+}
+
+/// A fail-closed failure while preparing the selected EMBEDDED Freeze START and retained payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedEmbeddedFreezePreparationError {
+    SelectedProfileRequired,
+    PublicationLockUnavailable,
+    Store(AuthoritativeRegistryStoreOpenError),
+    PolicyUnavailable,
+    PolicyInvalid,
+    PolicyUnsupported,
+    SourceInvalid,
+    SourceResourceLimit,
+    EntryIndexExhausted,
+    StartJournalEntry,
+    StartRecordPublication,
+    StartJournalPublication,
+    StartPublicationConflict,
+    RootConflict,
+    RootCreation,
+    PayloadPublication,
+    ManifestConstruction,
+    ManifestPublication,
+    SourceChanged,
+    ReplayMismatch,
+    RetainedGenerationChanged,
+}
+
+/// A fail-closed failure while turning one Store-derived selected payload preparation into
+/// FREEZE_COMMITTED. The input is opaque: callers cannot supply a Receipt, Manifest, root,
+/// Subject, policy conclusion, or terminal Journal state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedEmbeddedFreezeCommitError {
+    SelectedProfileRequired,
+    PublicationLockUnavailable,
+    Store(AuthoritativeRegistryStoreOpenError),
+    PreparationMismatch,
+    RetainedGenerationChanged,
+    PayloadInvalid,
+    PolicyInvalid,
+    CreationProfilePublication,
+    ReceiptConstruction,
+    ReceiptPublication,
+    JournalConstruction,
+    JournalPublication,
+    JournalConflict,
+    ReplayMismatch,
+    PositiveReplay(AuthoritativeFreezeCommittedBindingError),
+}
+
 /// An authoritative Registry store opened from its exact retained Journal and Record namespaces.
 ///
 /// The root path is only a locator. Registry identity, current head, Journal history, and Record
@@ -517,6 +608,9 @@ impl AuthoritativeFreezeCommittedBinding {
 pub enum AuthoritativeFreezeCommittedBindingError {
     Structural(ResolvedFreezeCommittedBindingError),
     RetainedGenerationChanged,
+    /// A selected Receipt did not satisfy the adopted selected Store, profile, policy, or
+    /// currently retained EMBEDDED-payload prerequisites.
+    SelectedPrerequisiteInvalid,
     /// Frozen authority does not assign the generic gate-Scope and selected Manifest-profile
     /// semantics needed to promote exact structural bindings into positive Freeze authority.
     SemanticAuthorityUnavailable,
@@ -902,8 +996,309 @@ impl AuthoritativeRegistryStore {
         &self.retained_journal
     }
 
-    /// Validates exact retained Freeze bindings and fails closed before positive authority where
-    /// frozen generic Policy-Scope and selected Manifest-profile semantics remain unavailable.
+    /// Records a selected event-100 START and creates its Store-owned EMBEDDED payload copy.
+    ///
+    /// This bounded producer deliberately stops before Receipt/event-101 construction. Its
+    /// successful return preserves structural facts only and establishes no positive authority.
+    pub fn prepare_selected_embedded_freeze(
+        &mut self,
+        input: SelectedEmbeddedFreezePreparationInput,
+    ) -> Result<PreparedSelectedEmbeddedFreeze, SelectedEmbeddedFreezePreparationError> {
+        if self.open_profile
+            != AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            return Err(SelectedEmbeddedFreezePreparationError::SelectedProfileRequired);
+        }
+        let root_hold = self
+            .namespace_holds
+            .first()
+            .ok_or(SelectedEmbeddedFreezePreparationError::RetainedGenerationChanged)?;
+        let _publication_lock =
+            acquire_selected_authoritative_publication_lock(&self.root, root_hold)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::PublicationLockUnavailable)?;
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_embedded_preparation_reload_error)?;
+
+        let policy_bytes = self
+            .resolve(input.policy_record_id)
+            .ok_or(SelectedEmbeddedFreezePreparationError::PolicyUnavailable)?;
+        let policy = MinimalPolicyRecord::decode_authoritative(policy_bytes)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::PolicyInvalid)?;
+        if policy.record_id() != input.policy_record_id {
+            return Err(SelectedEmbeddedFreezePreparationError::PolicyInvalid);
+        }
+        if !selected_freeze_policy_is_supported(&policy, self) {
+            return Err(SelectedEmbeddedFreezePreparationError::PolicyUnsupported);
+        }
+        let source = collect_selected_embedded_source(&input.source_root)?;
+        let subject_id = derive_selected_regular_file_subject(&source.artifacts)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+        let current_head = self.retained_journal.current_head_reference();
+        let current_context = self
+            .retained_journal
+            .resolve_reference(&current_head)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::ReplayMismatch)?;
+        let next_index = current_head
+            .entry_index()
+            .value()
+            .checked_add(1)
+            .and_then(|value| JournalEntryIndex::try_from(value).ok())
+            .ok_or(SelectedEmbeddedFreezePreparationError::EntryIndexExhausted)?;
+        let start_record = FreezeAttemptStartRecord::new(FreezeAttemptStartRecordInput {
+            freeze_attempt_id: input.freeze_attempt_id,
+            intended_root_id: derive_freeze_root(
+                current_head.registry_id(),
+                input.freeze_attempt_id,
+            )
+            .intended_root_id(),
+            subject_id,
+            policy_record_id: input.policy_record_id,
+        });
+        let start_entry =
+            FreezeAttemptStartJournalEntry::new(FreezeAttemptStartJournalEntryInput {
+                registry_id: current_head.registry_id(),
+                entry_index: next_index,
+                previous_entry_hash: current_head.entry_hash(),
+                start_record: start_record.clone(),
+                storage_capability_class_id: current_context.storage_capability_class_id(),
+                environment_observation_id: current_context.environment_observation_id(),
+            })
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::StartJournalEntry)?;
+        let start_entry_bytes = start_entry.authoritative_cbor();
+        let expected_start_reference = JournalReference::new(
+            current_head.registry_id(),
+            next_index,
+            JournalEntryHash::try_from(Sha256::digest(&start_entry_bytes).as_slice())
+                .expect("SHA-256 has exact Journal Entry hash width"),
+            start_entry.event_type_id(),
+            start_entry.event_record_id(),
+        );
+
+        publish_record_bytes(
+            self,
+            start_record.record_id(),
+            &start_record.authoritative_cbor(),
+        )
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::StartRecordPublication)?;
+        let journal_dir = self.root.join("journal");
+        let journal_hold = self
+            .acquire_publication_directory_hold(2, "journal")
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::RetainedGenerationChanged)?;
+        let journal_contents = namespace_contents_path(&journal_dir, &journal_hold)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::RetainedGenerationChanged)?;
+        let journal_name = format!("{:020}.cbor", next_index.value());
+        match publish_journal_slot(
+            &journal_contents,
+            &journal_hold,
+            Path::new(&journal_name),
+            &start_entry_bytes,
+        )
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::StartJournalPublication)?
+        {
+            JournalSlotPublication::Published(_) => {}
+            JournalSlotPublication::Conflict => {
+                return Err(SelectedEmbeddedFreezePreparationError::StartPublicationConflict)
+            }
+            JournalSlotPublication::VisibleReceiptUncertain => {
+                return Err(SelectedEmbeddedFreezePreparationError::StartJournalPublication)
+            }
+        }
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_embedded_preparation_reload_error)?;
+        let start_event_reference = self.retained_journal.current_head_reference();
+        if start_event_reference != expected_start_reference
+            || start_event_reference.event_type_id().value() != 100
+        {
+            return Err(SelectedEmbeddedFreezePreparationError::ReplayMismatch);
+        }
+
+        let (payload_directory, payload_hold) = create_selected_embedded_payload_root(
+            self,
+            input.freeze_attempt_id,
+            &start_event_reference,
+        )?;
+        publish_selected_embedded_payload(&payload_directory, &payload_hold, &source)?;
+        let retained = collect_selected_embedded_source(&payload_directory)?;
+        let retained_subject_id = derive_selected_regular_file_subject(&retained.artifacts)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::ReplayMismatch)?;
+        if retained.artifacts != source.artifacts
+            || retained_subject_id != subject_id
+            || collect_selected_embedded_source(&input.source_root)? != source
+        {
+            return Err(SelectedEmbeddedFreezePreparationError::SourceChanged);
+        }
+        let manifest = ManifestRecord::new(ManifestRecordInput {
+            subject_id: retained_subject_id,
+            artifact_count: u64::try_from(retained.artifacts.len())
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::ManifestConstruction)?,
+            path_identity_profile_id: 1,
+            digest_profile_id: 1,
+            artifacts: retained.artifacts,
+        })
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::ManifestConstruction)?;
+        publish_record_bytes(self, manifest.record_id(), &manifest.authoritative_cbor())
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::ManifestPublication)?;
+        self.revalidate_retained_generation()
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::RetainedGenerationChanged)?;
+        Ok(PreparedSelectedEmbeddedFreeze {
+            start_record,
+            start_event_reference,
+            manifest_record_id: manifest.record_id(),
+            payload_directory,
+        })
+    }
+
+    /// Publishes a selected FREEZE_RECEIPT and event 101 from an opaque Store-produced
+    /// EMBEDDED preparation, then requires an exact selected cold replay before returning.
+    pub fn commit_prepared_selected_embedded_freeze(
+        &mut self,
+        prepared: PreparedSelectedEmbeddedFreeze,
+    ) -> Result<AuthoritativeFreezeCommittedBinding, SelectedEmbeddedFreezeCommitError> {
+        if self.open_profile
+            != AuthoritativeRegistryStoreOpenProfile::SelectedTerminalAuthorityClosure
+        {
+            return Err(SelectedEmbeddedFreezeCommitError::SelectedProfileRequired);
+        }
+        let root_hold = self
+            .namespace_holds
+            .first()
+            .ok_or(SelectedEmbeddedFreezeCommitError::RetainedGenerationChanged)?;
+        let _publication_lock =
+            acquire_selected_authoritative_publication_lock(&self.root, root_hold)
+                .map_err(|_| SelectedEmbeddedFreezeCommitError::PublicationLockUnavailable)?;
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_embedded_commit_reload_error)?;
+
+        let start_reference = prepared.start_event_reference.clone();
+        if self.retained_journal.current_head_reference() != start_reference
+            || start_reference.event_type_id().value() != 100
+            || self
+                .resolve(prepared.start_record.record_id())
+                .is_none_or(|bytes| bytes != prepared.start_record.authoritative_cbor())
+        {
+            return Err(SelectedEmbeddedFreezeCommitError::PreparationMismatch);
+        }
+        let manifest_bytes = self
+            .resolve(prepared.manifest_record_id)
+            .ok_or(SelectedEmbeddedFreezeCommitError::PreparationMismatch)?;
+        let manifest = ManifestRecord::decode_authoritative(manifest_bytes)
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::PreparationMismatch)?;
+        if manifest.record_id() != prepared.manifest_record_id
+            || manifest.input().subject_id != prepared.start_record.input().subject_id
+            || validate_selected_embedded_payload(
+                &self.root,
+                prepared.start_record.input().freeze_attempt_id,
+                &manifest,
+            )
+            .is_err()
+        {
+            return Err(SelectedEmbeddedFreezeCommitError::PayloadInvalid);
+        }
+        let policy = self
+            .resolve(prepared.start_record.input().policy_record_id)
+            .and_then(|bytes| MinimalPolicyRecord::decode_authoritative(bytes).ok())
+            .filter(|policy| {
+                policy.record_id() == prepared.start_record.input().policy_record_id
+                    && selected_freeze_policy_is_supported(policy, self)
+            })
+            .ok_or(SelectedEmbeddedFreezeCommitError::PolicyInvalid)?;
+        let creation_profile = FreezeCreationProfileRecord::new()
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::ReceiptConstruction)?;
+        publish_record_bytes(
+            self,
+            creation_profile.record_id(),
+            &creation_profile.authoritative_cbor(),
+        )
+        .map_err(|_| SelectedEmbeddedFreezeCommitError::CreationProfilePublication)?;
+        self.revalidate_retained_generation()
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::RetainedGenerationChanged)?;
+
+        let head = self.retained_journal.current_head_reference();
+        let context = self
+            .retained_journal
+            .resolve_reference(&head)
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::PreparationMismatch)?;
+        let entry_index = head
+            .entry_index()
+            .value()
+            .checked_add(1)
+            .and_then(|value| JournalEntryIndex::try_from(value).ok())
+            .ok_or(SelectedEmbeddedFreezeCommitError::JournalConstruction)?;
+        let receipt = FreezeReceiptRecord::new(FreezeReceiptRecordInput {
+            freeze_attempt_id: prepared.start_record.input().freeze_attempt_id,
+            freeze_id: *prepared.start_record.input().freeze_attempt_id.as_bytes(),
+            attempt_start_journal_ref: start_reference.clone(),
+            subject_id: prepared.start_record.input().subject_id,
+            manifest_id: prepared.manifest_record_id,
+            custody_mode_id: 1,
+            creation_profile_ref: creation_profile.record_id(),
+            path_identity_profile_id: 1,
+            filesystem_profile_ref: context.environment_observation_id(),
+            policy_record_id: policy.record_id(),
+            file_content_flush_state: 1,
+            atomic_publish_no_replace_state: 1,
+            parent_directory_flush_state: 1,
+            platform_strongest_available: false,
+            requested_commit_durability_ref: None,
+            terminal_authority_closure_sha256: Some(TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256),
+            created_by_tool_version: "evidence-registry-selected-freeze-v1".to_owned(),
+        })
+        .map_err(|_| SelectedEmbeddedFreezeCommitError::ReceiptConstruction)?;
+        let entry = FreezeCommittedJournalEntry::new(FreezeCommittedJournalEntryInput {
+            registry_id: head.registry_id(),
+            entry_index,
+            previous_entry_hash: head.entry_hash(),
+            receipt: receipt.clone(),
+            storage_capability_class_id: context.storage_capability_class_id(),
+            environment_observation_id: context.environment_observation_id(),
+        })
+        .map_err(|_| SelectedEmbeddedFreezeCommitError::JournalConstruction)?;
+        let entry_bytes = entry.authoritative_cbor();
+        let reference = JournalReference::new(
+            head.registry_id(),
+            entry_index,
+            JournalEntryHash::try_from(Sha256::digest(&entry_bytes).as_slice())
+                .expect("SHA-256 has exact Journal Entry hash width"),
+            entry.event_type_id(),
+            entry.event_record_id(),
+        );
+        publish_record_bytes(self, receipt.record_id(), &receipt.authoritative_cbor())
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::ReceiptPublication)?;
+        self.revalidate_retained_generation()
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::RetainedGenerationChanged)?;
+        let journal_dir = self.root.join("journal");
+        let journal_hold = self
+            .acquire_publication_directory_hold(2, "journal")
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::RetainedGenerationChanged)?;
+        let journal_contents = namespace_contents_path(&journal_dir, &journal_hold)
+            .map_err(|_| SelectedEmbeddedFreezeCommitError::RetainedGenerationChanged)?;
+        match publish_journal_slot(
+            &journal_contents,
+            &journal_hold,
+            Path::new(&format!("{:020}.cbor", entry_index.value())),
+            &entry_bytes,
+        )
+        .map_err(|_| SelectedEmbeddedFreezeCommitError::JournalPublication)?
+        {
+            JournalSlotPublication::Published(_) => {}
+            JournalSlotPublication::Conflict => {
+                return Err(SelectedEmbeddedFreezeCommitError::JournalConflict)
+            }
+            JournalSlotPublication::VisibleReceiptUncertain => {
+                return Err(SelectedEmbeddedFreezeCommitError::JournalPublication)
+            }
+        }
+        self.reload_authoritative_namespaces()
+            .map_err(map_selected_embedded_commit_reload_error)?;
+        if self.retained_journal.current_head_reference() != reference {
+            return Err(SelectedEmbeddedFreezeCommitError::ReplayMismatch);
+        }
+        self.validate_freeze_committed_authority(reference)
+            .map_err(SelectedEmbeddedFreezeCommitError::PositiveReplay)
+    }
+
+    /// Validates selected Receipt/event-101 replay and current embedded payload bytes before
+    /// returning a positive selected Freeze witness. Unselected Receipt forms remain unavailable.
     pub fn validate_freeze_committed_authority(
         &self,
         committed_event_reference: JournalReference,
@@ -919,7 +1314,47 @@ impl AuthoritativeRegistryStore {
         {
             ResolvedFreezeCommittedBindingOutcome::AuthorityEvidenceUnavailable => {}
         }
-        Err(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable)
+        let committed = self
+            .retained_journal
+            .resolve_reference(&committed_event_reference)
+            .map_err(|error| {
+                AuthoritativeFreezeCommittedBindingError::Structural(
+                    ResolvedFreezeCommittedBindingError::RetainedReference(error),
+                )
+            })?;
+        let receipt_record_id = record_id_from_event_reference(&committed_event_reference);
+        let receipt = self
+            .resolve(receipt_record_id)
+            .and_then(|bytes| FreezeReceiptRecord::decode_authoritative(bytes).ok())
+            .filter(|receipt| receipt.record_id() == receipt_record_id)
+            .ok_or(AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid)?;
+        if receipt.terminal_authority_closure_sha256()
+            != Some(&TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256)
+        {
+            return Err(AuthoritativeFreezeCommittedBindingError::SemanticAuthorityUnavailable);
+        }
+        validate_selected_freeze_committed_prerequisites(
+            &self.root,
+            &self.retained_journal,
+            self,
+            &committed,
+            &receipt,
+        )
+        .map_err(|_| AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid)?;
+        let start_record_id =
+            record_id_from_event_reference(&receipt.input().attempt_start_journal_ref);
+        Ok(AuthoritativeFreezeCommittedBinding {
+            registry_id: committed_event_reference.registry_id(),
+            committed_event_reference,
+            start_event_reference: receipt.input().attempt_start_journal_ref.clone(),
+            receipt_record_id,
+            manifest_record_id: receipt.input().manifest_id,
+            start_record_id,
+            freeze_attempt_id: receipt.input().freeze_attempt_id,
+            freeze_id: receipt.input().freeze_id,
+            subject_id: receipt.input().subject_id,
+            policy_record_id: receipt.input().policy_record_id,
+        })
     }
 
     /// Accepts one bounded opaque Request/Result presentation and binds the exact authoritative
@@ -2053,6 +2488,407 @@ fn anchor_relation_id(comparison: JournalAnchorHistoryComparison) -> u64 {
     }
 }
 
+fn map_selected_embedded_preparation_reload_error(
+    error: AuthoritativeReviewAdmissionAcceptanceError,
+) -> SelectedEmbeddedFreezePreparationError {
+    match error {
+        AuthoritativeReviewAdmissionAcceptanceError::Store(error) => {
+            SelectedEmbeddedFreezePreparationError::Store(error)
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged => {
+            SelectedEmbeddedFreezePreparationError::ReplayMismatch
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::Input(_) => {
+            SelectedEmbeddedFreezePreparationError::ReplayMismatch
+        }
+    }
+}
+
+fn map_selected_embedded_commit_reload_error(
+    error: AuthoritativeReviewAdmissionAcceptanceError,
+) -> SelectedEmbeddedFreezeCommitError {
+    match error {
+        AuthoritativeReviewAdmissionAcceptanceError::Store(error) => {
+            SelectedEmbeddedFreezeCommitError::Store(error)
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::RegistryIdentityChanged => {
+            SelectedEmbeddedFreezeCommitError::ReplayMismatch
+        }
+        AuthoritativeReviewAdmissionAcceptanceError::Input(_) => {
+            SelectedEmbeddedFreezeCommitError::ReplayMismatch
+        }
+    }
+}
+
+fn selected_freeze_policy_is_supported(
+    policy: &MinimalPolicyRecord,
+    resolver: &impl ExactRecordByteResolver,
+) -> bool {
+    policy.declares_freeze_commit_support()
+        && resolver
+            .resolve(policy.gate_scope_ref())
+            .and_then(|bytes| ScopeRecord::decode_authoritative(bytes).ok())
+            .is_some_and(|scope| {
+                scope.record_id() == policy.gate_scope_ref()
+                    && scope.input().scope_profile_id == 2
+                    && scope.input().scope_profile_version == 1
+                    && scope.input().scope_payload.is_empty()
+                    && scope.input().scope_label.is_none()
+            })
+}
+
+fn validate_selected_embedded_payload(
+    store_root: &Path,
+    attempt: FreezeAttemptId,
+    manifest: &ManifestRecord,
+) -> Result<(), ()> {
+    if manifest.input().path_identity_profile_id != 1 || manifest.input().digest_profile_id != 1 {
+        return Err(());
+    }
+    let root = store_root
+        .join("roots")
+        .join(selected_attempt_directory_name(attempt));
+    validate_selected_exact_directory_entries(&root, &[("payload", true)])?;
+    let payload = root.join("payload");
+    let retained = collect_selected_embedded_source(&payload).map_err(|_| ())?;
+    if retained.artifacts != manifest.input().artifacts
+        || u64::try_from(retained.artifacts.len()).map_err(|_| ())?
+            != manifest.input().artifact_count
+        || derive_selected_regular_file_subject(&retained.artifacts).map_err(|_| ())?
+            != manifest.input().subject_id
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_selected_freeze_committed_prerequisites(
+    store_root: &Path,
+    retained_journal: &RetainedJournal,
+    resolver: &impl ExactRecordByteResolver,
+    committed: &ResolvedJournalReference,
+    receipt: &FreezeReceiptRecord,
+) -> Result<(), ()> {
+    if committed.event_type_id().value() != 101
+        || receipt.input().freeze_id != *receipt.input().freeze_attempt_id.as_bytes()
+        || receipt.input().custody_mode_id != 1
+        || receipt.input().path_identity_profile_id != 1
+        || receipt.input().requested_commit_durability_ref.is_some()
+        || receipt.input().platform_strongest_available
+        || receipt.input().file_content_flush_state != 1
+        || receipt.input().atomic_publish_no_replace_state != 1
+        || receipt.input().parent_directory_flush_state != 1
+        || receipt.input().filesystem_profile_ref != committed.environment_observation_id()
+    {
+        return Err(());
+    }
+    let creation_profile = resolver
+        .resolve(receipt.input().creation_profile_ref)
+        .ok_or(())?;
+    let creation_profile =
+        FreezeCreationProfileRecord::decode_authoritative(creation_profile).map_err(|_| ())?;
+    if creation_profile.record_id() != receipt.input().creation_profile_ref {
+        return Err(());
+    }
+    let environment = resolver
+        .resolve(receipt.input().filesystem_profile_ref)
+        .ok_or(())?;
+    let environment =
+        EnvironmentObservationRecord::decode_authoritative(environment).map_err(|_| ())?;
+    if environment.record_id() != receipt.input().filesystem_profile_ref {
+        return Err(());
+    }
+    let capability = resolver
+        .resolve(committed.storage_capability_class_id())
+        .ok_or(())?;
+    let capability =
+        StorageCapabilityClassRecord::decode_authoritative(capability).map_err(|_| ())?;
+    if capability.record_id() != committed.storage_capability_class_id() {
+        return Err(());
+    }
+    let policy = resolver
+        .resolve(receipt.input().policy_record_id)
+        .and_then(|bytes| MinimalPolicyRecord::decode_authoritative(bytes).ok())
+        .filter(|policy| {
+            policy.record_id() == receipt.input().policy_record_id
+                && policy.declares_freeze_commit_support()
+        })
+        .ok_or(())?;
+    if !selected_freeze_policy_is_supported(&policy, resolver) {
+        return Err(());
+    }
+    let start = retained_journal
+        .resolve_reference(&receipt.input().attempt_start_journal_ref)
+        .map_err(|_| ())?;
+    if start.event_type_id().value() != 100
+        || start.lifecycle_object_id() != *receipt.input().freeze_attempt_id.as_bytes()
+        || derive_freeze_root(start.registry_id(), receipt.input().freeze_attempt_id)
+            .intended_root_id()
+            != start.freeze_attempt_intended_root_id().ok_or(())?
+    {
+        return Err(());
+    }
+    let manifest = resolver
+        .resolve(receipt.input().manifest_id)
+        .and_then(|bytes| ManifestRecord::decode_authoritative(bytes).ok())
+        .filter(|manifest| manifest.record_id() == receipt.input().manifest_id)
+        .ok_or(())?;
+    if manifest.input().subject_id != receipt.input().subject_id
+        || policy.record_id() != receipt.input().policy_record_id
+    {
+        return Err(());
+    }
+    validate_selected_embedded_payload(store_root, receipt.input().freeze_attempt_id, &manifest)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedEmbeddedSource {
+    artifacts: Vec<ManifestArtifactEntry>,
+    bytes: Vec<Vec<u8>>,
+}
+
+fn collect_selected_embedded_source(
+    root: &Path,
+) -> Result<SelectedEmbeddedSource, SelectedEmbeddedFreezePreparationError> {
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+    if !root_metadata.is_dir() || metadata_is_reparse(&root_metadata) {
+        return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
+    }
+    let mut entries = Vec::new();
+    collect_selected_embedded_source_descendants(root, &mut Vec::new(), &mut entries)?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut artifacts = Vec::with_capacity(entries.len());
+    let mut bytes = Vec::with_capacity(entries.len());
+    let mut total_bytes = 0_usize;
+    for (path_components, file_bytes) in entries {
+        total_bytes = total_bytes
+            .checked_add(file_bytes.len())
+            .filter(|total| *total <= AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES)
+            .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
+        artifacts.push(ManifestArtifactEntry {
+            artifact_kind_id: 1,
+            path_components,
+            size_bytes: u64::try_from(file_bytes.len())
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?,
+            digest_algorithm_id: 1,
+            digest_bytes: Sha256::digest(&file_bytes).into(),
+        });
+        bytes.push(file_bytes);
+    }
+    Ok(SelectedEmbeddedSource { artifacts, bytes })
+}
+
+fn collect_selected_embedded_source_descendants(
+    directory: &Path,
+    prefix: &mut Vec<Vec<u8>>,
+    output: &mut Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+) -> Result<(), SelectedEmbeddedFreezePreparationError> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir(directory)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?
+    {
+        let entry = entry.map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+        if name.is_empty() || matches!(name.as_str(), "." | "..") {
+            return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
+        }
+        children.push((name, entry.path()));
+    }
+    children.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    for (name, path) in children {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+        if metadata_is_reparse(&metadata) {
+            return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
+        }
+        prefix.push(name.into_bytes());
+        if metadata.is_dir() {
+            collect_selected_embedded_source_descendants(&path, prefix, output)?;
+        } else if metadata.is_file() {
+            if output.len() >= AUTHORITATIVE_STORE_MAX_OBJECTS
+                || metadata.len() > AUTHORITATIVE_STORE_MAX_OBJECT_BYTES as u64
+            {
+                return Err(SelectedEmbeddedFreezePreparationError::SourceResourceLimit);
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+            let opened_metadata = file
+                .metadata()
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+            if !opened_metadata.is_file()
+                || metadata_is_reparse(&opened_metadata)
+                || metadata_link_count(&opened_metadata, &file) != Some(1)
+                || opened_metadata.len() != metadata.len()
+            {
+                return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
+            }
+            let mut bytes = Vec::with_capacity(
+                usize::try_from(opened_metadata.len())
+                    .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?,
+            );
+            file.read_to_end(&mut bytes)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?;
+            if bytes.len() != opened_metadata.len() as usize
+                || file
+                    .metadata()
+                    .map_err(|_| SelectedEmbeddedFreezePreparationError::SourceInvalid)?
+                    .len()
+                    != opened_metadata.len()
+            {
+                return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
+            }
+            output.push((prefix.clone(), bytes));
+        } else {
+            return Err(SelectedEmbeddedFreezePreparationError::SourceInvalid);
+        }
+        prefix.pop();
+    }
+    Ok(())
+}
+
+fn selected_attempt_directory_name(attempt: FreezeAttemptId) -> String {
+    attempt
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn create_selected_embedded_payload_root(
+    store: &AuthoritativeRegistryStore,
+    attempt: FreezeAttemptId,
+    start_reference: &JournalReference,
+) -> Result<(PathBuf, fs::File), SelectedEmbeddedFreezePreparationError> {
+    if start_reference.registry_id() != store.retained_journal.registry_id
+        || start_reference.entry_index().value() == 0
+        || start_reference.event_type_id().value() != 100
+    {
+        return Err(SelectedEmbeddedFreezePreparationError::ReplayMismatch);
+    }
+    let roots_path = store.root.join("roots");
+    let roots_hold = store
+        .acquire_publication_directory_hold(4, "roots")
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RetainedGenerationChanged)?;
+    let roots_contents = namespace_contents_path(&roots_path, &roots_hold)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RetainedGenerationChanged)?;
+    let attempt_name = selected_attempt_directory_name(attempt);
+    match fs::create_dir(roots_contents.join(&attempt_name)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(SelectedEmbeddedFreezePreparationError::RootConflict)
+        }
+        Err(_) => return Err(SelectedEmbeddedFreezePreparationError::RootCreation),
+    }
+    let root_hold = open_child_directory_hold(&roots_hold, &roots_contents, &attempt_name)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    let root_contents = namespace_contents_path(&roots_contents.join(&attempt_name), &root_hold)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    let root_publication_hold = open_publication_child_directory_hold(
+        &roots_hold,
+        &roots_contents,
+        &root_hold,
+        &attempt_name,
+    )
+    .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    fs::create_dir(root_contents.join("payload"))
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    let payload_hold = open_child_directory_hold(&root_hold, &root_contents, "payload")
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    let payload_publication_hold = open_publication_child_directory_hold(
+        &root_publication_hold,
+        &root_contents,
+        &payload_hold,
+        "payload",
+    )
+    .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    sync_retained_directory(&root_contents, &root_publication_hold)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    sync_retained_directory(&roots_contents, &roots_hold)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    sync_retained_directory(&root_contents.join("payload"), &payload_publication_hold)
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::RootCreation)?;
+    Ok((
+        store.root.join("roots").join(attempt_name).join("payload"),
+        payload_publication_hold,
+    ))
+}
+
+fn publish_selected_embedded_payload(
+    payload_directory: &Path,
+    payload_hold: &fs::File,
+    source: &SelectedEmbeddedSource,
+) -> Result<(), SelectedEmbeddedFreezePreparationError> {
+    let mut directories = BTreeSet::new();
+    for artifact in &source.artifacts {
+        for length in 1..artifact.path_components.len() {
+            directories.insert(artifact.path_components[..length].to_vec());
+        }
+    }
+    for directory in directories {
+        let mut parent_path = namespace_contents_path(payload_directory, payload_hold)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+        let mut parent_hold = payload_hold
+            .try_clone()
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+        for (index, component) in directory.iter().enumerate() {
+            let name = std::str::from_utf8(component)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+            let child_path = parent_path.join(name);
+            if index + 1 == directory.len() {
+                fs::create_dir(&child_path)
+                    .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+            }
+            let child_hold = open_child_directory_hold(&parent_hold, &parent_path, name)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+            parent_path = namespace_contents_path(&child_path, &child_hold)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+            parent_hold = child_hold;
+        }
+        sync_retained_directory(&parent_path, &parent_hold)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+    }
+    for (artifact, bytes) in source.artifacts.iter().zip(&source.bytes) {
+        let mut parent_path = namespace_contents_path(payload_directory, payload_hold)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+        let mut parent_hold = payload_hold
+            .try_clone()
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+        for component in &artifact.path_components[..artifact.path_components.len() - 1] {
+            let name = std::str::from_utf8(component)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+            let child_path = parent_path.join(name);
+            let child_hold = open_child_directory_hold(&parent_hold, &parent_path, name)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+            parent_path = namespace_contents_path(&child_path, &child_hold)
+                .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+            parent_hold = child_hold;
+        }
+        let name = std::str::from_utf8(
+            artifact
+                .path_components
+                .last()
+                .ok_or(SelectedEmbeddedFreezePreparationError::PayloadPublication)?,
+        )
+        .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?;
+        match publish_new_immutable_file(&parent_path, &parent_hold, Path::new(name), bytes)
+            .map_err(|_| SelectedEmbeddedFreezePreparationError::PayloadPublication)?
+        {
+            ImmutablePublicationOutcome::Published(_) => {}
+            ImmutablePublicationOutcome::Conflict
+            | ImmutablePublicationOutcome::VisibleReceiptUncertain => {
+                return Err(SelectedEmbeddedFreezePreparationError::PayloadPublication)
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct ImmutablePublicationFacts {
     content_flush: DurabilityActionState,
@@ -2680,7 +3516,8 @@ fn promote_held_file_no_replace(
         let offset = layout.file_name_offset + index * 2;
         bytes[offset..offset + 2].copy_from_slice(&unit.to_ne_bytes());
     }
-    let information_size = u32::try_from(information_bytes).map_err(|_| 87_u32)?;
+    let information_size =
+        u32::try_from(information_bytes.max(layout.allocation_header_size)).map_err(|_| 87_u32)?;
     let mut io_status = IoStatusBlock {
         status: 0,
         information: 0,
@@ -2721,6 +3558,47 @@ fn sync_retained_directory(path: &Path, directory: &fs::File) -> Result<Durabili
     directory.sync_all().map_err(|_| ())?;
     ensure_path_matches_handle(path, directory)?;
     Ok(DurabilityActionState::Performed)
+}
+
+#[cfg(windows)]
+fn acquire_selected_authoritative_publication_lock(
+    root: &Path,
+    root_hold: &fs::File,
+) -> Result<fs::File, ()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    ensure_path_matches_handle(root, root_hold)?;
+    let coordination = root.join("coordination");
+    let coordination_hold = open_child_directory_hold(root_hold, root, "coordination")?;
+    ensure_path_matches_handle(&coordination, &coordination_hold)?;
+    let path = coordination.join("publication.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata_is_reparse(&metadata)
+        || metadata_link_count(&metadata, &file) != Some(1)
+    {
+        return Err(());
+    }
+    ensure_path_matches_handle(root, root_hold)?;
+    ensure_path_matches_handle(&coordination, &coordination_hold)?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn acquire_selected_authoritative_publication_lock(
+    root: &Path,
+    root_hold: &fs::File,
+) -> Result<impl std::ops::Drop, ()> {
+    acquire_authoritative_publication_lock(root, root_hold)
 }
 
 #[cfg(windows)]

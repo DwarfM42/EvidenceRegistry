@@ -5,8 +5,9 @@ use evidence_registry::{
     FreezeAttemptStartJournalEntryInput, FreezeAttemptStartRecord, FreezeAttemptStartRecordInput,
     FreezeCommittedBindingInput, FreezeCommittedBindingOutcome, FreezeCommittedJournalEntry,
     FreezeCommittedJournalEntryInput, FreezeReceiptRecord, FreezeReceiptRecordInput,
-    IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference, RecordId, RegistryId,
-    ResolvedFreezeCommittedBindingError, ResolvedFreezeCommittedBindingOutcome, RetainedJournal,
+    IntendedRootId, JournalEntryHash, JournalEntryIndex, JournalReference, ManifestRecord,
+    RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
+    ResolvedFreezeCommittedBindingOutcome, RetainedJournal, SelectedEmbeddedFreezePreparationInput,
     StrictRecordFrame, TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
 };
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -759,12 +760,26 @@ fn receipt_bytes_with_policy(
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-fn freeze_commit_policy_bytes(operation_start: &JournalReference) -> Vec<u8> {
+fn selected_freeze_scope_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
+    bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    bytes.extend_from_slice(&[
+        0x14, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x14, 0x10, 0x02, 0x11, 0x01, 0x12, 0x40,
+    ]);
+    bytes
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn freeze_commit_policy_bytes(
+    operation_start: &JournalReference,
+    gate_scope_ref: RecordId,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
     bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
     bytes.extend_from_slice(&[0x18, 0x28, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x18, 0x28, 0x10]);
-    append_bstr_32(&mut bytes, &id(0x31));
+    append_bstr_32(&mut bytes, gate_scope_ref.as_bytes());
     bytes.extend_from_slice(&[0x18, 0x1d]);
     bytes.push(0x85);
     append_bstr_32(&mut bytes, operation_start.registry_id().as_bytes());
@@ -774,6 +789,185 @@ fn freeze_commit_policy_bytes(operation_start: &JournalReference) -> Vec<u8> {
     append_bstr_32(&mut bytes, operation_start.event_record_id().as_bytes());
     bytes.extend_from_slice(&[0x18, 0x1e, 0x81, 0x01]);
     bytes
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_embedded_preparation_derives_start_root_and_retained_payload() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "evidence-registry-selected-embedded-prepare-{}-{}",
+            std::process::id(),
+            NEXT_AUTHORITATIVE_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+    let source = root.with_extension("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), b"selected embedded payload").unwrap();
+    let registry_id = RegistryId::try_from(id(0x70).as_slice()).unwrap();
+    let store = AuthoritativeRegistryStore::initialize_selected_profile(
+        &root,
+        registry_id,
+        "selected-embedded-preparation-test",
+    )
+    .unwrap();
+    let scope_bytes = selected_freeze_scope_bytes();
+    let scope_record_id = RecordId::try_from(sha256(&scope_bytes).as_slice()).unwrap();
+    write_record(&root, scope_record_id, &scope_bytes);
+    let policy_bytes = freeze_commit_policy_bytes(
+        &store.retained_journal().current_head_reference(),
+        scope_record_id,
+    );
+    let policy_record_id = RecordId::try_from(sha256(&policy_bytes).as_slice()).unwrap();
+    write_record(&root, policy_record_id, &policy_bytes);
+    drop(store);
+    let mut store = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let freeze_attempt_id = FreezeAttemptId::try_from(id(0x90).as_slice()).unwrap();
+
+    let prepared = store
+        .prepare_selected_embedded_freeze(SelectedEmbeddedFreezePreparationInput {
+            source_root: source.clone(),
+            freeze_attempt_id,
+            policy_record_id,
+        })
+        .unwrap();
+
+    assert_eq!(
+        prepared.start_record().input().freeze_attempt_id,
+        freeze_attempt_id
+    );
+    assert_eq!(
+        prepared.start_record().input().intended_root_id,
+        derive_freeze_root(registry_id, freeze_attempt_id).intended_root_id()
+    );
+    assert_eq!(prepared.start_event_reference().entry_index().value(), 1);
+    assert_eq!(
+        fs::read(prepared.payload_directory().join("a")).unwrap(),
+        b"selected embedded payload"
+    );
+    assert!(root
+        .join("records")
+        .join(record_filename(prepared.start_record().record_id()))
+        .is_file());
+    let manifest_bytes = fs::read(
+        root.join("records")
+            .join(record_filename(prepared.manifest_record_id())),
+    )
+    .unwrap();
+    let manifest = ManifestRecord::decode_authoritative(&manifest_bytes).unwrap();
+    assert_eq!(manifest.record_id(), prepared.manifest_record_id());
+    assert_eq!(
+        manifest.input().subject_id,
+        prepared.start_record().input().subject_id
+    );
+    assert!(root.join("journal/00000000000000000001.cbor").is_file());
+    drop(store);
+    assert_eq!(
+        AuthoritativeRegistryStore::open_selected_profile(&root)
+            .unwrap()
+            .retained_journal()
+            .current_head_reference(),
+        *prepared.start_event_reference()
+    );
+    fs::remove_dir_all(&root).unwrap();
+    let _ = fs::remove_dir_all(&source);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_embedded_preparation_commits_and_cold_replays_a_selected_freeze() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "evidence-registry-selected-embedded-commit-{}-{}",
+            std::process::id(),
+            NEXT_AUTHORITATIVE_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+    let source = root.with_extension("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), b"selected embedded committed payload").unwrap();
+    let registry_id = RegistryId::try_from(id(0x71).as_slice()).unwrap();
+    let store = AuthoritativeRegistryStore::initialize_selected_profile(
+        &root,
+        registry_id,
+        "selected-embedded-commit-test",
+    )
+    .unwrap();
+    let scope_bytes = selected_freeze_scope_bytes();
+    let scope_record_id = RecordId::try_from(sha256(&scope_bytes).as_slice()).unwrap();
+    write_record(&root, scope_record_id, &scope_bytes);
+    let policy_bytes = freeze_commit_policy_bytes(
+        &store.retained_journal().current_head_reference(),
+        scope_record_id,
+    );
+    let policy_record_id = RecordId::try_from(sha256(&policy_bytes).as_slice()).unwrap();
+    write_record(&root, policy_record_id, &policy_bytes);
+    drop(store);
+    let mut store = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let prepared = store
+        .prepare_selected_embedded_freeze(SelectedEmbeddedFreezePreparationInput {
+            source_root: source.clone(),
+            freeze_attempt_id: FreezeAttemptId::try_from(id(0x91).as_slice()).unwrap(),
+            policy_record_id,
+        })
+        .unwrap();
+    let committed = store
+        .commit_prepared_selected_embedded_freeze(prepared.clone())
+        .unwrap();
+
+    assert_eq!(
+        committed
+            .committed_event_reference()
+            .event_type_id()
+            .value(),
+        101
+    );
+    assert_eq!(
+        committed.start_event_reference(),
+        prepared.start_event_reference()
+    );
+    assert_eq!(
+        committed.manifest_record_id(),
+        prepared.manifest_record_id()
+    );
+    assert!(root
+        .join("journal")
+        .join("00000000000000000002.cbor")
+        .is_file());
+    assert_eq!(
+        store
+            .validate_freeze_committed_authority(committed.committed_event_reference().clone())
+            .unwrap(),
+        committed
+    );
+    drop(store);
+
+    let reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let replayed = reopened
+        .validate_freeze_committed_authority(committed.committed_event_reference().clone())
+        .unwrap();
+    assert_eq!(replayed, committed);
+    assert_eq!(
+        fs::read(prepared.payload_directory().join("a")).unwrap(),
+        b"selected embedded committed payload"
+    );
+    drop(reopened);
+    fs::write(
+        prepared.payload_directory().join("a"),
+        b"corrupt retained payload",
+    )
+    .unwrap();
+    let corrupted = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    assert_eq!(
+        corrupted.validate_freeze_committed_authority(committed.committed_event_reference().clone()),
+        Err(evidence_registry::AuthoritativeFreezeCommittedBindingError::SelectedPrerequisiteInvalid),
+        "cold selected Freeze replay must re-verify current retained payload bytes"
+    );
+    drop(corrupted);
+    fs::remove_dir_all(&root).unwrap();
+    let _ = fs::remove_dir_all(&source);
 }
 
 #[test]
@@ -1672,7 +1866,10 @@ fn authoritative_store_fails_closed_before_positive_freeze_authority() {
         EventTypeId::try_from(1_u64).unwrap(),
         EventRecordId::try_from(genesis_record.record_id().as_bytes().as_slice()).unwrap(),
     );
-    let policy_bytes = freeze_commit_policy_bytes(&genesis_reference);
+    let policy_bytes = freeze_commit_policy_bytes(
+        &genesis_reference,
+        RecordId::try_from(id(0x31).as_slice()).unwrap(),
+    );
     let policy_record_id = RecordId::try_from(sha256(&policy_bytes).as_slice()).unwrap();
     let start_record = start_record_with_policy(registry_id, policy_record_id);
     let start_entry_bytes = freeze_start_bytes(genesis_entry.entry_hash(), &start_record);
