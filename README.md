@@ -109,9 +109,9 @@ Begin with [the executable structural example](examples/inspect_demo.rs), [crate
 - [`tests/review_admission_runtime.rs`](tests/review_admission_runtime.rs)
 - [`tests/journal_verify_cli.rs`](tests/journal_verify_cli.rs)
 
-### Public-example setup — Bash, final execution pending
+### Public-example setup — Bash
 
-The following recipe is intended for **Windows Git Bash, Linux Bash and macOS Bash**, not PowerShell or generic `sh`. Start at the authorized repository root containing the new example sources. The underlying examples ran on Windows with Rust/Cargo 1.97.1; **this assembled recipe has not yet been executed in those shells on the final candidate**. Native PowerShell recipes remain pending rather than being inferred from Bash.
+The following recipe is intended for **Windows Git Bash, Linux Bash and macOS Bash**, not PowerShell or generic `sh`. Start at the authorized repository root containing the new example sources. The Core and Binder command paths have Windows Git Bash execution evidence, with raw argv/stdout/stderr/exit records described in the [README verification ledger](docs/README-VERIFICATION-LEDGER.md). A final exact-tree rerun on all three native platforms remains required. Native PowerShell recipes remain pending rather than being inferred from Bash.
 
 Approve writes under the new `target/readme-public-examples-v1` leaf, including build/temp files, private logs and disposable Stores, before running. Change `RUN_NAME` for a later authorized run; `mkdir` refuses an existing leaf, including partial work. No cleanup or resume is attempted. Check that the checkout is owned, not dirty/in use by other work, and has the intended source identity as described above. This shared setup only creates destinations and a raw-stream/exit recorder; it does not launch an agent.
 
@@ -478,9 +478,15 @@ Use this human-readable report template (these labels are **not** promised JSON 
 | Every managed attempt | Successful, rejected, refused, failed, cancelled, timed-out, crash/incomplete and unresolved attempts, with predecessor relationships where recorded. |
 | Limits and permission | What remains unestablished and which next action, if any, needs user permission. |
 
-### Pending command and example integration
+### README verification ledger and remaining final execution
 
-This is a **development-integration pending ledger**, not the final all-command verification ledger. The public Core and fake Binder recipes above are traced to delivered source and retained development evidence, but their assembled shell commands have not been executed here. Parent integration must bind and execute the final commands before presenting onboarding as qualified. Bash recipes mean Windows Git Bash, Linux Bash and macOS Bash; they are not native PowerShell recipes.
+The [README verification ledger](docs/README-VERIFICATION-LEDGER.md) defines
+the required raw-evidence fields and records the current Windows development
+run. The public Core and fake Binder recipes above have been executed under
+Windows Git Bash, but that run intentionally records a preserved untracked-file
+cleanliness caveat and is not exact-final-tree qualification. Bash recipes mean
+Windows Git Bash, Linux Bash and macOS Bash; they are not native PowerShell
+recipes.
 
 | Section / recipe | Precise remaining deliverable |
 |---|---|
