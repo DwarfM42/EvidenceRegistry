@@ -669,6 +669,9 @@ pub enum AuthoritativeReviewAdmissionPublicationError {
     AdmissionRecord,
     JournalEntry,
     LifecyclePreflight(RetainedJournalError),
+    /// The complete selected candidate prefix did not pass the same semantic
+    /// replay validation required after Journal visibility.
+    SemanticPreflight,
     /// No platform primitive established the required mandatory runtime-publication lock.
     PublicationLockUnavailable,
     RetainedGenerationChanged,
@@ -2210,9 +2213,22 @@ impl AuthoritativeRegistryStore {
             )
         };
 
-        for _ in 0..MAX_AUTHORITATIVE_PUBLICATION_RETRIES {
-            self.reload_authoritative_namespaces()
-                .map_err(map_reload_to_runtime_error)?;
+        let publication_attempts = if selected_profile {
+            1
+        } else {
+            MAX_AUTHORITATIVE_PUBLICATION_RETRIES
+        };
+        for _ in 0..publication_attempts {
+            if selected_profile {
+                self.revalidate_retained_generation().map_err(|_| {
+                    AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                    )
+                })?;
+            } else {
+                self.reload_authoritative_namespaces()
+                    .map_err(map_reload_to_runtime_error)?;
+            }
             self.retained_journal
                 .resolve_reference(section_82.operation_start_journal_ref())
                 .map_err(|error| {
@@ -2259,6 +2275,11 @@ impl AuthoritativeRegistryStore {
                     },
                 )?;
             if preflight_store.retained_journal.current_head_reference() != current_head {
+                if selected_profile {
+                    return Err(AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                    ));
+                }
                 continue;
             }
             preflight_store
@@ -2269,6 +2290,31 @@ impl AuthoritativeRegistryStore {
                         AuthoritativeReviewAdmissionPublicationError::LifecyclePreflight(error),
                     )
                 })?;
+            match preflight_store.records.binary_search_by(|(stored_id, _)| {
+                stored_id
+                    .as_bytes()
+                    .cmp(admission_record.record_id().as_bytes())
+            }) {
+                Ok(index) if preflight_store.records[index].1 == admission_record_bytes => {}
+                Ok(_) => {
+                    return Err(AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::SemanticPreflight,
+                    ));
+                }
+                Err(index) => preflight_store.records.insert(
+                    index,
+                    (admission_record.record_id(), admission_record_bytes.clone()),
+                ),
+            }
+            validate_authoritative_event_records(
+                &preflight_store.retained_journal,
+                &preflight_store.records,
+            )
+            .map_err(|_| {
+                AuthoritativeReviewAdmissionRuntimeError::Publication(
+                    AuthoritativeReviewAdmissionPublicationError::SemanticPreflight,
+                )
+            })?;
             let mut publication_store =
                 Self::open_for_review_admission_runtime(&self.root, selected_profile).map_err(
                     |error| {
@@ -2278,6 +2324,11 @@ impl AuthoritativeRegistryStore {
                     },
                 )?;
             if publication_store.retained_journal.current_head_reference() != current_head {
+                if selected_profile {
+                    return Err(AuthoritativeReviewAdmissionRuntimeError::Publication(
+                        AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                    ));
+                }
                 continue;
             }
             for witness in &mut publication_store.retained_file_witnesses {
@@ -2358,7 +2409,14 @@ impl AuthoritativeRegistryStore {
                     AuthoritativeReviewAdmissionPublicationError::JournalPublication,
                 )
             })? {
-                JournalSlotPublication::Conflict => continue,
+                JournalSlotPublication::Conflict => {
+                    if selected_profile {
+                        return Err(AuthoritativeReviewAdmissionRuntimeError::Publication(
+                            AuthoritativeReviewAdmissionPublicationError::RetainedGenerationChanged,
+                        ));
+                    }
+                    continue;
+                }
                 JournalSlotPublication::Published(publication) => publication,
                 JournalSlotPublication::VisibleReceiptUncertain => {
                     return Ok(
@@ -3224,7 +3282,6 @@ fn selected_review_policy_is_supported(
                     && scope.input().scope_profile_id == 1
                     && scope.input().scope_profile_version == 1
                     && scope.input().scope_payload.is_empty()
-                    && scope.input().scope_label.is_none()
             })
 }
 
@@ -3702,11 +3759,14 @@ fn publish_record_bytes(
         {
             return Err(());
         }
+        // A same-byte reuse is still an operation-local durable-publication
+        // dependency. Flush the exact retained handle before its Journal event
+        // can become visible; a previous operation's flush is not reused as
+        // this operation's receipt fact.
+        guard.file.sync_all().map_err(|_| ())?;
         return Ok(ImmutablePublication {
             facts: ImmutablePublicationFacts {
-                // The retained read lease validates and prevents mutation but cannot truthfully
-                // claim a content flush for bytes published by an earlier operation.
-                content_flush: DurabilityActionState::Unsupported,
+                content_flush: DurabilityActionState::Performed,
                 atomic_no_replace: DurabilityActionState::PreviouslyEstablished,
                 parent_directory_flush: sync_retained_directory(&records_dir, &records_hold)?,
             },
