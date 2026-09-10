@@ -6488,6 +6488,133 @@ impl FreezeAttemptStartRecord {
     }
 }
 
+/// Typed inputs for a FREEZE_ATTEMPT_STARTED Journal Entry.
+///
+/// This construction layer derives the event's lifecycle and Record bindings
+/// from the exact typed START Record. It neither allocates an Attempt nor
+/// publishes an event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartJournalEntryInput {
+    pub registry_id: RegistryId,
+    pub entry_index: JournalEntryIndex,
+    pub previous_entry_hash: JournalEntryHash,
+    pub start_record: FreezeAttemptStartRecord,
+    pub storage_capability_class_id: RecordId,
+    pub environment_observation_id: RecordId,
+}
+
+/// A rejected FREEZE_ATTEMPT_STARTED Journal Entry construction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartJournalEntryError;
+
+/// A canonical FREEZE_ATTEMPT_STARTED Journal Entry, not a publication effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeAttemptStartJournalEntry {
+    registry_id: RegistryId,
+    entry_index: JournalEntryIndex,
+    previous_entry_hash: JournalEntryHash,
+    event_record_id: EventRecordId,
+    start_record: FreezeAttemptStartRecord,
+    storage_capability_class_id: RecordId,
+    environment_observation_id: RecordId,
+}
+
+impl FreezeAttemptStartJournalEntry {
+    /// Constructs the event-100 Entry derived from one exact START Record.
+    pub fn new(
+        input: FreezeAttemptStartJournalEntryInput,
+    ) -> Result<Self, FreezeAttemptStartJournalEntryError> {
+        if input.entry_index.value() == 0 {
+            return Err(FreezeAttemptStartJournalEntryError);
+        }
+        let event_record_id =
+            EventRecordId::try_from(input.start_record.record_id().as_bytes().as_slice())
+                .expect("RecordId has EventRecordId width");
+        Ok(Self {
+            registry_id: input.registry_id,
+            entry_index: input.entry_index,
+            previous_entry_hash: input.previous_entry_hash,
+            event_record_id,
+            start_record: input.start_record,
+            storage_capability_class_id: input.storage_capability_class_id,
+            environment_observation_id: input.environment_observation_id,
+        })
+    }
+
+    /// The frozen event type for a Freeze Attempt start.
+    pub fn event_type_id(&self) -> EventTypeId {
+        EventTypeId::try_from(100).expect("FREEZE_ATTEMPT_STARTED is registered")
+    }
+
+    /// The exact typed START Record identity carried by this Entry.
+    pub fn event_record_id(&self) -> EventRecordId {
+        self.event_record_id
+    }
+
+    /// The exact publication-time Journal slot selected by compare-and-append.
+    pub fn entry_index(&self) -> JournalEntryIndex {
+        self.entry_index
+    }
+
+    /// The exact publication-time predecessor hash.
+    pub fn previous_entry_hash(&self) -> JournalEntryHash {
+        self.previous_entry_hash
+    }
+
+    /// The exact typed START Record whose fields bind this Entry.
+    pub fn start_record(&self) -> &FreezeAttemptStartRecord {
+        &self.start_record
+    }
+
+    /// The storage-capability observation derived from the publication-time head.
+    pub fn storage_capability_class_id(&self) -> RecordId {
+        self.storage_capability_class_id
+    }
+
+    /// The environment observation derived from the publication-time head.
+    pub fn environment_observation_id(&self) -> RecordId {
+        self.environment_observation_id
+    }
+
+    /// Emits exact canonical FREEZE_ATTEMPT_STARTED Journal Entry bytes.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(320);
+        bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
+        bytes.extend_from_slice(JOURNAL_ENTRY_DOMAIN);
+        bytes.push(0xae);
+        bytes.extend_from_slice(&[0x00, 0x01, 0x01]);
+        encode_bstr_32(&mut bytes, self.registry_id.as_bytes());
+        bytes.push(0x02);
+        encode_uint(&mut bytes, self.entry_index.value());
+        bytes.push(0x03);
+        encode_bstr_32(&mut bytes, self.previous_entry_hash.as_bytes());
+        bytes.push(0x04);
+        encode_uint(&mut bytes, u64::from(self.event_type_id().value()));
+        bytes.push(0x05);
+        encode_bstr_32(&mut bytes, self.event_record_id.as_bytes());
+        bytes.extend_from_slice(&[0x06, 0x80, 0x07, 0x80, 0x08, 0x02, 0x09]);
+        encode_bstr_32(
+            &mut bytes,
+            self.start_record.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x0a);
+        encode_bstr_32(&mut bytes, self.storage_capability_class_id.as_bytes());
+        bytes.push(0x0b);
+        encode_bstr_32(&mut bytes, self.environment_observation_id.as_bytes());
+        bytes.push(0x10);
+        encode_bstr_32(
+            &mut bytes,
+            self.start_record.input().freeze_attempt_id.as_bytes(),
+        );
+        bytes.push(0x11);
+        encode_bstr_32(
+            &mut bytes,
+            self.start_record.input().intended_root_id.as_bytes(),
+        );
+        bytes
+    }
+}
+
 /// Typed, Record-local fields decoded from a FREEZE_RECEIPT Record.
 ///
 /// These fields establish only the strict local Record grammar and exact Record

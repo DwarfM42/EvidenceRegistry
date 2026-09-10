@@ -1,10 +1,11 @@
 use evidence_registry::{
     derive_freeze_root, validate_freeze_committed_binding,
     validate_resolved_freeze_committed_binding, EventRecordId, EventTypeId,
-    ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartRecord,
-    FreezeAttemptStartRecordInput, FreezeCommittedBindingInput, FreezeCommittedBindingOutcome,
-    FreezeReceiptRecord, FreezeReceiptRecordInput, IntendedRootId, JournalEntryHash,
-    JournalEntryIndex, JournalReference, RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
+    ExactRecordByteResolver, FreezeAttemptId, FreezeAttemptStartJournalEntry,
+    FreezeAttemptStartJournalEntryInput, FreezeAttemptStartRecord, FreezeAttemptStartRecordInput,
+    FreezeCommittedBindingInput, FreezeCommittedBindingOutcome, FreezeReceiptRecord,
+    FreezeReceiptRecordInput, IntendedRootId, JournalEntryHash, JournalEntryIndex,
+    JournalReference, RecordId, RegistryId, ResolvedFreezeCommittedBindingError,
     ResolvedFreezeCommittedBindingOutcome, RetainedJournal, StrictRecordFrame,
     TERMINAL_AUTHORITY_CLOSURE_CORE_SHA256,
 };
@@ -459,6 +460,53 @@ fn freeze_receipt_constructs_the_same_canonical_local_bytes_that_it_decodes() {
     assert_eq!(constructed.authoritative_cbor(), expected_bytes);
     assert_eq!(constructed.record_id(), expected.record_id());
     assert_eq!(constructed, expected);
+}
+
+#[test]
+fn freeze_attempt_start_entry_constructs_the_exact_canonical_fixture() {
+    let start_record =
+        FreezeAttemptStartRecord::decode_authoritative(&hex_bytes(START_RECORD_HEX)).unwrap();
+    let entry = FreezeAttemptStartJournalEntry::new(FreezeAttemptStartJournalEntryInput {
+        registry_id: RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+        entry_index: JournalEntryIndex::try_from(1_u64).unwrap(),
+        previous_entry_hash: JournalEntryHash::try_from(hex_id(GENESIS_HASH_HEX).as_slice())
+            .unwrap(),
+        start_record: start_record.clone(),
+        storage_capability_class_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
+        environment_observation_id: RecordId::try_from(id(0x60).as_slice()).unwrap(),
+    })
+    .unwrap();
+
+    assert_eq!(entry.authoritative_cbor(), hex_bytes(START_ENTRY_HEX));
+    assert_eq!(
+        entry.event_type_id(),
+        EventTypeId::try_from(100_u64).unwrap()
+    );
+    assert_eq!(
+        entry.event_record_id(),
+        EventRecordId::try_from(start_record.record_id().as_bytes().as_slice()).unwrap()
+    );
+    assert_eq!(entry.start_record(), &start_record);
+}
+
+#[test]
+fn freeze_attempt_start_entry_rejects_genesis_slot() {
+    let start_record =
+        FreezeAttemptStartRecord::decode_authoritative(&hex_bytes(START_RECORD_HEX)).unwrap();
+
+    assert!(
+        FreezeAttemptStartJournalEntry::new(FreezeAttemptStartJournalEntryInput {
+            registry_id: RegistryId::try_from(id(0x00).as_slice()).unwrap(),
+            entry_index: JournalEntryIndex::try_from(0_u64).unwrap(),
+            previous_entry_hash: JournalEntryHash::try_from(hex_id(GENESIS_HASH_HEX).as_slice())
+                .unwrap(),
+            start_record,
+            storage_capability_class_id: RecordId::try_from(id(0x40).as_slice()).unwrap(),
+            environment_observation_id: RecordId::try_from(id(0x60).as_slice()).unwrap(),
+        })
+        .is_err(),
+        "a FREEZE_ATTEMPT_STARTED event cannot reuse GENESIS slot zero"
+    );
 }
 
 #[test]
