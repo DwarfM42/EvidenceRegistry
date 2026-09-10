@@ -195,13 +195,20 @@ fn crash_boundaries_preserve_all_attempts_and_cold_candidates() {
     let mut old_ledger = Vec::new();
     for (i, (point, s, z, r, a, operation, candidate)) in cases.iter().enumerate() {
         let dir = dirs[i].clone();
-        // `std::process::exit(86)` is the requested abrupt stop, but libtest
-        // preserves that direct code on Windows and reports a failed test
-        // harness (101) on Darwin. The durable boundary requires abrupt
-        // non-success, not a platform-specific harness projection.
-        assert!(
-            !child(OWNER, &dir, "owner").success(),
-            "{point}: {}",
+        // `std::process::exit(86)` is the requested abrupt stop. Libtest
+        // preserves that direct code on Linux and Windows, while Darwin
+        // projects it as a failed test harness (101). Reject unrelated child
+        // failures before relying on their case-local checkpoint evidence.
+        let status = child(OWNER, &dir, "owner");
+        #[cfg(target_os = "macos")]
+        let expected_status = Some(101);
+        #[cfg(not(target_os = "macos"))]
+        let expected_status = Some(86);
+        assert_eq!(
+            status.code(),
+            expected_status,
+            "{point}: status {status:?}, stderr {}, evidence {}",
+            String::from_utf8_lossy(&fs::read(dir.join("owner-stderr.bin")).unwrap()),
             dir.display()
         );
         assert_eq!(

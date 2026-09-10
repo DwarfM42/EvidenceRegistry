@@ -303,7 +303,7 @@ fn native_names(
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
-            b".\0".as_ptr().cast(),
+            c".".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0,
         )
