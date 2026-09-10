@@ -2671,6 +2671,11 @@ impl AuthoritativeRegistryStore {
                     match $result {
                         Ok(value) => value,
                         Err(_) => {
+                            #[cfg(test)]
+                            eprintln!(
+                                "[DEBUG-7f98 post_visibility] {}",
+                                stringify!($result)
+                            );
                             return Ok(AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
                                 Box::new(uncertain_publication.clone()),
                             ));
