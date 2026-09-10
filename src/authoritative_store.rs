@@ -419,6 +419,15 @@ struct RetainedFileWitness {
     expected_sha256: [u8; ID_LENGTH],
 }
 
+#[cfg(target_os = "macos")]
+struct RetainedWitnessSnapshot {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    expected_length: usize,
+    expected_sha256: [u8; ID_LENGTH],
+}
+
 struct RetainedFileRead {
     bytes: Vec<u8>,
     witness: RetainedFileWitness,
@@ -2857,10 +2866,14 @@ impl AuthoritativeRegistryStore {
                 journal_publication.retained_witness,
             ));
             let mut post_publication_guards = Vec::with_capacity(2);
+            let record_witness =
+                post_visibility_try!(downgrade_publication_witness(publication.retained_witness));
+            #[cfg(target_os = "macos")]
+            post_publication_guards.push(post_visibility_try!(into_retained_file_guard(
+                record_witness
+            )));
+            #[cfg(not(target_os = "macos"))]
             if publication.facts.atomic_no_replace == DurabilityActionState::Performed {
-                let record_witness = post_visibility_try!(downgrade_publication_witness(
-                    publication.retained_witness
-                ));
                 post_publication_guards.push(post_visibility_try!(open_retained_file_guard(
                     &record_witness
                 )));
@@ -2868,12 +2881,38 @@ impl AuthoritativeRegistryStore {
                     .retained_file_witnesses
                     .push(record_witness);
             }
-            post_publication_guards.push(post_visibility_try!(open_retained_file_guard(
-                &journal_witness
+            #[cfg(target_os = "macos")]
+            post_publication_guards.push(post_visibility_try!(into_retained_file_guard(
+                journal_witness
             )));
-            publication_store
-                .retained_file_witnesses
-                .push(journal_witness);
+            #[cfg(not(target_os = "macos"))]
+            {
+                post_publication_guards.push(post_visibility_try!(open_retained_file_guard(
+                    &journal_witness
+                )));
+                publication_store
+                    .retained_file_witnesses
+                    .push(journal_witness);
+            }
+            #[cfg(target_os = "macos")]
+            let retained_witness_snapshots = {
+                let mut snapshots = Vec::with_capacity(
+                    retained_generation_guard.len() + post_publication_guards.len(),
+                );
+                for witness in retained_generation_guard
+                    .iter()
+                    .chain(post_publication_guards.iter())
+                {
+                    snapshots.push(post_visibility_try!(snapshot_retained_witness(witness)));
+                }
+                drop(post_publication_guards);
+                drop(retained_generation_guard);
+                drop(journal_hold);
+                snapshots
+            };
+            #[cfg(all(test, target_os = "macos"))]
+            post_visibility_try!(MACOS_POST_DROP_REPLAY_HOOK
+                .with_borrow_mut(|hook| hook.as_mut().map_or(Ok(()), |hook| hook())));
             let replayed = post_visibility_try!(Self::open_for_review_admission_runtime(
                 &self.root,
                 selected_profile,
@@ -2884,6 +2923,19 @@ impl AuthoritativeRegistryStore {
                     .iter()
                     .zip(&publication_store.namespace_holds)
                     .any(|(replayed, retained)| !handles_identify_same_object(replayed, retained))
+            {
+                return Ok(
+                    AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
+                        Box::new(uncertain_publication.clone()),
+                    ),
+                );
+            }
+            #[cfg(target_os = "macos")]
+            if replay_continues_retained_witness_snapshots(
+                &retained_witness_snapshots,
+                &replayed.retained_file_witnesses,
+            )
+            .is_err()
             {
                 return Ok(
                     AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(
@@ -3355,22 +3407,40 @@ impl AuthoritativeRegistryStore {
     }
 
     fn acquire_retained_generation_guard(
-        &self,
+        &mut self,
         already_guarded: Option<&RetainedFileWitness>,
     ) -> Result<Vec<RetainedFileWitness>, ()> {
-        let mut guards = Vec::new();
-        guards
-            .try_reserve_exact(self.retained_file_witnesses.len())
-            .map_err(|_| ())?;
-        for witness in &self.retained_file_witnesses {
-            if already_guarded
-                .is_some_and(|guard| handles_identify_same_object(&witness.file, &guard.file))
-            {
-                continue;
+        #[cfg(target_os = "macos")]
+        {
+            let witnesses = std::mem::take(&mut self.retained_file_witnesses);
+            let mut guards = Vec::new();
+            guards.try_reserve_exact(witnesses.len()).map_err(|_| ())?;
+            for witness in witnesses {
+                if already_guarded
+                    .is_some_and(|guard| handles_identify_same_object(&witness.file, &guard.file))
+                {
+                    continue;
+                }
+                guards.push(into_retained_file_guard(witness)?);
             }
-            guards.push(open_retained_file_guard(witness)?);
+            return Ok(guards);
         }
-        Ok(guards)
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut guards = Vec::new();
+            guards
+                .try_reserve_exact(self.retained_file_witnesses.len())
+                .map_err(|_| ())?;
+            for witness in &self.retained_file_witnesses {
+                if already_guarded
+                    .is_some_and(|guard| handles_identify_same_object(&witness.file, &guard.file))
+                {
+                    continue;
+                }
+                guards.push(open_retained_file_guard(witness)?);
+            }
+            Ok(guards)
+        }
     }
 
     fn revalidate_retained_generation(&self) -> Result<(), ()> {
@@ -6121,6 +6191,62 @@ fn revalidate_retained_file_witness(witness: &mut RetainedFileWitness) -> Result
             return Err(());
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snapshot_retained_witness(witness: &RetainedFileWitness) -> Result<RetainedWitnessSnapshot, ()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = witness.file.metadata().map_err(|_| ())?;
+    Ok(RetainedWitnessSnapshot {
+        path: witness.path.clone(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        expected_length: witness.expected_length,
+        expected_sha256: witness.expected_sha256,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn replay_continues_retained_witness_snapshots(
+    snapshots: &[RetainedWitnessSnapshot],
+    replayed: &[RetainedFileWitness],
+) -> Result<(), ()> {
+    if snapshots.len() != replayed.len() {
+        return Err(());
+    }
+    for snapshot in snapshots {
+        let replayed_witness = replayed
+            .iter()
+            .find(|witness| witness.path == snapshot.path)
+            .ok_or(())?;
+        let replayed_snapshot = snapshot_retained_witness(replayed_witness)?;
+        if replayed_snapshot.dev != snapshot.dev
+            || replayed_snapshot.ino != snapshot.ino
+            || replayed_snapshot.expected_length != snapshot.expected_length
+            || replayed_snapshot.expected_sha256 != snapshot.expected_sha256
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+type MacosPostDropReplayHook = Box<dyn FnMut() -> Result<(), ()>>;
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static MACOS_POST_DROP_REPLAY_HOOK: std::cell::RefCell<Option<MacosPostDropReplayHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct MacosPostDropReplayHookReset;
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for MacosPostDropReplayHookReset {
+    fn drop(&mut self) {
+        MACOS_POST_DROP_REPLAY_HOOK.set(None);
     }
 }
 
@@ -9857,6 +9983,153 @@ mod tests {
         );
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_selected_completion_replacement_after_guard_drop_is_receipt_uncertain() {
+        let sequence = NEXT_AUTHORITATIVE_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "evidence-registry-macos-post-drop-continuity-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.with_extension("source");
+        let _ = fs::remove_dir_all(&source);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("retained"), b"selected continuity witness").unwrap();
+        let mut store = AuthoritativeRegistryStore::initialize_selected_profile(
+            &root,
+            RegistryId::try_from([98; ID_LENGTH].as_slice()).unwrap(),
+            "macos-post-drop-continuity",
+        )
+        .unwrap();
+        let mut scopes = Vec::new();
+        for scope_profile_id in [1, 2] {
+            let scope = ScopeRecord::new(ScopeRecordInput {
+                scope_profile_id,
+                scope_profile_version: 1,
+                scope_payload: vec![],
+                scope_label: None,
+            })
+            .unwrap();
+            store.stage_scope_record(&scope).unwrap();
+            scopes.push(scope);
+        }
+        let method = MethodRecord::new(MethodRecordInput {
+            method_profile_id: 1,
+            method_profile_version: 1,
+            method_payload: vec![],
+            method_label: None,
+        })
+        .unwrap();
+        store.stage_method_record(&method).unwrap();
+        let check = CheckRecord::new(CheckRecordInput {
+            check_profile_id: 1,
+            check_profile_version: 1,
+            check_payload: vec![],
+            check_label: None,
+        })
+        .unwrap();
+        store.stage_check_record(&check).unwrap();
+        let checks = CheckSetRecord::new(CheckSetRecordInput {
+            check_refs: vec![check.record_id()],
+        })
+        .unwrap();
+        store.stage_check_set_record(&checks).unwrap();
+        let policy = store
+            .register_selected_minimal_policy(scopes[1].record_id())
+            .unwrap();
+        let review_policy = store
+            .register_selected_review_policy(
+                scopes[0].record_id(),
+                vec![ReviewAdmissionReviewRequirement::new(
+                    1,
+                    scopes[0].record_id(),
+                    method.record_id(),
+                    checks.record_id(),
+                    1,
+                )
+                .unwrap()],
+                Some(vec![1]),
+                Some(vec![1]),
+                Some(vec![1]),
+            )
+            .unwrap();
+        let prepared = store
+            .prepare_selected_embedded_freeze(SelectedEmbeddedFreezePreparationInput {
+                source_root: source.clone(),
+                freeze_attempt_id: FreezeAttemptId::try_from([99; ID_LENGTH].as_slice()).unwrap(),
+                policy_record_id: record_id_from_event_reference(&policy),
+            })
+            .unwrap();
+        let freeze = store
+            .commit_prepared_selected_embedded_freeze(prepared)
+            .unwrap();
+        let request = store
+            .record_selected_review_request(SelectedReviewRequestInput {
+                freeze_authority: freeze,
+                review_policy_record_id: record_id_from_event_reference(&review_policy),
+                review_role_id: 1,
+            })
+            .unwrap();
+        let result = store
+            .record_selected_review_result(SelectedReviewResultInput {
+                request_event_reference: request.request_event_reference().clone(),
+                method_status: 1,
+                finding_state: 1,
+                reason_codes: vec![],
+                findings: vec![],
+                reviewer_metadata: None,
+            })
+            .unwrap();
+        let first_publication = match store
+            .complete_selected_review_admission(result.result_event_reference().clone())
+            .unwrap()
+        {
+            AuthoritativeReviewAdmissionRuntimeOutcome::Published(publication) => publication,
+            other => panic!("expected first publication, got {other:?}"),
+        };
+        let record_name = record_filename(first_publication.admission_record().record_id());
+        let retained_path = store
+            .retained_file_witnesses
+            .iter()
+            .find(|witness| witness.path.file_name() == Some(Path::new(&record_name).as_os_str()))
+            .expect("first admission record must have a retained witness")
+            .path
+            .clone();
+        let retained_bytes = fs::read(&retained_path).unwrap();
+        MACOS_POST_DROP_REPLAY_HOOK.set(Some(Box::new(move || {
+            let replacement = retained_path.with_extension("replacement");
+            fs::write(&replacement, &retained_bytes).map_err(|_| ())?;
+            fs::rename(&replacement, &retained_path).map_err(|_| ())?;
+            Ok(())
+        })));
+        let _reset_hook = MacosPostDropReplayHookReset;
+        let uncertain = match store
+            .complete_selected_review_admission(result.result_event_reference().clone())
+            .unwrap()
+        {
+            AuthoritativeReviewAdmissionRuntimeOutcome::PublishedReceiptUncertain(uncertain) => {
+                uncertain
+            }
+            AuthoritativeReviewAdmissionRuntimeOutcome::Published(_) => {
+                panic!("replaced retained witness must not mint a published receipt")
+            }
+            other => panic!("unexpected completion outcome: {other:?}"),
+        };
+        let admission_record_id = uncertain.admission_record_id();
+        let admission_record_bytes = uncertain.admission_record_bytes().to_vec();
+        drop(uncertain);
+        drop(store);
+        let cold = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+        assert_eq!(
+            cold.resolve(admission_record_id),
+            Some(admission_record_bytes.as_slice())
+        );
+        drop(cold);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source).unwrap();
     }
 
     #[cfg(windows)]
