@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 mod authoritative_store;
+mod parameter_records;
+mod policy_records;
+
+pub use policy_records::{MinimalPolicyRecordInput, ReviewAdmissionPolicyRecordInput};
+
 pub use authoritative_store::{
     AcceptedAuthoritativeReviewAdmission, AuthoritativeFreezeCommittedBinding,
     AuthoritativeFreezeCommittedBindingError, AuthoritativePublicationDurability,
@@ -20,12 +25,18 @@ pub use authoritative_store::{
     AuthoritativeReviewAdmissionRuntimeError, AuthoritativeReviewAdmissionRuntimeOutcome,
     AuthoritativeReviewAdmissionSection82, AuthoritativeReviewAdmissionSection82Error,
     DurabilityActionState, PreparedSelectedEmbeddedFreeze, RecordedSelectedReviewRequest,
-    RecordedSelectedReviewResult, SelectedEmbeddedFreezeCommitError,
+    RecordedSelectedReviewResult, SelectedEmbeddedCaptureLimits, SelectedEmbeddedFreezeCommitError,
     SelectedEmbeddedFreezePreparationError, SelectedEmbeddedFreezePreparationInput,
-    SelectedReviewAdmissionCompletionError, SelectedReviewAdmissionSection82Error,
-    SelectedReviewRequestError, SelectedReviewRequestInput, SelectedReviewResultError,
-    SelectedReviewResultInput, SelectedTerminalInspection, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
+    SelectedEmbeddedPayload, SelectedReviewAdmissionCompletionError,
+    SelectedReviewAdmissionSection82Error, SelectedReviewRequestError, SelectedReviewRequestInput,
+    SelectedReviewResultError, SelectedReviewResultInput, SelectedTerminalInspection,
+    StoreProvisioningError, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
     AUTHORITATIVE_STORE_MAX_OBJECTS, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
+};
+
+pub use parameter_records::{
+    CheckRecord, CheckRecordInput, CheckSetRecord, CheckSetRecordInput, MethodRecord,
+    MethodRecordInput,
 };
 
 const FREEZE_ROOT_DOMAIN: &[u8] = b"EvidenceRegistry.FreezeRoot.v1";
@@ -1613,6 +1624,25 @@ impl RetainedJournal {
             entry.event_type_id(),
             entry.event_record_id(),
         )
+    }
+
+    /// Enumerates exact references in retained order, including GENESIS.
+    ///
+    /// This allocation-free iterator borrows one captured retained view. It
+    /// preserves every event instance, including repeated Record identities;
+    /// callers may bound consumption with `take`. It does not refresh a Store,
+    /// establish event authority, or recover historical publication receipts.
+    /// Store callers must separately revalidate the relevant authority bindings.
+    pub fn references(&self) -> impl ExactSizeIterator<Item = JournalReference> + '_ {
+        self.entries.iter().map(|entry| {
+            JournalReference::new(
+                self.registry_id,
+                entry.entry_index(),
+                entry.entry_hash(),
+                entry.event_type_id(),
+                entry.event_record_id(),
+            )
+        })
     }
 
     /// Resolves a version-1 Journal Anchor identity solely by reconstructing
@@ -3615,6 +3645,8 @@ impl ReviewAdmissionReviewRequirement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewAdmissionPolicyRecord {
     record_id: RecordId,
+    // Retain schema-valid fields outside the Review evaluator's projection.
+    authoritative_cbor: Vec<u8>,
     gate_scope_ref: RecordId,
     review_requirements: Vec<ReviewAdmissionReviewRequirement>,
     required_method_statuses: Option<Vec<u64>>,
@@ -3805,6 +3837,7 @@ impl ReviewAdmissionPolicyRecord {
             acceptable_anchor_relation_ids,
             operation_start_journal_ref,
             supported_context_ids,
+            authoritative_cbor: input.to_vec(),
         })
     }
 
@@ -3983,6 +4016,49 @@ pub struct ScopeRecord {
 }
 
 impl ScopeRecord {
+    /// Constructs a portable SCOPE definition without interpreting its profile.
+    pub fn new(input: ScopeRecordInput) -> Result<Self, RecordDecodeError> {
+        if input.scope_profile_id > ER_UINT_MAX || input.scope_profile_version > ER_UINT_MAX {
+            return Err(RecordDecodeError);
+        }
+        let mut record = Self {
+            record_id: RecordId([0; ID_LENGTH]),
+            input,
+        };
+        record.record_id = RecordId(Sha256::digest(record.authoritative_cbor()).into());
+        Ok(record)
+    }
+
+    /// Emits canonical SCOPE bytes, including any identity-bearing label.
+    pub fn authoritative_cbor(&self) -> Vec<u8> {
+        let mut bytes = vec![0x84];
+        encode_text(&mut bytes, "EvidenceRegistry.Record.v1");
+        bytes.extend_from_slice(&[
+            20,
+            1,
+            if self.input.scope_label.is_some() {
+                0xa6
+            } else {
+                0xa5
+            },
+            0,
+            1,
+            1,
+            20,
+            16,
+        ]);
+        encode_uint(&mut bytes, self.input.scope_profile_id);
+        bytes.push(17);
+        encode_uint(&mut bytes, self.input.scope_profile_version);
+        bytes.push(18);
+        encode_bstr(&mut bytes, &self.input.scope_payload);
+        if let Some(label) = &self.input.scope_label {
+            bytes.push(19);
+            encode_text(&mut bytes, label);
+        }
+        bytes
+    }
+
     /// Strictly decodes the complete local SCOPE grammar without interpreting its profile.
     pub fn decode_authoritative(input: &[u8]) -> Result<Self, RecordDecodeError> {
         let frame = StrictRecordFrame::decode_authoritative(input)?;
@@ -5807,8 +5883,15 @@ impl ReviewResultRecord {
         &self.reason_codes
     }
 
-    pub(crate) fn findings(&self) -> &[RecordId] {
+    /// The exact submitted finding identities, preserving array order and duplicates.
+    /// Reading them does not resolve the referenced Records or establish their truth.
+    pub fn findings(&self) -> &[RecordId] {
         &self.findings
+    }
+
+    /// The exact optional reviewer-submitted text, without attribution or authority.
+    pub fn reviewer_metadata(&self) -> Option<&str> {
+        self.reviewer_metadata.as_deref()
     }
 }
 
