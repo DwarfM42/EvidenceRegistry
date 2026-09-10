@@ -487,6 +487,29 @@ fn failed_os_spawn_is_recorded_separately() {
         .iter()
         .any(|f| matches!(f.event, Event::Observation(Observation::Spawned { .. }))));
 }
+
+#[test]
+fn empty_command_is_rejected_before_intent_or_spawn_without_panicking() {
+    let s = Sandbox::new();
+    let mut w = s.writer();
+    let mut intent = s.intent("fixture_marker");
+    intent.command.clear();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_managed(
+            &mut w,
+            request(),
+            "empty-command",
+            intent,
+            &AtomicBool::new(false),
+        )
+    }));
+    assert!(outcome.is_ok(), "empty command must not panic");
+    assert!(outcome.unwrap().is_err());
+    assert!(!s.0.join("out/marker").exists());
+    assert!(!s.0.join("out/binder-stdout.bin").exists());
+    assert!(w.report().frames.is_empty());
+}
+
 #[cfg(windows)]
 #[test]
 fn implicit_batch_shell_is_rejected_before_spawn() {
