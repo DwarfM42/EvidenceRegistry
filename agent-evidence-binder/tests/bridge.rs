@@ -81,6 +81,78 @@ fn fixed_outputs_cannot_be_waived_before_dispatch() {
 }
 
 include!("bridge/fixture.rs");
+
+#[cfg(target_os = "linux")]
+#[test]
+fn near_capacity_selected_admission_completes_within_ordinary_descriptor_limit() {
+    const NAME: &str =
+        "near_capacity_selected_admission_completes_within_ordinary_descriptor_limit";
+    if std::env::var_os("BINDER_NEAR_CAPACITY_FD_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env("BINDER_NEAR_CAPACITY_FD_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let limit = libc::rlimit {
+        rlim_cur: 256,
+        rlim_max: 256,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+    let mut f = Fixture::new();
+    let retained_object_count = || {
+        fs::read_dir(f.base.join("store/records")).unwrap().count()
+            + fs::read_dir(f.base.join("store/journal")).unwrap().count()
+            + 1
+    };
+    // Preparation, output Freeze, Result, and Admission reserve a Record and
+    // a Journal slot; the preparation's embedded Manifest is a ninth Record.
+    // Fill only the remaining retained-object budget.
+    let final_route_objects = 9;
+    let mut profile = 10_000_u64;
+    while retained_object_count() + final_route_objects < AUTHORITATIVE_STORE_MAX_OBJECTS {
+        let method = MethodRecord::new(MethodRecordInput {
+            method_profile_id: profile,
+            method_profile_version: 1,
+            method_payload: vec![],
+            method_label: None,
+        })
+        .unwrap();
+        f.store.stage_method_record(&method).unwrap();
+        profile += 1;
+    }
+    f.input(1);
+    let declaration = f.intent("fake_reviewer");
+    let mut writer = LedgerWriter::open(f.base.join("ledger")).unwrap();
+    let outcome = run_to_admission(
+        &mut f.store,
+        &mut writer,
+        f.request.request_event_reference().clone(),
+        "near-capacity",
+        declaration,
+        f.plan.clone(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            outcome.admission,
+            AuthoritativeReviewAdmissionRuntimeOutcome::Published(_)
+        ),
+        "{:#?}",
+        outcome.admission
+    );
+}
+
 #[test]
 fn clean_syntax_claim_that_fails_selected_policy_is_completed_rejection() {
     let mut f = Fixture::new();

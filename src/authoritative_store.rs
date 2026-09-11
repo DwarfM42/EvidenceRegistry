@@ -2700,10 +2700,10 @@ impl AuthoritativeRegistryStore {
                         )
                     })?;
             }
-            // The synthetic candidate has completed its full-prefix validation. Do not overlap
-            // its retained witnesses with the separately fresh publication Store: the latter
-            // revalidates its own retained generation before publishing.
-            drop(preflight_store);
+            // The synthetic candidate has completed its full-prefix validation. Replace the
+            // original Store before opening the separately fresh publication Store so a
+            // terminal admission never retains two complete prior generations.
+            *self = preflight_store;
             let mut publication_store =
                 Self::open_for_review_admission_runtime(&self.root, selected_profile).map_err(
                     |error| {
@@ -2815,6 +2815,14 @@ impl AuthoritativeRegistryStore {
                     );
                 }
             };
+            // On non-macOS targets the guard owns the Store's original retained
+            // witnesses. Restore them before post-publication replay so the
+            // Store keeps the same identity-bound handles without opening a
+            // second full generation at terminal capacity.
+            #[cfg(not(target_os = "macos"))]
+            {
+                publication_store.retained_file_witnesses = retained_generation_guard;
+            }
             macro_rules! post_visibility_try {
                 ($result:expr) => {
                     match $result {
@@ -2928,15 +2936,24 @@ impl AuthoritativeRegistryStore {
             #[cfg(all(test, target_os = "macos"))]
             post_visibility_try!(MACOS_POST_DROP_REPLAY_HOOK
                 .with_borrow_mut(|hook| hook.as_mut().map_or(Ok(()), |hook| hook())));
+            // Non-macOS publication_store now owns the original generation plus the two
+            // published witnesses. The temporary guards are therefore redundant and must not
+            // overlap the cold replay candidate at the terminal descriptor budget.
+            #[cfg(not(target_os = "macos"))]
+            drop(post_publication_guards);
+            // The publication Store has now validated the visible prefix. Replace the prior
+            // generation before the cold replay to keep only one retained generation plus the
+            // replay candidate alive at terminal capacity.
+            *self = publication_store;
             let replayed = post_visibility_try!(Self::open_for_review_admission_runtime(
                 &self.root,
                 selected_profile,
             ));
-            if replayed.namespace_holds.len() != publication_store.namespace_holds.len()
+            if replayed.namespace_holds.len() != self.namespace_holds.len()
                 || replayed
                     .namespace_holds
                     .iter()
-                    .zip(&publication_store.namespace_holds)
+                    .zip(&self.namespace_holds)
                     .any(|(replayed, retained)| !handles_identify_same_object(replayed, retained))
             {
                 return Ok(
@@ -3442,17 +3459,12 @@ impl AuthoritativeRegistryStore {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = already_guarded;
+            let witnesses = std::mem::take(&mut self.retained_file_witnesses);
             let mut guards = Vec::new();
-            guards
-                .try_reserve_exact(self.retained_file_witnesses.len())
-                .map_err(|_| ())?;
-            for witness in &self.retained_file_witnesses {
-                if already_guarded
-                    .is_some_and(|guard| handles_identify_same_object(&witness.file, &guard.file))
-                {
-                    continue;
-                }
-                guards.push(open_retained_file_guard(witness)?);
+            guards.try_reserve_exact(witnesses.len()).map_err(|_| ())?;
+            for witness in witnesses {
+                guards.push(witness);
             }
             Ok(guards)
         }
