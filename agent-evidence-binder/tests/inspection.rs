@@ -34,12 +34,20 @@ struct Fixture {
     request: RecordedSelectedReviewRequest,
     freeze_policy: RecordId,
     target_payload: PathBuf,
+    // Selected Stores retain identity-bound witnesses. The ordinary test
+    // harness must not create enough concurrent fixture Stores to exceed a
+    // platform's descriptor envelope; release this after the Store.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
+static FIXTURE_SERIAL: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 impl Fixture {
     fn new() -> Self {
-        let base = std::env::current_dir()
+        let serial = FIXTURE_SERIAL
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let base = fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join("../target")
             .join(format!(
                 "binder-inspection-{}-{}-{}",
                 std::process::id(),
@@ -141,6 +149,7 @@ impl Fixture {
             request,
             freeze_policy: record_id(&freeze_policy),
             target_payload,
+            _serial: serial,
         }
     }
     fn intent(&self, predecessor: Option<&str>) -> DispatchIntent {

@@ -593,6 +593,15 @@ pub struct LedgerWriter {
     live: BTreeSet<String>,
     poisoned: bool,
 }
+impl Drop for LedgerWriter {
+    fn drop(&mut self) {
+        // Release the advisory writer lock before the descriptor is dropped.
+        // This makes the lifetime boundary explicit on Unix and preserves the
+        // fail-closed busy contract even when concurrent creation contenders
+        // retain their own short-lived descriptors.
+        let _ = self.file.unlock();
+    }
+}
 impl LedgerWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute(path.as_ref())?;
@@ -761,11 +770,14 @@ pub fn read_ledger(path: impl AsRef<Path>) -> Result<ReadReport> {
         fs::TryLockError::WouldBlock => LedgerError::Busy,
         fs::TryLockError::Error(e) => LedgerError::Io(e),
     })?;
-    check_identity(&file, &path, false)?;
-    let report = parse(&mut file)?;
-    check_identity(&file, &path, false)?;
+    let result = (|| {
+        check_identity(&file, &path, false)?;
+        let report = parse(&mut file)?;
+        check_identity(&file, &path, false)?;
+        Ok(report)
+    })();
     file.unlock()?;
-    Ok(report)
+    result
 }
 fn parse(file: &mut File) -> Result<ReadReport> {
     file.seek(SeekFrom::Start(0))?;

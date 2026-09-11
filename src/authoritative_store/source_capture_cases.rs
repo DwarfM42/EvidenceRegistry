@@ -484,7 +484,7 @@ fn source_capture_repeated_scans_have_fresh_cursors() {
 #[test]
 fn source_capture_entry_budget_counts_empty_directories() {
     let mut f = Fixture::new();
-    for n in 0..AUTHORITATIVE_STORE_MAX_OBJECTS {
+    for n in 0..SELECTED_EMBEDDED_CAPTURE_MAX_FILES {
         fs::create_dir(f.source.join(format!("d{n:04}"))).unwrap();
     }
     assert_eq!(

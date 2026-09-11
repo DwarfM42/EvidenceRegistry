@@ -32,6 +32,7 @@ pub use authoritative_store::{
     SelectedReviewResultError, SelectedReviewResultInput, SelectedTerminalInspection,
     StoreProvisioningError, AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
     AUTHORITATIVE_STORE_MAX_OBJECTS, AUTHORITATIVE_STORE_MAX_OBJECT_BYTES,
+    SELECTED_EMBEDDED_CAPTURE_MAX_FILES,
 };
 
 pub use parameter_records::{

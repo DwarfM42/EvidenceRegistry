@@ -40,12 +40,18 @@ pub const AUTHORITATIVE_STORE_MAX_OBJECT_BYTES: usize = 1_048_576;
 /// Maximum regular objects admitted across one authoritative store opening.
 ///
 /// The Store retains one identity-bound file witness per admitted object for
-/// its whole live generation. Keep this below the ordinary 1,024-descriptor
-/// Unix process envelope so an admitted store can be cold-opened and
-/// revalidated without treating descriptor exhaustion as a generation change.
-pub const AUTHORITATIVE_STORE_MAX_OBJECTS: usize = 512;
+/// its whole live generation. Keep this below the ordinary 256-descriptor
+/// process envelope so concurrently live selected generations can be
+/// cold-opened and revalidated without descriptor exhaustion.
+pub const AUTHORITATIVE_STORE_MAX_OBJECTS: usize = 96;
 /// Maximum aggregate bytes retained across one authoritative store opening.
 pub const AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES: usize = 64 * 1_048_576;
+/// Maximum artifacts admitted during one selected EMBEDDED source capture.
+///
+/// Source capture scans with independently bounded cursors and does not retain
+/// a Store witness per source entry, so this intake bound is distinct from the
+/// live authoritative-namespace witness budget above.
+pub const SELECTED_EMBEDDED_CAPTURE_MAX_FILES: usize = 512;
 
 /// A fail-closed error while opening the authoritative on-disk Registry namespaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,7 +154,7 @@ pub struct SelectedEmbeddedCaptureLimits {
 impl Default for SelectedEmbeddedCaptureLimits {
     fn default() -> Self {
         Self {
-            max_files: AUTHORITATIVE_STORE_MAX_OBJECTS,
+            max_files: SELECTED_EMBEDDED_CAPTURE_MAX_FILES,
             max_content_bytes: AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES,
         }
     }
@@ -160,7 +166,7 @@ impl SelectedEmbeddedCaptureLimits {
             return Err(SelectedEmbeddedFreezePreparationError::SourceResourceLimit);
         }
         Ok(Self {
-            max_files: self.max_files.min(AUTHORITATIVE_STORE_MAX_OBJECTS),
+            max_files: self.max_files.min(SELECTED_EMBEDDED_CAPTURE_MAX_FILES),
             max_content_bytes: self
                 .max_content_bytes
                 .min(AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES),
@@ -2694,6 +2700,10 @@ impl AuthoritativeRegistryStore {
                         )
                     })?;
             }
+            // The synthetic candidate has completed its full-prefix validation. Do not overlap
+            // its retained witnesses with the separately fresh publication Store: the latter
+            // revalidates its own retained generation before publishing.
+            drop(preflight_store);
             let mut publication_store =
                 Self::open_for_review_admission_runtime(&self.root, selected_profile).map_err(
                     |error| {
@@ -3428,7 +3438,7 @@ impl AuthoritativeRegistryStore {
                 }
                 guards.push(into_retained_file_guard(witness)?);
             }
-            return Ok(guards);
+            Ok(guards)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4140,7 +4150,7 @@ impl SelectedEmbeddedTraversalBudget {
         self.entries = self
             .entries
             .checked_add(1)
-            .filter(|entries| *entries <= AUTHORITATIVE_STORE_MAX_OBJECTS)
+            .filter(|entries| *entries <= SELECTED_EMBEDDED_CAPTURE_MAX_FILES)
             .ok_or(SelectedEmbeddedFreezePreparationError::SourceResourceLimit)?;
         self.path_bytes = self
             .path_bytes

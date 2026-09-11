@@ -5,7 +5,13 @@ struct Fixture {
     store: AuthoritativeRegistryStore,
     request: RecordedSelectedReviewRequest,
     plan: OutputCapturePlan,
+    // Selected Stores intentionally retain namespace and file witnesses. Keep
+    // this test fixture process-serial so the test harness cannot exceed the
+    // platform's ordinary descriptor envelope by constructing many stores at
+    // once. This guard is test-only and is released after the Store.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
+static FIXTURE_SERIAL: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 fn record_id(r: &JournalReference) -> RecordId {
     RecordId::try_from(r.event_record_id().as_bytes().as_slice()).unwrap()
 }
@@ -23,9 +29,12 @@ fn binding(r: &JournalReference) -> RequestBinding {
 }
 impl Fixture {
     fn new() -> Self {
-        let base = std::env::current_dir()
+        let serial = FIXTURE_SERIAL
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let base = fs::canonicalize(std::env::temp_dir())
             .unwrap()
-            .join("../target")
             .join(format!(
                 "binder-bridge-{}-{}-{}",
                 std::process::id(),
@@ -130,6 +139,7 @@ impl Fixture {
             store,
             request,
             plan,
+            _serial: serial,
         }
     }
     fn input(&self, status: u64) {

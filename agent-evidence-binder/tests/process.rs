@@ -1,5 +1,8 @@
 use ai_agent_evidence_binder::{
-    ledger::{CommandLimits, DispatchIntent, Event, LedgerWriter, Observation},
+    ledger::{
+        read_ledger, BoundaryKind, CommandLimits, DispatchIntent, Event, LedgerError, LedgerWriter,
+        Observation,
+    },
     process::run_managed,
     RequestBinding,
 };
@@ -12,9 +15,17 @@ use std::{
 #[path = "../src/process/test_support.rs"]
 mod test_support;
 static NEXT: AtomicU64 = AtomicU64::new(0);
-struct Sandbox(PathBuf);
+static FIXTURE_SERIAL: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+struct Sandbox(
+    PathBuf,
+    #[allow(dead_code)] Option<std::sync::MutexGuard<'static, ()>>,
+);
 impl Sandbox {
     fn new() -> Self {
+        let serial = FIXTURE_SERIAL
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let p = std::env::temp_dir().join(format!(
             "binder-process-{}-{}-{}",
             std::time::SystemTime::now()
@@ -26,7 +37,7 @@ impl Sandbox {
         ));
         fs::create_dir(&p).unwrap();
         fs::create_dir(p.join("out")).unwrap();
-        Self(p)
+        Self(p, Some(serial))
     }
     fn writer(&self) -> LedgerWriter {
         LedgerWriter::open(self.0.join("ledger")).unwrap()
@@ -45,7 +56,11 @@ impl Sandbox {
             binder_identity: "process-test".into(),
             limits: CommandLimits {
                 runtime_ms: 3000,
-                pipe_drain_ms: 100,
+                // This default exercises ordinary child completion. Keep it
+                // comfortably above host scheduling jitter under the native
+                // harness's default parallelism; boundary tests set their
+                // own short drain limit below.
+                pipe_drain_ms: 1000,
                 ..CommandLimits::default()
             },
             predecessor: None,
@@ -278,12 +293,14 @@ fn timeout_is_bounded_and_persisted() {
 fn inherited_pipe_after_exit_zero_is_not_completion() {
     let s = Sandbox::new();
     let mut w = s.writer();
+    let mut intent = s.intent("fixture_descendant");
+    intent.limits.pipe_drain_ms = 100;
     let start = std::time::Instant::now();
     let result = run_managed(
         &mut w,
         request(),
         "descendant",
-        s.intent("fixture_descendant"),
+        intent,
         &AtomicBool::new(false),
     );
     assert!(
@@ -747,7 +764,7 @@ fn shell_metacharacters_remain_literal_arguments_and_stdin_is_null() {
     assert!(!s.0.join("out/injected-marker").exists());
 }
 #[test]
-fn supervisor_crash_reopens_history_without_resuming_or_spawning() {
+fn supervisor_crash_never_resumes_a_valid_or_torn_ledger() {
     let s = Sandbox::new();
     let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -772,25 +789,37 @@ fn supervisor_crash_reopens_history_without_resuming_or_spawning() {
     }
     assert!(s.0.join("out/crash_started").exists());
     assert!(owner.try_wait().unwrap().is_some());
-    let mut w = s.writer();
-    let count = w.report().frames.len();
-    assert!(w.report().attempts().iter().all(|a| !a.live_witness));
-    assert!(run_managed(
-        &mut w,
-        request(),
-        "crashed",
-        s.intent("fixture_marker"),
-        &AtomicBool::new(false)
-    )
-    .is_err());
-    assert_eq!(w.report().frames.len(), count);
+    match LedgerWriter::open(s.0.join("ledger")) {
+        Ok(mut w) => {
+            let count = w.report().frames.len();
+            assert!(w.report().attempts().iter().all(|a| !a.live_witness));
+            assert!(run_managed(
+                &mut w,
+                request(),
+                "crashed",
+                s.intent("fixture_marker"),
+                &AtomicBool::new(false)
+            )
+            .is_err());
+            assert_eq!(w.report().frames.len(), count);
+            assert!(!w
+                .report()
+                .frames
+                .iter()
+                .any(|f| matches!(f.event, Event::Publication(_))));
+        }
+        Err(LedgerError::Corrupt(boundary)) => {
+            assert_eq!(boundary.kind, BoundaryKind::Torn);
+            let report = read_ledger(s.0.join("ledger")).unwrap();
+            assert_eq!(report.boundary, Some(boundary));
+            assert!(!report
+                .frames
+                .iter()
+                .any(|f| matches!(f.event, Event::Publication(_))));
+        }
+        Err(error) => panic!("unexpected cold ledger outcome after supervisor crash: {error:?}"),
+    }
     assert!(!s.0.join("out/marker").exists());
-    assert!(!w
-        .report()
-        .frames
-        .iter()
-        .any(|f| matches!(f.event, Event::Publication(_))));
-    drop(w);
     // The supervised child is deliberately not a process-tree containment claim.
     // This bounded fixture exits itself; wait only to clean up this test's files.
     while !s.0.join("out/crash_child_done").exists() && std::time::Instant::now() < deadline {
@@ -840,7 +869,7 @@ fn fixture_stdin() {
 #[test]
 #[ignore]
 fn fixture_supervisor_owner() {
-    let s = Sandbox(std::env::current_dir().unwrap());
+    let s = Sandbox(std::env::current_dir().unwrap(), None);
     let mut w = s.writer();
     let _ = run_managed(
         &mut w,

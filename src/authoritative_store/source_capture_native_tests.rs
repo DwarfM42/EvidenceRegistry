@@ -44,7 +44,7 @@ fn source_capture_native_entry_budget_charges_before_rejection() {
         Err(INVALID)
     );
     assert_eq!(budget.entries, 1);
-    budget.entries = AUTHORITATIVE_STORE_MAX_OBJECTS;
+    budget.entries = SELECTED_EMBEDDED_CAPTURE_MAX_FILES;
     assert_eq!(
         append_name(&mut names, "a".into(), &mut budget, 1),
         Err(LIMIT)
