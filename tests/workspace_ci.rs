@@ -26,7 +26,10 @@ fn each_native_workflow_includes_binder_and_preserves_core_gates() {
             "git diff --check",
         ] {
             assert!(
-                commands.contains(&required),
+                commands
+                    .iter()
+                    .any(|command| *command == required
+                        || command.ends_with(&format!(" && {required}"))),
                 "{platform} missing {required}"
             );
         }

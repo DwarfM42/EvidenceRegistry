@@ -38,7 +38,12 @@ mod source_capture_tests;
 /// Maximum bytes admitted from any single authoritative namespace object.
 pub const AUTHORITATIVE_STORE_MAX_OBJECT_BYTES: usize = 1_048_576;
 /// Maximum regular objects admitted across one authoritative store opening.
-pub const AUTHORITATIVE_STORE_MAX_OBJECTS: usize = 4_096;
+///
+/// The Store retains one identity-bound file witness per admitted object for
+/// its whole live generation. Keep this below the ordinary 1,024-descriptor
+/// Unix process envelope so an admitted store can be cold-opened and
+/// revalidated without treating descriptor exhaustion as a generation change.
+pub const AUTHORITATIVE_STORE_MAX_OBJECTS: usize = 512;
 /// Maximum aggregate bytes retained across one authoritative store opening.
 pub const AUTHORITATIVE_STORE_MAX_NAMESPACE_BYTES: usize = 64 * 1_048_576;
 
