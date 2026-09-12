@@ -37,16 +37,18 @@ custody proof, semantic authority, or execution-authentication mechanism.
 
 ## Qualification status and boundaries
 
-This candidate has no final release qualification record. A final exact-tree
-record, if the candidate is accepted, must bind retained native qualification
-evidence on Windows x86_64, Linux x86_64, and native macOS arm64, plus the
-required locked/offline workspace gates, focused regressions, and formal
-support-impact test. A final real-agent record must separately bind a bounded
-Windows Request-first Hermes run, if performed, with its retained Result and
-selected-lane Admission followed by cold all-attempt inspection.
+The exact Binder implementation tree completed native qualification on Windows
+x86_64, Linux x86_64, and macOS arm64; the [README verification
+ledger](README-VERIFICATION-LEDGER.md) identifies the three records. This is
+current implementation qualification, not a release identity. v0.3.0 remains
+unpublished until an annotated tag, its resolved commit/tree, and the matching
+GitHub Release exist. A future real-agent record, if performed, must bind its
+own bounded Request-first Hermes run, retained Result/Admission, and cold
+all-attempt inspection.
 
 Historical implementation-tree qualification and Hermes dogfood records remain
-useful provenance but do not qualify this candidate or a future v0.3.0 release.
+useful provenance but do not qualify this documentation revision or a future
+v0.3.0 release.
 
 These observations do **not** establish semantic correctness, reviewer
 correctness or identity, independent review, agent authorship, a sandbox,

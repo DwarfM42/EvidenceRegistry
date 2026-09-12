@@ -4,11 +4,11 @@
 
 Use EvidenceRegistry to check a review against a specified request, target, submitted inputs, and Policy, then retain the inputs and decision for later rechecking—instead of adopting an AI agent's answer unconditionally. It does **not** automatically establish that the review is correct.
 
-The Rust Core provides exact Record handling, retained Journal replay, and one bounded, Store-owned Review Admission path. The **AI Agent Evidence Binder** is a separate companion released in v0.3.0, intended to connect a managed agent execution to that path; its first real-agent adapter targets Hermes. Core and its read-only CLI do not require Hermes.
+The Rust Core provides exact Record handling, retained Journal replay, and one bounded, Store-owned Review Admission path. The **AI Agent Evidence Binder** is a separate companion implemented for the v0.3.0 source candidate, intended to connect a managed agent execution to that path; its first real-agent adapter targets Hermes. Core and its read-only CLI do not require Hermes.
 
 > **Claim boundary:** `STRUCTURALLY_VALID != AUTHORITATIVELY_VALID`. **Policy acceptance != semantic truth.** These are explanations, not new wire enums. A successful decode, replay, inspection, or command establishes only its reported facts. Acceptance in the selected lane means the checked Request/target/submitted-input relationships satisfy the applicable Policy—not that the reviewer is honest, the reasoning is correct, every defect was found, or external action is authorized.
 
-> **v0.3.0 source candidate:** v0.2.0 remains the immutable Core-only release and does not contain Binder. This candidate prepares Binder and its public examples for a future v0.3.0 source release. Do not treat the version number as a published release identity: only an annotated tag, its resolved commit/tree, and a GitHub Release can establish that public locator after publication. Historical implementation-tree evidence is retained in [the dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md) and [README verification ledger](#readme-verification-ledger-and-remaining-final-execution); it does not qualify this candidate. Any eventual real-agent record does not establish semantic correctness, reviewer identity/correctness, independence, other adapters, sandboxing, or external authorization.
+> **v0.3.0 source candidate:** v0.2.0 remains the immutable Core-only release and does not contain Binder. The Binder implementation and public examples are present in this candidate. Its exact implementation tree completed native qualification on Windows x86_64, Linux x86_64, and macOS arm64; the records are identified in the [README verification ledger](docs/README-VERIFICATION-LEDGER.md). This documentation revision does not claim a new native implementation run. Do not treat the version number as a published release identity: only an annotated tag, its resolved commit/tree, and a GitHub Release can establish that public locator after publication. The retained [dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md) is a historical Windows Hermes observation. A real-agent record does not establish semantic correctness, reviewer identity/correctness, independence, other adapters, sandboxing, or external authorization.
 
 ## Choose a surface
 
@@ -16,8 +16,8 @@ The Rust Core provides exact Record handling, retained Journal replay, and one b
 |---|---|---|
 | Rust Core library | Strict Record framing/typed decoding, retained replay, selected Store-owned Freeze/Request/Result/Policy/Admission APIs | Not a general authority engine; no agent runtime dependency. |
 | `evidence-registry` CLI | Read-only `journal verify` over explicitly ordered byte files | Journal-only structural/state replay; authority and Admission remain unavailable. |
-| AI Agent Evidence Binder | Separate v0.3.0 candidate workspace component; public [`binder` example](agent-evidence-binder/examples/binder.rs) provides `init`, `run`, and read-only all-attempt `inspect`; [design and trust contract](docs/AGENT-BINDER-DESIGN.md) | Candidate qualification is pending. Binder is not in v0.2.0, and its local ledger is not a new Core authority Record. |
-| Initial Hermes adapter | Binder's literal-argv process route can invoke an approved configured executable; Hermes is the first real-agent integration | A historical Windows Request-first run retained a Store Result and accepted Admission; see the [dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md). It does not qualify this candidate, other adapters, reviewer correctness, or independent-review quorum; Core requires neither. |
+| AI Agent Evidence Binder | Separate v0.3.0 source-candidate workspace component; public [`binder` example](agent-evidence-binder/examples/binder.rs) provides `init`, `run`, and read-only all-attempt `inspect`; [design and trust contract](docs/AGENT-BINDER-DESIGN.md) | Native implementation qualification completed on Windows x86_64, Linux x86_64, and macOS arm64. The tag and GitHub Release do not yet exist. Binder is not in v0.2.0, and its local ledger is not a new Core authority Record. |
+| Initial Hermes adapter | Binder's literal-argv process route can invoke an approved configured executable; Hermes is the first real-agent integration | The retained Windows Request-first run is historical. Native qualification used deterministic fixture routes, not Hermes. Neither establishes other adapters, reviewer correctness, or independent-review quorum; Core requires neither. |
 
 EvidenceRegistry fits evidence-sensitive review workflows where you need to distinguish retained bytes, a reviewer's assertions, and a policy-derived local decision. Use the CLI when the question is only whether the supplied Journal replays structurally. Use the library when you need the selected Store path and can obey its exact storage and authority contract. Do not use either as an automatic correctness oracle, a substitute for independent review, a general evidence database, or deployment authorization. For signing, transparency, supply-chain attestation, metadata discovery, or deployment enforcement, compare the [neighboring tools](#related-tools-and-standards).
 
@@ -76,7 +76,7 @@ EvidenceRegistry is distributed as tagged source from the [official GitHub repos
 
 Prerequisites are Git with public HTTPS access, Rustup/Cargo and the platform linker. Use the pinned toolchain and components described in [Build and verify](#build-and-verify); Cargo may download the locked dependencies through your normal approved configuration. No private SSH key, author-specific directory, private dispatcher, or Hermes installation is needed for Core.
 
-**Fresh consumer environment:** choose a new, empty, user-authorized parent directory and obtain the official repository over public HTTPS into a new child checkout. Pin the annotated v0.3.0 release for Binder, or v0.2.0 only when the Core-only historical surface is intended. The empty-consumer shell recipes remain individually qualified only where the [README verification ledger](docs/README-VERIFICATION-LEDGER.md) records raw evidence; do not infer a shell/platform result from another platform or use the existing-checkout recipe in an unrelated or dirty development checkout.
+**Fresh consumer environment:** choose a new, empty, user-authorized parent directory and obtain the official repository over public HTTPS into a new child checkout. v0.2.0 is the available Core-only release. **After** an annotated v0.3.0 tag and its GitHub Release exist, pin that release for Binder; until then, there is no public Binder release identity. The empty-consumer shell recipes remain individually qualified only where the [README verification ledger](docs/README-VERIFICATION-LEDGER.md) records raw evidence; do not infer a shell/platform result from another platform or use the existing-checkout recipe in an unrelated or dirty development checkout.
 
 **Existing checkout:** stop if it is dirty or in use; check ownership of files and running work before changing its revision. Obtain permission for network/ref changes and build-output writes. Never discard changes, force-replace a tag, or reset a checkout to make onboarding pass. The following preserved v0.2.0 recipe is **not re-executed in this restoration draft**; run commands separately and stop on failure:
 
@@ -89,9 +89,10 @@ git rev-parse "v0.2.0^{tag}" "v0.2.0^{commit}" HEAD
 
 For a release, retain the annotated tag object, resolved commit, source tree, build commands, and binary hash. Check the resolved commit against the corresponding GitHub Release before building; a moving branch is not a release identity. The published v0.2.0 tag object is `b24619e0d036884652cfd9101d116bf015e629b7`, resolving to `14aa2d2b4ef6342e53e1274acd393b87ab5ee6aa`, tree `702e2a4a497fb605e7c2b7b63d6904e6112ba3bd`. Source identity is provenance, not a trusted-producer attestation.
 
-**Binder installation identity:** do not check out v0.2.0 and try `selected_review_demo` or the Binder example. Use the annotated v0.3.0 tag and verify its tag object, resolved commit, source tree, lockfile, and release page before building. A Cargo version string alone cannot identify changed source. The commands below are scoped examples, not a substitute for checking that immutable release identity or for platform/shell evidence not recorded in the ledger.
+**Binder installation identity:** do not check out v0.2.0 and try `selected_review_demo` or the Binder example. No public v0.3.0 Binder identity exists yet. **After publication**, use the annotated v0.3.0 tag and verify its tag object, resolved commit, source tree, lockfile, and release page before building. A Cargo version string alone cannot identify changed source. The commands below apply only after that publication; they are not a substitute for platform/shell evidence not recorded in the ledger.
 
 ```sh
+# After the annotated v0.3.0 tag and matching GitHub Release exist:
 git fetch https://github.com/DwarfM42/EvidenceRegistry.git tag v0.3.0
 git checkout --detach v0.3.0
 git rev-parse "v0.3.0^{tag}" "v0.3.0^{commit}" HEAD 'HEAD^{tree}'
@@ -122,7 +123,7 @@ Begin with [the executable structural example](examples/inspect_demo.rs), [crate
 
 ### Public-example setup — Bash
 
-The following recipe is intended for **Windows Git Bash, Linux Bash and macOS Bash**, not PowerShell or generic `sh`. Start at an authorized v0.3.0 repository root containing the examples. The final v0.3.0 source subject has raw native qualification evidence for Windows x86_64, Linux x86_64, and macOS arm64 as recorded in the [README verification ledger](docs/README-VERIFICATION-LEDGER.md). That evidence does not turn these Bash snippets into tested PowerShell recipes; PowerShell remains pending rather than inferred from Bash.
+The following recipe is intended for **Windows Git Bash, Linux Bash and macOS Bash**, not PowerShell or generic `sh`. Start at an authorized v0.3.0 repository root containing the examples. The implementation tree completed native qualification on Windows x86_64, Linux x86_64, and macOS arm64; the [README verification ledger](docs/README-VERIFICATION-LEDGER.md) identifies those records. These observations do not turn the Bash snippets into tested PowerShell recipes; PowerShell execution remains unverified rather than inferred from Bash.
 
 Approve writes under the new `target/readme-public-examples-v1` leaf, including build/temp files, private logs and disposable Stores, before running. Change `RUN_NAME` for a later authorized run; `mkdir` refuses an existing leaf, including partial work. No cleanup or resume is attempted. Check that the checkout is owned, not dirty/in use by other work, and has the intended source identity as described above. This shared setup only creates destinations and a raw-stream/exit recorder; it does not launch an agent.
 
@@ -308,7 +309,7 @@ CI and native qualification workflows use Rust/Cargo `1.97.1` with `rustfmt` and
 
 ### Windows Git Bash: Journal-only quick start
 
-**Execution status:** this exact build/demo/verify sequence ran on Windows x86_64 with Git Bash and Rust/Cargo 1.97.1 on 2026-09-11 (UTC+09:00). It is a **current dirty working-tree observation, NOT the final Binder candidate or a release qualification**. The build, demo, and replay completed successfully. Final-tree rerun is pending.
+**Execution status:** this exact build/demo/verify sequence ran on Windows x86_64 with Git Bash and Rust/Cargo 1.97.1 on 2026-09-11 (UTC+09:00). It is a **dirty working-tree observation**, separate from the current source candidate's Windows qualification and not a published-release qualification. The build, demo, and replay completed successfully. This recipe itself has not been rerun from the current documentation revision.
 
 **Before writing:** use a trusted, authorized local checkout and a fresh demo leaf. The build writes under `target/readme-restoration-build/`; the example always writes under the compile-time checkout's `target/`, regardless of `CARGO_TARGET_DIR`. It does not open a Store or launch an agent. Keep partial or refused runs; do not delete an unknown directory to reuse its name. Native Windows programs need Windows-form environment paths, hence Git Bash's `pwd -W` rather than POSIX `$PWD`.
 
@@ -361,7 +362,7 @@ The head hash was checked against SHA-256 of the generated `genesis-entry.cbor`.
 
 The final native recipe must set Windows-form build/temp paths, run the locked build and fresh demo, invoke the `.exe`, and capture `$LASTEXITCODE` immediately after each native command. It must preserve raw stdout/stderr and stop on failure. The Git Bash run above does **not** verify PowerShell syntax or execution. No unexecuted PowerShell demo is presented as runnable evidence here.
 
-### Linux / macOS — preserved build recipe, final execution pending
+### Linux / macOS — preserved build recipe; recipe-specific execution status
 
 The following POSIX environment/build recipe is retained from the Core README, **not newly executed on Linux/macOS in this draft**. Do not apply its `$PWD` environment setup to Windows native tools. Obtain permission for build/temp writes, run commands separately, and stop on failure:
 
@@ -373,7 +374,7 @@ mkdir -p "$TMPDIR"
 cargo build --release --locked
 ```
 
-The POSIX binary is `target/release/evidence-registry` when using that target directory. Native Linux and macOS build → fresh demo → ordered replay → stdout/stderr/exit recipes remain **pending parent integration and execution on each native platform**; do not infer them from the Windows observation.
+The POSIX binary is `target/release/evidence-registry` when using that target directory. This particular build → fresh demo → ordered replay recipe has not been executed on Linux or macOS from this documentation revision; do not infer recipe execution from the Windows observation or from the broader Linux smoke. The macOS exact-candidate workspace suite currently has a recorded failing test.
 
 ### Developer verification
 
@@ -390,17 +391,18 @@ cargo test --doc --locked
 git diff --check
 ```
 
-Final integration must also execute the actual Binder/workspace suites, [formal tooling tests](scripts/formal/test_supportimpact.py), and Markdown/link checks without dropping the existing gates. Exact commands and retained evidence belong in the final all-command ledger, not an invented universal test command.
+Release closeout must bind the annotated v0.3.0 tag, its resolved commit/tree, and the GitHub Release to the completed implementation qualification records. Exact commands and retained evidence belong in the release record, not an invented universal test command.
 
 ### Platform qualification
 
-| Scope | What this draft can say | Still required |
+| Scope | Current status | Boundary / next action |
 |---|---|---|
-| Released Core authority path | Previously exercised natively on Windows x86_64, Linux x86_64, macOS arm64, bound to release evidence | Historical qualification does not qualify this changed tree. |
-| Current Journal quick start | Windows x86_64 / Git Bash working-tree build, synthetic demo and replay observed | Final exact-tree replay, PowerShell, Linux and macOS recipes. |
-| Core positive / Binder fake examples | Retained Windows development executions; public command surfaces integrated here, assembled shell recipe not yet executed | Final exact-tree Windows Git Bash/PowerShell, Linux and macOS runs; fixed public revision; fixtures must stay labeled fixtures. |
-| Binder common code / subprocess fixtures | `1bbaeea` / `adde784a` passed full native qualification on Windows x86_64, Linux x86_64, and macOS arm64. | The result is bound to that exact implementation tree; focused example success is not a claim about an altered documentation/release tree. |
-| Real Hermes review | One Windows/Git-Bash Request-first Hermes run on `1bbaeea` / `adde784a` retained a Result and accepted selected-lane Admission; its exact boundary is in [the dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md). | Report only the OS/adapter actually exercised, with Request-to-cold-replay evidence and all attempts; this does not establish semantic correctness, reviewer identity, independence, or other adapters. |
+| Released Core authority path | Historical release qualification exists for the Core-only v0.2.0 release. | Historical qualification does not qualify the v0.3.0 source candidate. |
+| Current Binder implementation tree | Native qualification completed on Windows x86_64, Linux x86_64, and macOS arm64. | The qualification records bind the implementation tree, not semantic correctness or a publication identity. |
+| Current Journal quick start | A Windows x86_64 / Git Bash working-tree build, synthetic demo, and replay were observed. | This specific recipe has not been rerun from the current documentation revision; PowerShell, Linux, and macOS recipe execution is not inferred. |
+| Core positive / Binder fake examples | Retained development executions and the native qualification fixture routes exist. | Fixtures remain fixtures; documented shell recipes need their own execution records if represented as tested recipes. |
+| Binder common code / subprocess fixtures | `1bbaeea` / `adde784a` passed full native qualification on Windows x86_64, Linux x86_64, and macOS arm64. | This is clearly historical implementation-tree evidence, not qualification of the current documentation revision. |
+| Real Hermes review | One Windows/Git-Bash Request-first Hermes run on `1bbaeea` / `adde784a` retained a Result and accepted selected-lane Admission; its exact boundary is in [the dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md). | It is historical; native qualification used deterministic fixture routes. Neither establishes semantic correctness, reviewer identity, independence, or other adapters. |
 
 Neither native tests nor hosted CI establish all-filesystem support, hostile same-principal writer exclusion, universal durability, custody, or production readiness. Unsupported capability and unavailable/preterminal outcomes must remain explicit. Historical platform details are in the [release notes](docs/RELEASE-NOTES-v0.2.0.md); they are not fresh observations of Binder.
 
@@ -435,7 +437,7 @@ A Request's role/reviewer identity text does not authenticate the actual submitt
 
 ### Binder workflow and capture boundary
 
-**Implemented controlled route; final v0.3.0 native qualification and one bounded Windows real-Hermes run are recorded:**
+**Implemented controlled route; qualification status is reported above, and the bounded Windows real-Hermes run below is historical:**
 
 ```text
 Target Freeze → exact Review Request / fixed Anchor → retained dispatch intent
@@ -457,9 +459,9 @@ Cold reopen must reconcile all managed attempts and known exact Store references
 
 ### Before installation or execution
 
-1. **Choose the operation and identity.** Ask whether the user needs read-only Journal replay, selected Store operations, or the separate Binder route. Verify the release or exact source commit/tree; do not treat moving `main`, a Cargo version, successful installation, or a build as an authoritative result. Follow [installation](#installation-and-release-identity); v0.2.0 is Core-only and v0.3.0 carries Binder.
+1. **Choose the operation and identity.** Ask whether the user needs read-only Journal replay, selected Store operations, or the separate Binder route. Verify the release or exact source commit/tree; do not treat moving `main`, a Cargo version, successful installation, or a build as an authoritative result. Follow [installation](#installation-and-release-identity); v0.2.0 is Core-only, and Binder is available only in the current v0.3.0 source candidate until a v0.3.0 release exists.
 2. **Distinguish a fresh consumer from an existing checkout.** A fresh consumer starts in an authorized empty location using public HTTPS source. In an existing checkout, inspect dirty/in-use state and ownership and refuse revision changes/builds against unknown concurrent work. Do not clean, reset, overwrite, terminate other work, or force tags to make the instructions fit. Author archive paths are not consumer prerequisites.
-3. **Check real prerequisites.** Confirm OS/shell, installed Rust toolchain, components and linker. Keep `Cargo.lock` and use locked builds. Core requires no Hermes. The [Bash example setup](#public-example-setup--bash) uses installed Rust/Cargo 1.97.1, native absolute paths and `sha256sum` or `shasum` for binary identity. Before the Hermes adapter is used, separately obtain approval for the existing agent configuration, network/provider use, budget and runtime bounds; do not install or launch an agent merely because this section mentions one. The fake companion recipe is available above; real-Hermes arguments and final qualification remain pending.
+3. **Check real prerequisites.** Confirm OS/shell, installed Rust toolchain, components and linker. Keep `Cargo.lock` and use locked builds. Core requires no Hermes. The [Bash example setup](#public-example-setup--bash) uses installed Rust/Cargo 1.97.1, native absolute paths and `sha256sum` or `shasum` for binary identity. Before the Hermes adapter is used, separately obtain approval for the existing agent configuration, network/provider use, budget and runtime bounds; do not install or launch an agent merely because this section mentions one. The fake companion recipe is available above; real-Hermes arguments must be explicitly supplied for a new run. Native implementation qualification is complete; the publication identity is still absent.
 
 ### Before writes, agent spawn, or capture
 
@@ -489,25 +491,28 @@ Use this human-readable report template (these labels are **not** promised JSON 
 | Every managed attempt | Successful, rejected, refused, failed, cancelled, timed-out, crash/incomplete and unresolved attempts, with predecessor relationships where recorded. |
 | Limits and permission | What remains unestablished and which next action, if any, needs user permission. |
 
-### README verification ledger and remaining final execution
+### README verification ledger and recipe-specific execution
 
 The [README verification ledger](docs/README-VERIFICATION-LEDGER.md) defines
-the required raw-evidence fields and records the exact implementation-candidate
-native qualification and real Hermes run. Bash recipes mean Windows Git Bash,
-Linux Bash and macOS Bash; they are not native PowerShell recipes.
+the required raw-evidence fields and records historical implementation-tree
+qualification and real-Hermes observations. The Binder implementation tree
+completed native qualification on Windows x86_64, Linux x86_64, and macOS arm64.
+Those records do not create an annotated v0.3.0 tag or GitHub Release. Bash
+recipes mean Windows Git Bash, Linux Bash and macOS Bash; they are not native
+PowerShell recipes.
 
 | Section / recipe | Precise remaining deliverable |
 |---|---|
 | Empty-consumer installation | Public HTTPS acquisition in isolated authorized scratch; immutable Core vs Binder-containing revision selection; actual Windows PowerShell/Git Bash, Linux/macOS shell runs and identity checks. |
 | Existing-checkout installation | Execute safe clean/not-in-use revision selection and identity checks; separately demonstrate dirty/in-use refusal. Do not mutate the canonical development checkout to test this. |
-| Journal minimum experience | Rerun build → fresh demo → exact Journal inputs → raw JSON/stderr/exit on the final tree; retain hashes and replace this working-tree sample with that evidence. Execute native PowerShell/Linux/macOS variants. |
+| Journal minimum experience | Rerun build → fresh demo → exact Journal inputs → raw JSON/stderr/exit on the identified source candidate; retain hashes and replace this working-tree sample with that evidence. Execute native PowerShell/Linux/macOS variants. |
 | Public-example setup / identity / binary hashes | Execute the shared Bash initialization, fresh-root/refusal, raw-stream/exit/argv recorder, installed 1.97.1/toolchain checks and platform hash utilities on Windows Git Bash, Linux Bash and macOS Bash. Supply and execute the native PowerShell equivalent separately. |
-| Local path consumer and positive library example | Build/run the documented `selected_review_demo` accepted/rejected/invalid/generic-unsupported controls and separate-process `inspect` from final source, with retained logs/layout/payload readback. Assemble and execute an isolated path-dependency consumer; a built in-repo example alone is not that fresh-consumer test. All three native platforms, plus Windows PowerShell, remain final-execution tasks. |
-| Binder installation and configuration | Supply a fixed revision that actually contains `binder`; final public HTTPS acquisition remains pending. Execute its locked build, fresh `init` and predispatch `inspect` with the documented fixed DEMO Policy/source/capture contract. Actual Hermes configuration is separate; do not point new commands at v0.2.0. |
+| Local path consumer and positive library example | Build/run the documented `selected_review_demo` accepted/rejected/invalid/generic-unsupported controls and separate-process `inspect` from the identified source candidate, with retained logs/layout/payload readback. Assemble and execute an isolated path-dependency consumer; a built in-repo example alone is not that fresh-consumer test. The unexecuted platform/shell coverage remains explicit rather than inferred. |
+| Binder installation and configuration | Supply a fixed revision that actually contains `binder`; public HTTPS Binder acquisition is unavailable until the annotated v0.3.0 tag and GitHub Release exist. Execute its locked build, fresh `init` and predispatch `inspect` with the documented fixed DEMO Policy/source/capture contract. Actual Hermes configuration is separate; do not point new commands at v0.2.0. |
 | Binder fake lifecycle | Execute the explicit `a/nonzero → b/malformed → c/rejected → d/clean` recipe, fresh capture IDs and required immediate predecessors, retaining each nonzero exit and every cold inspection. These commands are intended for the shared Bash setup; PowerShell translation/execution is pending. Regenerate sample summaries from final raw JSON, not this development table. |
 | Binder real review | A real Windows Hermes run on `1bbaeea` / `adde784a` is recorded in [the dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md): a fresh Request-first run produced a retained Result and accepted Admission with cold inspection. Re-execute a new Request-first run if a source change changes the implementation tree; fake subprocess fixtures do not substitute. |
-| Binder interruption and all-attempt inspection | Final-tree `binder inspect --workspace` execution and failure/corruption/candidate-completeness checks, with payload/reference validation and all prior failed/unresolved attempts. The fake chain demonstrates observed failures, not every crash/publication-uncertainty scenario. No historical-log import or automatic resume recipe. |
-| Final verification and platform report | Bind every README command/example to the final exact tree, OS/shell/toolchain, raw stdout/stderr/exit/hashes and status. Preserve Core, Binder/workspace, release-focused, doctest, formal, formatting, warning-denied clippy and Markdown/link gates. Separate real-Hermes E2E from native fixture tests. |
+| Binder interruption and all-attempt inspection | Execute `binder inspect --workspace` from the identified source candidate and perform failure/corruption/candidate-completeness checks, with payload/reference validation and all prior failed/unresolved attempts. The fake chain demonstrates observed failures, not every crash/publication-uncertainty scenario. No historical-log import or automatic resume recipe. |
+| Release verification and platform report | Bind every release-claimed README command/example to its exact source tree, OS/shell/toolchain, raw stdout/stderr/exit/hashes and status. Preserve Core, Binder/workspace, release-focused, doctest, formal, formatting, warning-denied clippy and Markdown/link gates. Separate real-Hermes E2E from native fixture tests. |
 
 The [restoration inventory](docs/README-RESTORATION-LEDGER.md) records the historical reader capabilities being restored; it does not assert these pending executions passed.
 
