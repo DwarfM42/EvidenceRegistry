@@ -27,7 +27,7 @@ No adopted bytes or old release identities are changed by this work.
 | Agent artifact list | No | Selection changes retained material and can prevent Binder ingestion | Untrusted candidates; not filesystem read authorization or proof of completeness |
 | Binder-spawned process exit and owned pipe bytes | No | Only Binder-local completeness gates unless an adopted evaluator expressly says otherwise | Top-level process/pipe observation, not internal delegation completion |
 | Store-captured bytes | Retained evidence, not independent truth/authorship | They establish their own selected Freeze; no automatic original Review Policy dependency | Bytes read and retained at capture, including current payload validation |
-| Hermes internal delegation logs | No | Any mapped semantic claim remains submitted input; opaque logs are not a new evaluator | Agent-reported internal work, not Binder observation of it |
+| Agent internal delegation logs | No | Any mapped semantic claim remains submitted input; opaque logs are not a new evaluator | Agent-reported internal work, not Binder observation of it |
 | Binder executable/build identity | No | No automatic Policy effect | Provenance, not attestation or execution authentication |
 | Selected Admission | Selected-lane authoritative disposition | Yes, only under applicable downstream semantics | Applicable Policy outcome, not semantic truth or external action permission |
 
@@ -199,7 +199,7 @@ Resource limits cover frame size/count, total ledger bytes, stdout/stderr bytes,
 output files/bytes, runtime, post-exit pipe drain and open descriptors. Concrete
 values belong to the implemented typed configuration and tests, not guessed CLI
 flags. Same-principal hostile writers, Binder-external executions, deleted whole
-stores/ledgers and hidden Hermes retries are outside complete-history claims.
+stores/ledgers and hidden Agent-side retries are outside complete-history claims.
 Capture establishes capture-time bytes, not agent authorship or equality with bytes
 at process exit. Times and PIDs are diagnostics, not attribution authority.
 
@@ -365,6 +365,8 @@ paths; they do not substitute for final-tree Linux/macOS qualification.
 
 This design did not itself authorize or complete the release. v0.3.0 closure is
 recorded separately through exact Git objects, retained native qualification,
-bounded real-Hermes Request→dispatch→capture→Admission→cold inspection evidence,
+historical Hermes Request→dispatch→capture→Admission→cold inspection evidence,
 independent review, protected integration, release readback, canonical-main
-synchronization, and a sender receipt. v0.2.0 remains unchanged and Core-only.
+synchronization, and a sender receipt. Post-release Codex CLI and Claude Code
+observations use the same literal-argv route but do not retroactively alter release
+closure or native qualification. v0.2.0 remains unchanged and Core-only.

@@ -28,10 +28,15 @@ The Binder is a separate workspace component with the public `binder` example:
 - `inspect` is read-only and reconciles the local bounded ledger with known
   retained Store references across all attempts.
 
-Hermes is the first real-agent adapter/dogfood target. Core and the read-only
-`evidence-registry journal verify` CLI neither require nor configure Hermes.
-The Binder ledger is bounded local history, not a Core Record, signature,
-custody proof, semantic authority, or execution-authentication mechanism.
+Binder uses a generic literal-argv managed-process route. Hermes is the first
+real-agent integration/dogfood target; [bounded post-release Windows
+observations](BINDER-REAL-AGENT-OBSERVATIONS-v0.3.0.md) subsequently exercised
+the same route with Codex CLI and Claude Code. These are not built-in or formally
+qualified adapters, and they do not establish every runtime version/configuration
+or platform. Core and the read-only `evidence-registry journal verify` CLI require
+and configure no agent runtime. The Binder ledger is bounded local history, not a
+Core Record, signature, custody proof, semantic authority, or
+execution-authentication mechanism.
 
 ## Qualification status and boundaries
 
@@ -40,13 +45,13 @@ x86_64, Linux x86_64, and macOS arm64; the [README verification
 ledger](README-VERIFICATION-LEDGER.md) identifies the three records. This is
 current implementation qualification, not semantic correctness. The annotated
 tag, its resolved commit/tree, and matching GitHub Release establish the public
-release locator. A future real-agent record, if performed, must bind its own
-bounded Request-first Hermes run, retained Result/Admission, and cold
-all-attempt inspection.
+release locator. Any future real-agent observation must bind its own bounded
+Request-first runtime run, retained Result/Admission, and cold all-attempt
+inspection.
 
-Historical implementation-tree qualification and Hermes dogfood records remain
-useful provenance but do not qualify this documentation revision beyond its
-stated bounded facts.
+Historical implementation-tree qualification, Hermes dogfood, and post-release
+Codex CLI/Claude Code observation records remain useful provenance but do not
+qualify this documentation revision beyond their stated bounded facts.
 
 These observations do **not** establish semantic correctness, reviewer
 correctness or identity, independent review, agent authorship, a sandbox,
