@@ -47,14 +47,24 @@ that evidence root, but hashes alone are not a substitute for retained output.
   but that local checkout did not satisfy the README's clean-checkout
   precondition. It is therefore useful execution evidence, not final candidate
   qualification.
-- `docs/HERMES-BINDER-DOGFOOD-0a44589.md` records the separate actual Windows
-  Hermes run on commit `0a44589`, including a fresh accepted Request-first
-  path and cold inspection. It is not a replacement for
-  exact-final-documentation-tree rerun or native multi-platform qualification.
+- `docs/HERMES-BINDER-DOGFOOD-1bbaeea.md` records the actual Windows Hermes
+  Request-first run on `1bbaeea170322602fe60664bf6e4c4f10fadcb8e` /
+  `adde784afd6a45818739ab122a08aa3416390d90`. Its private evidence root is
+  `target/hermes-dogfood-adde784a-final/`; it retains literal argv, raw
+  stdout/stderr/exits, output capture, Store/ledger state, cold inspection, and
+  evidence manifest hash `f1058d022c43a51cb0354e30b399e8d5eacf1cfad55384fc303e24af74cd85ed`.
+- The same exact implementation tree passed full native qualification on
+  Windows x86_64 (`C:/Users/sngme/AppData/Local/Temp/evidenceregistry-current-windows-20260911T233148Z`, manifest
+  `b71bc25031b8a94afcd8714e1c5f05507e48325078737e2e524669ed94b3294d`), Linux
+  x86_64 (`/home/dwarfm42/.cache/evidence-registry-1bbaeea-linux-qualification-Cg6B7F`, manifest
+  `5892eccf6eefe107b343f0369ba425b3dea4b7e0e76b4a41a7670b7190838c44`), and
+  native macOS arm64 (`/Users/mskd/.cache/evidence-registry-native-arm64-final-complete.S9vL2k`, manifest
+  `4dad7acb1fe34eaeb8c834f67e09c4a387601c06cc1796864e161a71456e8075`).
+  These are implementation-tree records, not release, semantic-correctness, or
+  reviewer-correctness conclusions.
 - `docs/HERMES-BINDER-DOGFOOD-98b7646.md` remains retained historical context
   for the earlier launcher probes and accepted implementation-tree run.
 
-After the final source/documentation tree is committed, create a new machine
-record beneath `target/` using every field above. The final handoff must name
-that evidence root and summarize each row without replacing raw output with a
-narrative.
+Any change to the qualified implementation tree requires a new machine record
+beneath `target/` using every field above. Documentation-only changes must not
+be represented as fresh source qualification without a corresponding rerun.
