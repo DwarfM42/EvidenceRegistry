@@ -31,7 +31,7 @@ that evidence root, but hashes alone are not a substitute for retained output.
 | Public-example setup | Identity, source-state safeguard, toolchain/components, recorder files, and fresh-root refusal. | Observed separately per native shell. A dirty/in-use safeguard must be reported rather than bypassed. |
 | Bounded positive Core example | Locked build; accepted, rejected, invalid, unsupported, and cold-inspect commands. | Controlled fake semantic Result; not an AI review. |
 | Binder controlled fake example | Locked Binder build; init; predispatch inspect; `a → b → c → d` with every cold inspection. | Controlled fake reviewer; each expected nonzero remains evidence, not a skipped failure. |
-| Hermes Binder run | New Store Request; literal managed process; retained capture; Result/Admission where present; all-attempt cold inspection. | Actual adapter execution; Agent claims and internal delegation stay untrusted/agent-reported. |
+| Binder real-agent run | New Store Request; literal managed process; retained capture; Result/Admission where present; all-attempt cold inspection. | Actual runtime observation only; Agent claims and internal delegation stay untrusted/agent-reported. Runtime/version/platform records remain separate. |
 | Journal quick start | Release build, fresh `inspect_demo`, ordered journal replay, raw JSON/stderr/exit. | Journal-only structural replay; authority/admission remain unavailable. |
 | Developer gate | Formatting, workspace tests, doctests, warning-denied Clippy, formal script, Markdown/link check, release build and applicable focused suites. | A test pass is not platform qualification or reviewer correctness. |
 | Native qualification | Same exact tree on Windows x86_64, Linux x86_64 and macOS arm64. | Native execution only; no Docker/cross-compilation substitution. |
@@ -53,6 +53,12 @@ that evidence root, but hashes alone are not a substitute for retained output.
   `target/hermes-dogfood-adde784a-final/`; it retains literal argv, raw
   stdout/stderr/exits, output capture, Store/ledger state, cold inspection, and
   evidence manifest hash `f1058d022c43a51cb0354e30b399e8d5eacf1cfad55384fc303e24af74cd85ed`.
+- [Bounded real-agent CLI observations](BINDER-REAL-AGENT-OBSERVATIONS-v0.3.0.md)
+  records separate bounded
+  post-release Windows x86_64 Codex CLI and Claude Code observations on the public
+  v0.3.0 tag/commit/tree. Each retained prior failed attempts and later completed
+  the Request → Result → Admission → cold-inspection route. They are not formal
+  adapter or cross-platform qualification records.
 - The same exact implementation tree passed full native qualification on
   Windows x86_64 (`C:/Users/sngme/AppData/Local/Temp/evidenceregistry-current-windows-20260911T233148Z`, manifest
   `b71bc25031b8a94afcd8714e1c5f05507e48325078737e2e524669ed94b3294d`), Linux
