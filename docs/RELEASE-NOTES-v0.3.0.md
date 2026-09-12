@@ -1,14 +1,12 @@
-# EvidenceRegistry v0.3.0 release-candidate notes
+# EvidenceRegistry v0.3.0 release notes
 
-## Planned release identity
+## Release identity
 
-This source candidate prepares EvidenceRegistry v0.3.0 as a source-only release
-of the Rust Core and the **AI Agent Evidence Binder** companion. It is not a
-published release identity. After publication, the annotated `v0.3.0` tag, its
-resolved commit and source tree, and the GitHub Release will be the release
-identity to verify before building. The planned release is not published to
-crates.io (`publish = false`) and provides no prebuilt binaries or binary
-assets.
+EvidenceRegistry v0.3.0 is a source-only release of the Rust Core and the **AI
+Agent Evidence Binder** companion. Verify the annotated `v0.3.0` tag, its
+resolved commit and source tree, and the matching GitHub Release before
+building. The release is not published to crates.io (`publish = false`) and
+provides no prebuilt binaries or binary assets.
 
 Both workspace packages are version `0.3.0`:
 
@@ -40,15 +38,15 @@ custody proof, semantic authority, or execution-authentication mechanism.
 The exact Binder implementation tree completed native qualification on Windows
 x86_64, Linux x86_64, and macOS arm64; the [README verification
 ledger](README-VERIFICATION-LEDGER.md) identifies the three records. This is
-current implementation qualification, not a release identity. v0.3.0 remains
-unpublished until an annotated tag, its resolved commit/tree, and the matching
-GitHub Release exist. A future real-agent record, if performed, must bind its
-own bounded Request-first Hermes run, retained Result/Admission, and cold
+current implementation qualification, not semantic correctness. The annotated
+tag, its resolved commit/tree, and matching GitHub Release establish the public
+release locator. A future real-agent record, if performed, must bind its own
+bounded Request-first Hermes run, retained Result/Admission, and cold
 all-attempt inspection.
 
 Historical implementation-tree qualification and Hermes dogfood records remain
-useful provenance but do not qualify this documentation revision or a future
-v0.3.0 release.
+useful provenance but do not qualify this documentation revision beyond its
+stated bounded facts.
 
 These observations do **not** establish semantic correctness, reviewer
 correctness or identity, independent review, agent authorship, a sandbox,
@@ -68,6 +66,6 @@ a general authority engine and does not upgrade generic or legacy paths.
 For commands, trust boundaries, and raw-evidence requirements, see the
 [README](../README.md), [README verification ledger](README-VERIFICATION-LEDGER.md),
 and [Binder design and trust contract](AGENT-BINDER-DESIGN.md). The GitHub
-Release will be the authoritative public locator for the final tag object,
-commit, tree, release body, and release-time evidence pointers only after it is
-created and read back.
+Release is the public locator for the final tag object, commit, tree, release
+body, and release-time evidence pointers; verify it and the annotated tag
+directly.
