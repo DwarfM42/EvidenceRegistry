@@ -1,6 +1,6 @@
 # AI Agent Evidence Binder v0 — implementation contract
 
-Status: Phase 0 implementation design, not an adopted Core successor or a claim of completed functionality.
+Status: v0.3.0 implementation/design contract. It does not adopt a new Core successor or turn Binder-local observations into Core authority.
 
 ## Rebound baseline
 
@@ -363,10 +363,8 @@ remain unestablished. Successful syscalls establish the reported actions, not
 strongest-available storage capability. Native Windows regressions exercise these
 paths; they do not substitute for final-tree Linux/macOS qualification.
 
-No implementation is complete merely because this design exists. Required closure:
-RED→GREEN public-seam tests, hostile and independent provenance review on exact Git
-objects, fresh real Hermes Request→dispatch→capture→Admission→cold reopen, native
-Windows/Linux/macOS tests on the final tree, README restoration and freshly executed
-README verification ledger, protected PR/CI/merge, clean canonical main sync, final
-handoff and completion sender receipt. v0.2.0 remains unchanged; no new release is
-implicitly authorized.
+This design did not itself authorize or complete the release. v0.3.0 closure is
+recorded separately through exact Git objects, retained native qualification,
+bounded real-Hermes Request→dispatch→capture→Admission→cold inspection evidence,
+independent review, protected integration, release readback, canonical-main
+synchronization, and a sender receipt. v0.2.0 remains unchanged and Core-only.

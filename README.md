@@ -4,11 +4,11 @@
 
 Use EvidenceRegistry to check a review against a specified request, target, submitted inputs, and Policy, then retain the inputs and decision for later rechecking—instead of adopting an AI agent's answer unconditionally. It does **not** automatically establish that the review is correct.
 
-The Rust Core provides exact Record handling, retained Journal replay, and one bounded, Store-owned Review Admission path. The **AI Agent Evidence Binder** is a separate companion under integration, intended to connect a managed agent execution to that path; its first adapter targets Hermes. Core and its read-only CLI do not require Hermes.
+The Rust Core provides exact Record handling, retained Journal replay, and one bounded, Store-owned Review Admission path. The **AI Agent Evidence Binder** is a separate companion released in v0.3.0, intended to connect a managed agent execution to that path; its first real-agent adapter targets Hermes. Core and its read-only CLI do not require Hermes.
 
 > **Claim boundary:** `STRUCTURALLY_VALID != AUTHORITATIVELY_VALID`. **Policy acceptance != semantic truth.** These are explanations, not new wire enums. A successful decode, replay, inspection, or command establishes only its reported facts. Acceptance in the selected lane means the checked Request/target/submitted-input relationships satisfy the applicable Policy—not that the reviewer is honest, the reasoning is correct, every defect was found, or external action is authorized.
 
-> **Development integration, not a release:** v0.2.0 remains the immutable, source-only Core release; it does not contain Binder or these public examples. The Binder implementation candidate `1bbaeea` / `adde784a` has retained Windows, Linux x86_64, and native macOS arm64 qualification evidence, plus one bounded Windows real Hermes Request-first run with a retained Result and **accepted** Admission; see [the dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md) and the [README verification ledger](#readme-verification-ledger-and-remaining-final-execution). The real-agent record does not establish reviewer correctness, independent review, other adapters, or final release status. No new release is claimed.
+> **v0.3.0 source release:** v0.2.0 remains the immutable Core-only release and does not contain Binder. v0.3.0 adds the Binder and its public examples; verify the annotated tag, resolved commit/tree, and GitHub Release before building. The retained qualification record covers the final v0.3.0 source subject on Windows x86_64, Linux x86_64, and native macOS arm64, plus one bounded Windows real Hermes Request-first run with a retained Result and **accepted** Admission; see [the v0.3.0 release notes](docs/RELEASE-NOTES-v0.3.0.md), [dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md), and [README verification ledger](#readme-verification-ledger-and-remaining-final-execution). The real-agent record does not establish semantic correctness, reviewer identity/correctness, independence, other adapters, sandboxing, or external authorization.
 
 ## Choose a surface
 
@@ -16,8 +16,8 @@ The Rust Core provides exact Record handling, retained Journal replay, and one b
 |---|---|---|
 | Rust Core library | Strict Record framing/typed decoding, retained replay, selected Store-owned Freeze/Request/Result/Policy/Admission APIs | Not a general authority engine; no agent runtime dependency. |
 | `evidence-registry` CLI | Read-only `journal verify` over explicitly ordered byte files | Journal-only structural/state replay; authority and Admission remain unavailable. |
-| AI Agent Evidence Binder | Separate workspace component; public [`binder` example](agent-evidence-binder/examples/binder.rs) provides `init`, `run`, and read-only all-attempt `inspect`; [design and trust contract](docs/AGENT-BINDER-DESIGN.md) | Candidate `1bbaeea` was natively qualified on Windows x86_64, Linux x86_64, and macOS arm64. It is not in v0.2.0, and its local ledger is not a new Core authority Record. |
-| Initial Hermes adapter | Binder's literal-argv process route can invoke an approved configured executable; Hermes is the first intended real-agent integration | One Windows Request-first run on `1bbaeea` reached Store Result and accepted Admission; see the [dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md). It does not qualify other adapters, reviewer correctness, or independent-review quorum; Core requires neither. |
+| AI Agent Evidence Binder | Separate v0.3.0 workspace component; public [`binder` example](agent-evidence-binder/examples/binder.rs) provides `init`, `run`, and read-only all-attempt `inspect`; [design and trust contract](docs/AGENT-BINDER-DESIGN.md) | The final v0.3.0 source subject has retained native qualification on Windows x86_64, Linux x86_64, and macOS arm64. Binder is not in v0.2.0, and its local ledger is not a new Core authority Record. |
+| Initial Hermes adapter | Binder's literal-argv process route can invoke an approved configured executable; Hermes is the first real-agent integration | One bounded Windows Request-first run retained a Store Result and accepted Admission; see the [dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md). It does not qualify other adapters, reviewer correctness, or independent-review quorum; Core requires neither. |
 
 EvidenceRegistry fits evidence-sensitive review workflows where you need to distinguish retained bytes, a reviewer's assertions, and a policy-derived local decision. Use the CLI when the question is only whether the supplied Journal replays structurally. Use the library when you need the selected Store path and can obey its exact storage and authority contract. Do not use either as an automatic correctness oracle, a substitute for independent review, a general evidence database, or deployment authorization. For signing, transparency, supply-chain attestation, metadata discovery, or deployment enforcement, compare the [neighboring tools](#related-tools-and-standards).
 
@@ -72,11 +72,11 @@ The selected lane is not a general authority engine. It is unavailable to legacy
 
 ## Installation and release identity
 
-EvidenceRegistry is distributed as tagged source from the [official GitHub repository](https://github.com/DwarfM42/EvidenceRegistry) and [GitHub Releases](https://github.com/DwarfM42/EvidenceRegistry/releases), not crates.io. `publish = false` is intentional. Prebuilt binaries are outside this release's distribution scope. See the [v0.2.0 release notes](docs/RELEASE-NOTES-v0.2.0.md) for the supported-surface and qualification boundaries.
+EvidenceRegistry is distributed as tagged source from the [official GitHub repository](https://github.com/DwarfM42/EvidenceRegistry) and [GitHub Releases](https://github.com/DwarfM42/EvidenceRegistry/releases), not crates.io. `publish = false` is intentional. Prebuilt binaries are outside this release's distribution scope. See the [v0.3.0 release notes](docs/RELEASE-NOTES-v0.3.0.md) for the current Binder release and the [v0.2.0 release notes](docs/RELEASE-NOTES-v0.2.0.md) for the historical Core-only release.
 
 Prerequisites are Git with public HTTPS access, Rustup/Cargo and the platform linker. Use the pinned toolchain and components described in [Build and verify](#build-and-verify); Cargo may download the locked dependencies through your normal approved configuration. No private SSH key, author-specific directory, private dispatcher, or Hermes installation is needed for Core.
 
-**Fresh consumer environment:** choose a new, empty, user-authorized parent directory and obtain the official repository over public HTTPS into a new child checkout. Pin either the released Core source or a separately verified, Binder-containing exact commit. The empty-consumer clone/build recipe is **pending parent integration and shell execution**, not claimed verified in this draft. Do not run the existing-checkout recipe below in an unrelated or dirty development checkout.
+**Fresh consumer environment:** choose a new, empty, user-authorized parent directory and obtain the official repository over public HTTPS into a new child checkout. Pin the annotated v0.3.0 release for Binder, or v0.2.0 only when the Core-only historical surface is intended. The empty-consumer shell recipes remain individually qualified only where the [README verification ledger](docs/README-VERIFICATION-LEDGER.md) records raw evidence; do not infer a shell/platform result from another platform or use the existing-checkout recipe in an unrelated or dirty development checkout.
 
 **Existing checkout:** stop if it is dirty or in use; check ownership of files and running work before changing its revision. Obtain permission for network/ref changes and build-output writes. Never discard changes, force-replace a tag, or reset a checkout to make onboarding pass. The following preserved v0.2.0 recipe is **not re-executed in this restoration draft**; run commands separately and stop on failure:
 
@@ -89,7 +89,18 @@ git rev-parse "v0.2.0^{tag}" "v0.2.0^{commit}" HEAD
 
 For a release, retain the annotated tag object, resolved commit, source tree, build commands, and binary hash. Check the resolved commit against the corresponding GitHub Release before building; a moving branch is not a release identity. The published v0.2.0 tag object is `b24619e0d036884652cfd9101d116bf015e629b7`, resolving to `14aa2d2b4ef6342e53e1274acd393b87ab5ee6aa`, tree `702e2a4a497fb605e7c2b7b63d6904e6112ba3bd`. Source identity is provenance, not a trusted-producer attestation.
 
-**New-example installation pin is pending:** do not check out v0.2.0 and try `selected_review_demo` or the Binder example. This draft specifies no new release/tag, published package, or supported fixed Binder revision. A Cargo version string alone cannot identify changed source. The commands below build the actual examples from an already authorized development checkout containing their linked sources; they are not a substitute for final public HTTPS acquisition, exact revision verification and shell qualification. Parent integration must supply that real fixed revision and its qualified scope before a fresh consumer can treat this as supported Binder installation.
+**Binder installation identity:** do not check out v0.2.0 and try `selected_review_demo` or the Binder example. Use the annotated v0.3.0 tag and verify its tag object, resolved commit, source tree, lockfile, and release page before building. A Cargo version string alone cannot identify changed source. The commands below are scoped examples, not a substitute for checking that immutable release identity or for platform/shell evidence not recorded in the ledger.
+
+```sh
+git fetch https://github.com/DwarfM42/EvidenceRegistry.git tag v0.3.0
+git checkout --detach v0.3.0
+git rev-parse "v0.3.0^{tag}" "v0.3.0^{commit}" HEAD 'HEAD^{tree}'
+git status --short
+```
+
+Stop if the tag object, resolved commit, `HEAD`, or tree does not match the GitHub
+Release record, or if the checkout is dirty/in use. Do not force-move a tag,
+reset an existing checkout, or substitute moving `main` for the annotated release.
 
 ### Local path dependency
 
@@ -111,7 +122,7 @@ Begin with [the executable structural example](examples/inspect_demo.rs), [crate
 
 ### Public-example setup — Bash
 
-The following recipe is intended for **Windows Git Bash, Linux Bash and macOS Bash**, not PowerShell or generic `sh`. Start at the authorized repository root containing the new example sources. Candidate `1bbaeea` has raw native qualification evidence for Windows x86_64, Linux x86_64, and macOS arm64 as recorded in the [README verification ledger](docs/README-VERIFICATION-LEDGER.md). That evidence does not turn these Bash snippets into tested PowerShell recipes; PowerShell remains pending rather than inferred from Bash.
+The following recipe is intended for **Windows Git Bash, Linux Bash and macOS Bash**, not PowerShell or generic `sh`. Start at an authorized v0.3.0 repository root containing the examples. The final v0.3.0 source subject has raw native qualification evidence for Windows x86_64, Linux x86_64, and macOS arm64 as recorded in the [README verification ledger](docs/README-VERIFICATION-LEDGER.md). That evidence does not turn these Bash snippets into tested PowerShell recipes; PowerShell remains pending rather than inferred from Bash.
 
 Approve writes under the new `target/readme-public-examples-v1` leaf, including build/temp files, private logs and disposable Stores, before running. Change `RUN_NAME` for a later authorized run; `mkdir` refuses an existing leaf, including partial work. No cleanup or resume is attempted. Check that the checkout is owned, not dirty/in use by other work, and has the intended source identity as described above. This shared setup only creates destinations and a raw-stream/exit recorder; it does not launch an agent.
 
@@ -268,11 +279,11 @@ The same sample's cold `inspect` JSON reports **4 attempts**, **2 `ObservedFailu
 
 A completed `run` report emits `inspection_required=true`; usage/preflight errors can instead emit an error report. Read each private `binder-*.stdout/.stderr/.exit/.argv` log and each `binder-inspect-*.stdout` report, not just the latest Admission. Report exact Request, `launch`/`process_exit`, `result_recorded`, Result/output-Freeze/Admission references, failure stage, receipt and all attempt statuses. A null `result_recorded` means Result mutation was attempted without a known returned reference; false means publication was not attempted. Null references alone are never absence proof. Cold inspection revalidates known retained references/payloads without recreating a live witness or historical durability receipt. Displayed Intent argv is redacted and `frames_redacted=true`; preserve the private originals and review all other text before sharing. See [For AI Agents](#for-ai-agents) for recovery and reporting boundaries.
 
-**Real Hermes observed:** [a Windows Request-first run](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md) used the actual installed Hermes executable through the Binder and completed a fresh Result/accepted-Admission path with cold inspection. Do not replace the fake command with guessed Hermes flags, treat a copied historical log as a new review, or treat that acceptance as a reviewer-correctness or independence verdict. No Hermes output is supplied here, and a release/install claim still requires its own bound evidence.
+**Real Hermes observed:** [a bounded Windows Request-first run](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md) used the actual installed Hermes executable through the Binder and completed a fresh Result/accepted-Admission path with cold inspection. Do not replace the fake command with guessed Hermes flags, treat a copied historical log as a new review, or treat that acceptance as a reviewer-correctness or independence verdict. The retained run is one adapter/OS observation, not an authentication, sandbox, or general-agent claim.
 
 ## Store namespaces and operational boundary
 
-The **selected profile** requires `registry/`, `journal/`, `records/`, `roots/`, and `coordination/{freeze,staging}/`. It validates its retained selected-terminal chain on every cold open and is bounded by the Store limits in [the implementation](src/authoritative_store.rs). It never initializes, repairs, or upgrades an incomplete generic/legacy history. The [Core example](#bounded-positive-core-example) describes its actual selected layout; final-candidate regeneration remains pending. Binder adds a separate local ledger and private workspace files, not new Core authority namespaces.
+The **selected profile** requires `registry/`, `journal/`, `records/`, `roots/`, and `coordination/{freeze,staging}/`. It validates its retained selected-terminal chain on every cold open and is bounded by the Store limits in [the implementation](src/authoritative_store.rs). It never initializes, repairs, or upgrades an incomplete generic/legacy history. The [Core example](#bounded-positive-core-example) describes its actual selected layout. Binder adds a separate local ledger and private workspace files, not new Core authority namespaces.
 
 For comparison, `AuthoritativeRegistryStore::open(root)` is the **legacy** three-namespace read/derivation seam:
 
@@ -424,7 +435,7 @@ A Request's role/reviewer identity text does not authenticate the actual submitt
 
 ### Binder workflow and capture boundary
 
-**Implemented controlled route; a Windows real-Hermes run is recorded, while final qualification remains pending:**
+**Implemented controlled route; final v0.3.0 native qualification and one bounded Windows real-Hermes run are recorded:**
 
 ```text
 Target Freeze → exact Review Request / fixed Anchor → retained dispatch intent
@@ -446,7 +457,7 @@ Cold reopen must reconcile all managed attempts and known exact Store references
 
 ### Before installation or execution
 
-1. **Choose the operation and identity.** Ask whether the user needs read-only Journal replay, selected Store operations, or the separate Binder route. Verify the release or exact source commit/tree; do not treat moving `main`, a Cargo version, successful installation, or a build as an authoritative result. Follow [installation](#installation-and-release-identity); v0.2.0 is Core-only.
+1. **Choose the operation and identity.** Ask whether the user needs read-only Journal replay, selected Store operations, or the separate Binder route. Verify the release or exact source commit/tree; do not treat moving `main`, a Cargo version, successful installation, or a build as an authoritative result. Follow [installation](#installation-and-release-identity); v0.2.0 is Core-only and v0.3.0 carries Binder.
 2. **Distinguish a fresh consumer from an existing checkout.** A fresh consumer starts in an authorized empty location using public HTTPS source. In an existing checkout, inspect dirty/in-use state and ownership and refuse revision changes/builds against unknown concurrent work. Do not clean, reset, overwrite, terminate other work, or force tags to make the instructions fit. Author archive paths are not consumer prerequisites.
 3. **Check real prerequisites.** Confirm OS/shell, installed Rust toolchain, components and linker. Keep `Cargo.lock` and use locked builds. Core requires no Hermes. The [Bash example setup](#public-example-setup--bash) uses installed Rust/Cargo 1.97.1, native absolute paths and `sha256sum` or `shasum` for binary identity. Before the Hermes adapter is used, separately obtain approval for the existing agent configuration, network/provider use, budget and runtime bounds; do not install or launch an agent merely because this section mentions one. The fake companion recipe is available above; real-Hermes arguments and final qualification remain pending.
 

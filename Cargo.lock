@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ai-agent-evidence-binder"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "evidence-registry",
  "libc",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "evidence-registry"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "sha2",
