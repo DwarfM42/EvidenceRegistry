@@ -1,13 +1,14 @@
-# EvidenceRegistry v0.3.0 release notes
+# EvidenceRegistry v0.3.0 release-candidate notes
 
-## Release identity
+## Planned release identity
 
-EvidenceRegistry v0.3.0 is a source-only release of the Rust Core and the
-**AI Agent Evidence Binder** companion. The annotated `v0.3.0` tag, its
-resolved commit and source tree, and the GitHub Release are the release
-identity; verify those immutable objects before building. The release is not
-published to crates.io (`publish = false`) and provides no prebuilt binaries
-or binary assets.
+This source candidate prepares EvidenceRegistry v0.3.0 as a source-only release
+of the Rust Core and the **AI Agent Evidence Binder** companion. It is not a
+published release identity. After publication, the annotated `v0.3.0` tag, its
+resolved commit and source tree, and the GitHub Release will be the release
+identity to verify before building. The planned release is not published to
+crates.io (`publish = false`) and provides no prebuilt binaries or binary
+assets.
 
 Both workspace packages are version `0.3.0`:
 
@@ -34,14 +35,18 @@ Hermes is the first real-agent adapter/dogfood target. Core and the read-only
 The Binder ledger is bounded local history, not a Core Record, signature,
 custody proof, semantic authority, or execution-authentication mechanism.
 
-## Qualification record and boundaries
+## Qualification status and boundaries
 
-The release record binds retained native qualification evidence for the final
-v0.3.0 source subject on Windows x86_64, Linux x86_64, and native macOS arm64,
-plus the required locked/offline workspace gates, focused regressions, and
-formal support-impact test. It separately retains a bounded Windows
-Request-first Hermes run with one Store Result and one accepted selected-lane
-Admission followed by cold all-attempt inspection.
+This candidate has no final release qualification record. A final exact-tree
+record, if the candidate is accepted, must bind retained native qualification
+evidence on Windows x86_64, Linux x86_64, and native macOS arm64, plus the
+required locked/offline workspace gates, focused regressions, and formal
+support-impact test. A final real-agent record must separately bind a bounded
+Windows Request-first Hermes run, if performed, with its retained Result and
+selected-lane Admission followed by cold all-attempt inspection.
+
+Historical implementation-tree qualification and Hermes dogfood records remain
+useful provenance but do not qualify this candidate or a future v0.3.0 release.
 
 These observations do **not** establish semantic correctness, reviewer
 correctness or identity, independent review, agent authorship, a sandbox,
@@ -61,5 +66,6 @@ a general authority engine and does not upgrade generic or legacy paths.
 For commands, trust boundaries, and raw-evidence requirements, see the
 [README](../README.md), [README verification ledger](README-VERIFICATION-LEDGER.md),
 and [Binder design and trust contract](AGENT-BINDER-DESIGN.md). The GitHub
-Release is the authoritative public locator for the final tag object, commit,
-tree, release body, and release-time evidence pointers.
+Release will be the authoritative public locator for the final tag object,
+commit, tree, release body, and release-time evidence pointers only after it is
+created and read back.
