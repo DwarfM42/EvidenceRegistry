@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use EvidenceRegistry, please cite it using these metadata."
+title: "EvidenceRegistry"
+type: software
+authors:
+  - name: "DwarfM42"
+version: 0.3.0
+date-released: "2026-09-12"
+url: "https://github.com/DwarfM42/EvidenceRegistry"
+repository-code: "https://github.com/DwarfM42/EvidenceRegistry"
+license:
+  - MIT
+  - Apache-2.0
