@@ -1098,19 +1098,33 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
     let context = store.retained_journal().resolve_reference(&head).unwrap();
     let gate_scope_bytes = selected_review_scope_bytes(1);
     let review_scope_bytes = selected_review_scope_bytes(1);
-    let method_bytes = selected_review_scope_bytes(3);
-    let checks_bytes = selected_review_scope_bytes(4);
+    let method_bytes = evidence_registry::MethodRecord::new(evidence_registry::MethodRecordInput {
+        method_profile_id: 1,
+        method_profile_version: 1,
+        method_payload: vec![],
+        method_label: None,
+    })
+    .unwrap()
+    .authoritative_cbor();
+    let check = evidence_registry::CheckRecord::new(evidence_registry::CheckRecordInput {
+        check_profile_id: 1,
+        check_profile_version: 1,
+        check_payload: vec![],
+        check_label: None,
+    })
+    .unwrap();
+    let checks_bytes =
+        evidence_registry::CheckSetRecord::new(evidence_registry::CheckSetRecordInput {
+            check_refs: vec![check.record_id()],
+        })
+        .unwrap()
+        .authoritative_cbor();
     let gate_scope_id = RecordId::try_from(sha256(&gate_scope_bytes).as_slice()).unwrap();
     let review_scope_id = RecordId::try_from(sha256(&review_scope_bytes).as_slice()).unwrap();
     let method_id = RecordId::try_from(sha256(&method_bytes).as_slice()).unwrap();
     let checks_id = RecordId::try_from(sha256(&checks_bytes).as_slice()).unwrap();
-    let review_policy_bytes = selected_review_policy_bytes(
-        freeze.start_event_reference(),
-        gate_scope_id,
-        review_scope_id,
-        method_id,
-        checks_id,
-    );
+    let review_policy_bytes =
+        selected_review_policy_bytes(&head, gate_scope_id, review_scope_id, method_id, checks_id);
     let review_policy_id = RecordId::try_from(sha256(&review_policy_bytes).as_slice()).unwrap();
     let policy_entry = selected_review_policy_entry(
         registry_id,
@@ -1126,6 +1140,7 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         (gate_scope_id, gate_scope_bytes),
         (review_scope_id, review_scope_bytes),
         (method_id, method_bytes),
+        (check.record_id(), check.authoritative_cbor()),
         (checks_id, checks_bytes),
         (review_policy_id, review_policy_bytes),
     ] {
@@ -1144,6 +1159,7 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         "an unregistered caller role must fail before a Request Record or Journal slot is staged"
     );
     assert!(!root.join("journal/00000000000000000004.cbor").exists());
+    let request_start = store.retained_journal().current_head_reference();
     let recorded = store
         .record_selected_review_request(SelectedReviewRequestInput {
             freeze_authority: freeze.clone(),
@@ -1152,6 +1168,11 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         })
         .unwrap();
     assert_eq!(recorded.request_event_reference().entry_index().value(), 4);
+    assert_eq!(
+        recorded.request().operation_start_journal_ref(),
+        &request_start,
+        "Request chronology belongs to this operation, not the reviewed Freeze START"
+    );
     assert_eq!(
         recorded.request().freeze_authority_ref(),
         freeze.committed_event_reference()
@@ -1178,6 +1199,7 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         "unsupported Result status must fail before its Record or event 301 slot is staged"
     );
     assert!(!root.join("journal/00000000000000000005.cbor").exists());
+    let result_start = store.retained_journal().current_head_reference();
     let result = store
         .record_selected_review_result(SelectedReviewResultInput {
             request_event_reference: recorded.request_event_reference().clone(),
@@ -1189,6 +1211,12 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
         })
         .unwrap();
     assert_eq!(result.result_event_reference().entry_index().value(), 5);
+    assert_eq!(
+        result.result().operation_start_journal_ref(),
+        &result_start,
+        "Result chronology is additional to the Request-defined redundant bindings"
+    );
+    assert_ne!(request_start, result_start);
     assert_eq!(
         result.result().review_request_authority_ref(),
         recorded.request_event_reference()
@@ -1203,6 +1231,17 @@ fn selected_review_request_is_store_derived_and_cold_replays() {
     drop(store);
 
     let mut reopened = AuthoritativeRegistryStore::open_selected_profile(&root).unwrap();
+    let references: Vec<_> = reopened.retained_journal().references().collect();
+    assert_eq!(references.len(), 6);
+    for (index, reference) in references.iter().enumerate() {
+        assert_eq!(reference.entry_index().value(), index as u64);
+        reopened
+            .retained_journal()
+            .resolve_reference(reference)
+            .unwrap();
+    }
+    assert_eq!(&references[4], recorded.request_event_reference());
+    assert_eq!(&references[5], result.result_event_reference());
     assert_eq!(
         reopened
             .validate_selected_review_request(recorded.request_event_reference().clone())
@@ -1343,8 +1382,27 @@ fn selected_rejected_admission_cold_replays_and_is_inspected() {
     let context = store.retained_journal().resolve_reference(&head).unwrap();
     let gate_scope_bytes = selected_review_scope_bytes_with_label(1, b"rejected");
     let review_scope_bytes = selected_review_scope_bytes(1);
-    let method_bytes = selected_review_scope_bytes(3);
-    let checks_bytes = selected_review_scope_bytes(4);
+    let method_bytes = evidence_registry::MethodRecord::new(evidence_registry::MethodRecordInput {
+        method_profile_id: 1,
+        method_profile_version: 1,
+        method_payload: vec![],
+        method_label: None,
+    })
+    .unwrap()
+    .authoritative_cbor();
+    let check = evidence_registry::CheckRecord::new(evidence_registry::CheckRecordInput {
+        check_profile_id: 1,
+        check_profile_version: 1,
+        check_payload: vec![],
+        check_label: None,
+    })
+    .unwrap();
+    let checks_bytes =
+        evidence_registry::CheckSetRecord::new(evidence_registry::CheckSetRecordInput {
+            check_refs: vec![check.record_id()],
+        })
+        .unwrap()
+        .authoritative_cbor();
     let gate_scope_id = RecordId::try_from(sha256(&gate_scope_bytes).as_slice()).unwrap();
     let review_scope_id = RecordId::try_from(sha256(&review_scope_bytes).as_slice()).unwrap();
     let method_id = RecordId::try_from(sha256(&method_bytes).as_slice()).unwrap();
@@ -1371,6 +1429,7 @@ fn selected_rejected_admission_cold_replays_and_is_inspected() {
         (gate_scope_id, gate_scope_bytes),
         (review_scope_id, review_scope_bytes),
         (method_id, method_bytes),
+        (check.record_id(), check.authoritative_cbor()),
         (checks_id, checks_bytes),
         (review_policy_id, review_policy_bytes),
     ] {

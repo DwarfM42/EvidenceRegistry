@@ -33,6 +33,177 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Public-only regression fixture. Reviewer statuses are test claims, not real execution.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_repeated_admissions_replay_every_same_and_distinct_request_and_freeze() {
+    use evidence_registry::*;
+    let sequence = NEXT_AUTHORITATIVE_REVIEW_STORE_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "evidence-registry-repeat-admission-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(source.join("empty")).unwrap();
+    fs::create_dir(source.join("nested")).unwrap();
+    fs::write(source.join("nested/review.txt"), b"test review target").unwrap();
+    let store_path = root.join("store");
+    let mut store = AuthoritativeRegistryStore::initialize_selected_profile(
+        &store_path,
+        RegistryId::try_from([91; 32].as_slice()).unwrap(),
+        "repeat-admission-regression",
+    )
+    .unwrap();
+    let scope = ScopeRecord::new(ScopeRecordInput {
+        scope_profile_id: 1,
+        scope_profile_version: 1,
+        scope_payload: vec![],
+        scope_label: None,
+    })
+    .unwrap();
+    store.stage_scope_record(&scope).unwrap();
+    let method = MethodRecord::new(MethodRecordInput {
+        method_profile_id: 1,
+        method_profile_version: 1,
+        method_payload: vec![],
+        method_label: None,
+    })
+    .unwrap();
+    store.stage_method_record(&method).unwrap();
+    let check = CheckRecord::new(CheckRecordInput {
+        check_profile_id: 1,
+        check_profile_version: 1,
+        check_payload: vec![],
+        check_label: None,
+    })
+    .unwrap();
+    store.stage_check_record(&check).unwrap();
+    let checks = CheckSetRecord::new(CheckSetRecordInput {
+        check_refs: vec![check.record_id()],
+    })
+    .unwrap();
+    store.stage_check_set_record(&checks).unwrap();
+    let record_id = |r: &JournalReference| {
+        RecordId::try_from(r.event_record_id().as_bytes().as_slice()).unwrap()
+    };
+    let freeze_scope = ScopeRecord::new(ScopeRecordInput {
+        scope_profile_id: 2,
+        scope_profile_version: 1,
+        scope_payload: vec![],
+        scope_label: None,
+    })
+    .unwrap();
+    store.stage_scope_record(&freeze_scope).unwrap();
+    let freeze_policy = store
+        .register_selected_minimal_policy(freeze_scope.record_id())
+        .unwrap();
+    let review_policy = store
+        .register_selected_review_policy(
+            scope.record_id(),
+            vec![ReviewAdmissionReviewRequirement::new(
+                1,
+                scope.record_id(),
+                method.record_id(),
+                checks.record_id(),
+                1,
+            )
+            .unwrap()],
+            Some(vec![1]),
+            Some(vec![1]),
+            Some(vec![1, 2]),
+        )
+        .unwrap();
+    let mut admissions = Vec::new();
+    let mut requests = Vec::new();
+    let mut first_payload = None;
+    for attempt in [92_u8, 93] {
+        fs::write(source.join("nested/review.txt"), [attempt]).unwrap();
+        let prepared = store
+            .prepare_selected_embedded_freeze(SelectedEmbeddedFreezePreparationInput {
+                source_root: source.clone(),
+                freeze_attempt_id: FreezeAttemptId::try_from([attempt; 32].as_slice()).unwrap(),
+                policy_record_id: record_id(&freeze_policy),
+            })
+            .unwrap();
+        first_payload.get_or_insert_with(|| prepared.payload_directory().to_owned());
+        let freeze = store
+            .commit_prepared_selected_embedded_freeze(prepared)
+            .unwrap();
+        for _ in 0..2 {
+            let request = store
+                .record_selected_review_request(SelectedReviewRequestInput {
+                    freeze_authority: freeze.clone(),
+                    review_policy_record_id: record_id(&review_policy),
+                    review_role_id: 1,
+                })
+                .unwrap();
+            requests.push(request.request_event_reference().clone());
+            for status in [1, 2, 3] {
+                let result = store
+                    .record_selected_review_result(SelectedReviewResultInput {
+                        request_event_reference: request.request_event_reference().clone(),
+                        method_status: status,
+                        finding_state: 1,
+                        reason_codes: vec![],
+                        findings: vec![],
+                        reviewer_metadata: None,
+                    })
+                    .unwrap();
+                let start = store.retained_journal().current_head_reference();
+                let outcome = store
+                    .complete_selected_review_admission(result.result_event_reference().clone())
+                    .expect("a later bounded Admission must pass full-prefix semantic preflight");
+                let AuthoritativeReviewAdmissionRuntimeOutcome::Published(published) = outcome
+                else {
+                    panic!("expected completed Policy publication: {outcome:?}");
+                };
+                assert_eq!(
+                    published.journal_reference().event_type_id().value(),
+                    if status == 1 { 302 } else { 303 }
+                );
+                assert_eq!(
+                    published.admission_record().operation_start_journal_ref(),
+                    &start
+                );
+                assert_eq!(
+                    published.admission_record().review_request_ref(),
+                    Some(request.request_event_reference())
+                );
+                assert_eq!(
+                    published.admission_record().review_result_ref(),
+                    Some(result.result_event_reference())
+                );
+                admissions.push((
+                    published.journal_reference().clone(),
+                    published.admission_record_bytes().to_vec(),
+                ));
+                drop(store);
+                store = AuthoritativeRegistryStore::open_selected_profile(&store_path).unwrap();
+                for (reference, bytes) in &admissions {
+                    store
+                        .retained_journal()
+                        .resolve_reference(reference)
+                        .unwrap();
+                    assert_eq!(store.resolve(record_id(reference)), Some(bytes.as_slice()));
+                }
+            }
+        }
+    }
+    assert_eq!(admissions.len(), 12);
+    assert_eq!(requests.len(), 4);
+    // Replaying later terminals must not stop validating an older shared target.
+    drop(store);
+    fs::write(
+        first_payload.unwrap().join("nested/review.txt"),
+        b"corrupted",
+    )
+    .unwrap();
+    assert!(AuthoritativeRegistryStore::open_selected_profile(&store_path).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn id(first: u8) -> [u8; 32] {
     core::array::from_fn(|index| first.wrapping_add(index as u8))
 }
@@ -327,6 +498,7 @@ fn independently_construct_version_1_review_request_with_freeze_policy_scope_anc
     review_package_anchor_id: [u8; 32],
     operation_start: &JournalReference,
     manifest_id: RecordId,
+    definitions: ReviewDefinitionRefs,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
@@ -336,13 +508,13 @@ fn independently_construct_version_1_review_request_with_freeze_policy_scope_anc
     bytes.push(0x11);
     append_bstr_32(&mut bytes, *manifest_id.as_bytes());
     bytes.extend_from_slice(&[0x12, 0x05, 0x13]);
-    append_bstr_32(&mut bytes, id(0xa0));
+    append_bstr_32(&mut bytes, *definitions.check_set_ref.as_bytes());
     bytes.push(0x14);
     append_journal_reference(&mut bytes, policy_authority);
     bytes.push(0x15);
     append_bstr_32(&mut bytes, *scope_ref.as_bytes());
     bytes.push(0x16);
-    append_bstr_32(&mut bytes, id(0xe0));
+    append_bstr_32(&mut bytes, *definitions.method_ref.as_bytes());
     bytes.push(0x17);
     append_bstr_32(&mut bytes, review_package_anchor_id);
     bytes.extend_from_slice(&[0x18, 0x18]);
@@ -538,6 +710,7 @@ fn independently_construct_version_1_review_result_with_freeze_scope_and_start(
     review_package_anchor_id: [u8; 32],
     operation_start: &JournalReference,
     manifest_id: RecordId,
+    method_ref: RecordId,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x84, 0x78, 0x1a]);
@@ -551,7 +724,7 @@ fn independently_construct_version_1_review_result_with_freeze_scope_and_start(
     bytes.extend_from_slice(&[0x13, 0x05, 0x14]);
     append_bstr_32(&mut bytes, *scope_ref.as_bytes());
     bytes.push(0x15);
-    append_bstr_32(&mut bytes, id(0xe0));
+    append_bstr_32(&mut bytes, *method_ref.as_bytes());
     bytes.extend_from_slice(&[0x16, 0x01, 0x17, 0x01, 0x18, 0x18, 0x81, 0x62]);
     bytes.extend_from_slice(b"OK");
     bytes.extend_from_slice(&[0x18, 0x19, 0x80, 0x18, 0x1b]);
@@ -652,6 +825,7 @@ fn independently_construct_review_admission_policy_with_requirement_roles(
     review_requirement_scope_ref: RecordId,
     review_roles: &[u8],
     include_verification_requirement: bool,
+    definitions: ReviewDefinitionRefs,
 ) -> Vec<u8> {
     assert!(!review_roles.is_empty() && review_roles.len() < 24);
     assert!(review_roles.windows(2).all(|pair| pair[0] < pair[1]));
@@ -681,9 +855,9 @@ fn independently_construct_review_admission_policy_with_requirement_roles(
         bytes.extend_from_slice(&[0xa5, 0x00, *review_role, 0x01]);
         append_bstr_32(&mut bytes, *review_requirement_scope_ref.as_bytes());
         bytes.push(0x02);
-        append_bstr_32(&mut bytes, id(0xe0));
+        append_bstr_32(&mut bytes, *definitions.method_ref.as_bytes());
         bytes.push(0x03);
-        append_bstr_32(&mut bytes, id(0xa0));
+        append_bstr_32(&mut bytes, *definitions.check_set_ref.as_bytes());
         bytes.extend_from_slice(&[0x04, 0x01]);
     }
     bytes.extend_from_slice(&[0x12, 0x81, 0x01, 0x13, 0x81, 0x01]);
@@ -707,6 +881,7 @@ fn independently_construct_review_request_creation_policy_with_requirement_roles
     gate_scope_ref: RecordId,
     review_requirement_scope_ref: RecordId,
     review_roles: &[u8],
+    definitions: ReviewDefinitionRefs,
 ) -> Vec<u8> {
     assert!(!review_roles.is_empty() && review_roles.len() < 24);
     assert!(review_roles.windows(2).all(|pair| pair[0] < pair[1]));
@@ -721,9 +896,9 @@ fn independently_construct_review_request_creation_policy_with_requirement_roles
         bytes.extend_from_slice(&[0xa5, 0x00, *review_role, 0x01]);
         append_bstr_32(&mut bytes, *review_requirement_scope_ref.as_bytes());
         bytes.push(0x02);
-        append_bstr_32(&mut bytes, id(0xe0));
+        append_bstr_32(&mut bytes, *definitions.method_ref.as_bytes());
         bytes.push(0x03);
-        append_bstr_32(&mut bytes, id(0xa0));
+        append_bstr_32(&mut bytes, *definitions.check_set_ref.as_bytes());
         bytes.extend_from_slice(&[0x04, 0x01]);
     }
     bytes.extend_from_slice(&[0x18, 0x1d]);
@@ -738,6 +913,7 @@ fn policy_recorded_entry_at(
     policy_record_id: RecordId,
     gate_scope_ref: RecordId,
     review_requirement_scope_ref: RecordId,
+    definitions: ReviewDefinitionRefs,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x82, 0x78, 0x20]);
@@ -752,8 +928,8 @@ fn policy_recorded_entry_at(
     let mut identity_dependencies = vec![
         (1, *gate_scope_ref.as_bytes()),
         (1, *review_requirement_scope_ref.as_bytes()),
-        (1, id(0xa0)),
-        (1, id(0xe0)),
+        (1, *definitions.check_set_ref.as_bytes()),
+        (1, *definitions.method_ref.as_bytes()),
     ];
     identity_dependencies.sort();
     identity_dependencies.dedup();
@@ -789,6 +965,46 @@ fn independently_construct_labeled_exact_review_admission_scope(label: &str) -> 
     bytes.extend_from_slice(&[0x13, 0x60 + label.len() as u8]);
     bytes.extend_from_slice(label.as_bytes());
     bytes
+}
+
+#[derive(Clone, Copy)]
+struct ReviewDefinitionRefs {
+    method_ref: RecordId,
+    check_set_ref: RecordId,
+}
+
+fn independently_construct_review_definitions() -> (ReviewDefinitionRefs, RecordBytes) {
+    // Independent wire fixtures: retain actual portable definitions, not fabricated
+    // references or production-encoder output. Standalone decoder vectors above
+    // deliberately keep their synthetic identities.
+    let mut method_bytes = vec![0x84, 0x78, 0x1a];
+    method_bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    method_bytes.extend_from_slice(&[
+        0x15, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x15, 0x10, 0x01, 0x11, 0x01, 0x12, 0x40,
+    ]);
+    let method_id = RecordId::try_from(Sha256::digest(&method_bytes).as_slice()).unwrap();
+    let mut check_bytes = vec![0x84, 0x78, 0x1a];
+    check_bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    check_bytes.extend_from_slice(&[
+        0x16, 0x01, 0xa5, 0x00, 0x01, 0x01, 0x16, 0x10, 0x01, 0x11, 0x01, 0x12, 0x40,
+    ]);
+    let check_id = RecordId::try_from(Sha256::digest(&check_bytes).as_slice()).unwrap();
+    let mut check_set_bytes = vec![0x84, 0x78, 0x1a];
+    check_set_bytes.extend_from_slice(b"EvidenceRegistry.Record.v1");
+    check_set_bytes.extend_from_slice(&[0x17, 0x01, 0xa3, 0x00, 0x01, 0x01, 0x17, 0x10, 0x81]);
+    append_bstr_32(&mut check_set_bytes, *check_id.as_bytes());
+    let check_set_id = RecordId::try_from(Sha256::digest(&check_set_bytes).as_slice()).unwrap();
+    (
+        ReviewDefinitionRefs {
+            method_ref: method_id,
+            check_set_ref: check_set_id,
+        },
+        RecordBytes(vec![
+            (method_id, method_bytes),
+            (check_id, check_bytes),
+            (check_set_id, check_set_bytes),
+        ]),
+    )
 }
 
 struct RecordBytes(Vec<(RecordId, Vec<u8>)>);
@@ -1066,6 +1282,7 @@ fn authoritative_review_admission_fixture_with_overrides(
     });
     let common_scope_id =
         RecordId::try_from(Sha256::digest(&common_scope_bytes).as_slice()).unwrap();
+    let (definitions, definition_records) = independently_construct_review_definitions();
     let operation_start = policy_operation_start
         .as_ref()
         .unwrap_or(&genesis_reference);
@@ -1075,6 +1292,7 @@ fn authoritative_review_admission_fixture_with_overrides(
             gate_scope_id,
             common_scope_id,
             review_roles,
+            definitions,
         )
     } else {
         let mut bytes = independently_construct_review_admission_policy_with_requirement_roles(
@@ -1083,6 +1301,7 @@ fn authoritative_review_admission_fixture_with_overrides(
             common_scope_id,
             review_roles,
             policy_includes_verification_requirement,
+            definitions,
         );
         if let Some(policy_context_id) = policy_context_id {
             *bytes.last_mut().unwrap() = policy_context_id;
@@ -1104,6 +1323,7 @@ fn authoritative_review_admission_fixture_with_overrides(
         policy_id,
         gate_scope_id,
         common_scope_id,
+        definitions,
     );
     let policy_entry_hash: [u8; 32] = Sha256::digest(&policy_entry).into();
     let policy_reference = JournalReference::new(
@@ -1132,6 +1352,7 @@ fn authoritative_review_admission_fixture_with_overrides(
                 .as_ref()
                 .unwrap_or(&policy_reference),
             manifest_id,
+            definitions,
         );
     let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
     let mut request_identity_dependencies = vec![
@@ -1217,6 +1438,7 @@ fn authoritative_review_admission_fixture_with_overrides(
             selected_result_package_anchor_id,
             &selected_result_operation_start,
             selected_result_manifest_id,
+            selected_result_method_ref,
         );
     if let Some(role_id) = result_review_role_id {
         let role = result_bytes
@@ -1225,14 +1447,7 @@ fn authoritative_review_admission_fixture_with_overrides(
             .unwrap();
         result_bytes[role + 1] = role_id;
     }
-    if result_method_ref.is_some() {
-        let method = result_bytes
-            .windows(4)
-            .position(|window| window == [0x15, 0x58, 0x20, 0xe0])
-            .unwrap();
-        result_bytes[method + 3..method + 35]
-            .copy_from_slice(selected_result_method_ref.as_bytes());
-    }
+
     let status_fields = result_bytes
         .windows(6)
         .position(|window| window == [0x16, 0x01, 0x17, 0x01, 0x18, 0x18])
@@ -1328,6 +1543,7 @@ fn authoritative_review_admission_fixture_with_overrides(
         (request.record_id(), request_bytes.clone()),
         (result_frame.record_id(), result_bytes.clone()),
     ];
+    records.extend(definition_records.0);
     if common_scope_id != gate_scope_id {
         records.push((common_scope_id, common_scope_bytes));
     }
@@ -1364,6 +1580,10 @@ fn future_review_admission_pair(
             *existing_request.review_package_anchor_id().as_bytes(),
             operation_start,
             existing_request.manifest_id(),
+            ReviewDefinitionRefs {
+                method_ref: existing_request.review_method_ref(),
+                check_set_ref: existing_request.required_checks_ref(),
+            },
         );
     let request = ReviewRequestRecord::decode_authoritative(&request_bytes).unwrap();
     let request_index = u8::try_from(operation_start.entry_index().value() + 1).unwrap();
@@ -1401,6 +1621,7 @@ fn future_review_admission_pair(
         *existing_request.review_package_anchor_id().as_bytes(),
         operation_start,
         existing_request.manifest_id(),
+        existing_request.review_method_ref(),
     );
     let result = ReviewResultRecord::decode_authoritative(&result_bytes).unwrap();
     let result_index = request_index.checked_add(1).unwrap();
@@ -1501,6 +1722,89 @@ fn assert_complete_review_admission_authority_error(
         )
     );
     assert_eq!(fixture.journal.current_head_reference(), retained_head);
+}
+
+#[test]
+fn authoritative_fixture_retains_exact_typed_review_definition_closure() {
+    for policy_context_id in [None, Some(5)] {
+        let fixture = authoritative_review_admission_fixture_with_overrides(
+            true,
+            &[4, 5],
+            IdentityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            AuthorityDependencyMode::Exact,
+            ReviewAdmissionFixtureOverrides {
+                policy_context_id,
+                ..Default::default()
+            },
+        );
+        let request = ReviewRequestRecord::decode_authoritative(&fixture.request_bytes).unwrap();
+        let method = evidence_registry::MethodRecord::decode_authoritative(
+            fixture
+                .resolver
+                .resolve(request.review_method_ref())
+                .expect("positive fixture must retain its METHOD definition"),
+        )
+        .unwrap();
+        assert_eq!(method.record_id(), request.review_method_ref());
+        let checks = evidence_registry::CheckSetRecord::decode_authoritative(
+            fixture
+                .resolver
+                .resolve(request.required_checks_ref())
+                .expect("positive fixture must retain its CHECK_SET definition"),
+        )
+        .unwrap();
+        assert_eq!(checks.record_id(), request.required_checks_ref());
+        assert!(!checks.check_refs().is_empty());
+        for check_ref in checks.check_refs() {
+            let check = evidence_registry::CheckRecord::decode_authoritative(
+                fixture
+                    .resolver
+                    .resolve(*check_ref)
+                    .expect("positive fixture must retain every CHECK member"),
+            )
+            .unwrap();
+            assert_eq!(check.record_id(), *check_ref);
+        }
+        let policy_id = RecordId::try_from(
+            request
+                .policy_authority_ref()
+                .event_record_id()
+                .as_bytes()
+                .as_slice(),
+        )
+        .unwrap();
+        let policy = ReviewAdmissionPolicyRecord::decode_authoritative(
+            fixture.resolver.resolve(policy_id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(policy.review_requirements().len(), 2);
+        for requirement in policy.review_requirements() {
+            assert_eq!(requirement.review_method_ref(), method.record_id());
+            assert_eq!(requirement.required_checks_ref(), checks.record_id());
+        }
+        let result = ReviewResultRecord::decode_authoritative(&fixture.result_bytes).unwrap();
+        assert_eq!(result.review_method_ref(), method.record_id());
+        validate_review_admission_common_request_result_fields(
+            &fixture.request_bytes,
+            &fixture.result_bytes,
+        )
+        .unwrap();
+
+        let future =
+            future_review_admission_pair(&fixture, &fixture.journal.current_head_reference());
+        let future_request =
+            ReviewRequestRecord::decode_authoritative(&future.request_bytes).unwrap();
+        let future_result = ReviewResultRecord::decode_authoritative(&future.result_bytes).unwrap();
+        assert_eq!(future_request.review_method_ref(), method.record_id());
+        assert_eq!(future_request.required_checks_ref(), checks.record_id());
+        assert_eq!(future_result.review_method_ref(), method.record_id());
+        validate_review_admission_common_request_result_fields(
+            &future.request_bytes,
+            &future.result_bytes,
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -1728,6 +2032,46 @@ fn review_request_and_result_reject_unassigned_review_role_ids() {
     assert_eq!(
         ReviewResultRecord::decode_authoritative(&result),
         Err(evidence_registry::RecordDecodeError)
+    );
+}
+
+#[test]
+fn review_result_public_readback_preserves_exact_submission_material() {
+    let empty = ReviewResultRecord::decode_authoritative(
+        &independently_construct_version_1_review_result(),
+    )
+    .unwrap();
+    assert!(empty.findings().is_empty());
+    assert_eq!(empty.reviewer_metadata(), None);
+
+    // Independent wire fixture: findings is an array, not a sorted set. Keep
+    // order and duplicates; metadata is submitted text, not an authority edge.
+    let mut bytes = independently_construct_version_1_review_result();
+    let body = bytes.iter().position(|byte| *byte == 0xae).unwrap();
+    bytes[body] = 0xaf;
+    let position = bytes
+        .windows(5)
+        .position(|window| window == [0x18, 0x19, 0x80, 0x18, 0x1b])
+        .unwrap();
+    let mut material = vec![0x18, 0x19, 0x83];
+    for value in [0x60, 0x20, 0x60] {
+        append_bstr_32(&mut material, id(value));
+    }
+    material.extend_from_slice(&[0x18, 0x1a, 0x64]);
+    material.extend_from_slice(b"raw\n");
+    bytes.splice(position..position + 3, material);
+    let decoded = ReviewResultRecord::decode_authoritative(&bytes).unwrap();
+    let expected: Vec<RecordId> = [0x60, 0x20, 0x60]
+        .into_iter()
+        .map(|value| RecordId::try_from(id(value).as_slice()).unwrap())
+        .collect();
+    assert_eq!(decoded.findings(), expected.as_slice());
+    assert_eq!(decoded.reviewer_metadata(), Some("raw\n"));
+    assert_eq!(
+        decoded.record_id(),
+        StrictRecordFrame::decode_authoritative(&bytes)
+            .unwrap()
+            .record_id()
     );
 }
 
