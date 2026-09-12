@@ -121,7 +121,7 @@ Begin with [the executable structural example](examples/inspect_demo.rs), [crate
 - [`tests/review_admission_runtime.rs`](tests/review_admission_runtime.rs)
 - [`tests/journal_verify_cli.rs`](tests/journal_verify_cli.rs)
 
-### Public-example setup — Bash
+### Quick start setup — Bash
 
 The following recipe is intended for **Windows Git Bash, Linux Bash and macOS Bash**, not PowerShell or generic `sh`. Start at an authorized v0.3.0 repository root containing the examples. The implementation tree completed native qualification on Windows x86_64, Linux x86_64, and macOS arm64; the [README verification ledger](docs/README-VERIFICATION-LEDGER.md) identifies those records. These observations do not turn the Bash snippets into tested PowerShell recipes; PowerShell execution remains unverified rather than inferred from Bash.
 
@@ -305,22 +305,38 @@ The selected profile does **not** establish universal filesystem durability, cus
 
 ## Build and verify
 
-CI and native qualification workflows use Rust/Cargo `1.97.1` with `rustfmt` and `clippy`; this is a tested toolchain pin, not an independently declared universal MSRV. Confirm the actual installed toolchain/components before building. Windows requires the MSVC target (`1.97.1-x86_64-pc-windows-msvc`) and MSVC C++ Build Tools; Linux/macOS require their native linker/toolchain. The Linux suite additionally needs `python3`. Missing prerequisites are not permission to install tools, alter agent configuration, or acquire credentials silently.
+CI and native qualification workflows use Rust/Cargo `1.97.1` with `rustfmt` and `clippy`; this is a tested toolchain pin, not an independently declared universal MSRV. Confirm the actual installed toolchain/components before building. Qualified native platforms are Windows x86_64, Linux x86_64, and macOS arm64. Windows requires the MSVC target (`1.97.1-x86_64-pc-windows-msvc`) and MSVC C++ Build Tools; Linux/macOS require their native linker/toolchain. The Linux suite additionally needs `python3`. Missing prerequisites are not permission to install tools, alter agent configuration, or acquire credentials silently.
 
-### Windows Git Bash: Journal-only quick start
+### Quick start: Journal-only replay
 
-**Execution status:** this exact build/demo/verify sequence ran on Windows x86_64 with Git Bash and Rust/Cargo 1.97.1 on 2026-09-11 (UTC+09:00). It is a **dirty working-tree observation**, separate from the current source candidate's Windows qualification and not a published-release qualification. The build, demo, and replay completed successfully. This recipe itself has not been rerun from the current documentation revision.
+Use this Bash-compatible recipe from an authorized checkout. It supports Windows Git Bash, Linux Bash, and macOS Bash, with the platform-specific environment setup described below. The implementation tree completed native qualification on Windows x86_64, Linux x86_64, and macOS arm64; that qualification does not itself verify every documented shell recipe.
 
-**Before writing:** use a trusted, authorized local checkout and a fresh demo leaf. The build writes under `target/readme-restoration-build/`; the example always writes under the compile-time checkout's `target/`, regardless of `CARGO_TARGET_DIR`. It does not open a Store or launch an agent. Keep partial or refused runs; do not delete an unknown directory to reuse its name. Native Windows programs need Windows-form environment paths, hence Git Bash's `pwd -W` rather than POSIX `$PWD`.
+**Recipe observation:** this exact build/demo/verify sequence ran on Windows x86_64 with Git Bash and Rust/Cargo 1.97.1 on 2026-09-11 (UTC+09:00). It is a **dirty working-tree observation**, separate from the current source candidate's Windows qualification and not a published-release qualification. The build, demo, and replay completed successfully. This recipe itself has not been rerun from the current documentation revision.
+
+**Before writing:** use a trusted, authorized local checkout and a fresh demo leaf. The build writes under `target/readme-restoration-build/`; the example always writes under the compile-time checkout's `target/`, regardless of `CARGO_TARGET_DIR`. It does not open a Store or launch an agent. Keep partial or refused runs; do not delete an unknown directory to reuse its name.
+
+**Shell note:** on Windows Git Bash, native Windows programs need Windows-form environment paths, hence `pwd -W` rather than POSIX `$PWD`. On Linux and macOS, use the POSIX setup in [POSIX shell note](#posix-shell-note) and invoke the binary without `.exe`.
 
 ```bash
-export RUSTUP_TOOLCHAIN=1.97.1-x86_64-pc-windows-msvc RUSTUP_AUTO_INSTALL=0
-export CARGO_TARGET_DIR="$(pwd -W)/target/readme-restoration-build"
+case "$(uname -s)" in
+  MINGW*|MSYS*)
+    export RUSTUP_TOOLCHAIN=1.97.1-x86_64-pc-windows-msvc
+    export CARGO_TARGET_DIR="$(pwd -W)/target/readme-restoration-build"
+    CLI="$CARGO_TARGET_DIR/release/evidence-registry.exe"
+    ;;
+  Linux*|Darwin*)
+    export RUSTUP_TOOLCHAIN=1.97.1
+    export CARGO_TARGET_DIR="$PWD/target/readme-restoration-build"
+    CLI="$CARGO_TARGET_DIR/release/evidence-registry"
+    ;;
+  *) printf 'Unsupported recipe shell/host\n' >&2; exit 1 ;;
+esac
+export RUSTUP_AUTO_INSTALL=0
 export TMPDIR="$CARGO_TARGET_DIR/tmp" TEMP="$CARGO_TARGET_DIR/tmp" TMP="$CARGO_TARGET_DIR/tmp"
 mkdir -p "$TMPDIR" || exit 1
 cargo build --release --locked || exit 1
 cargo run --example inspect_demo --locked -- readme-restoration-demo-v1 || exit 1
-./target/readme-restoration-build/release/evidence-registry.exe journal verify --genesis ./target/readme-restoration-demo-v1/genesis-entry.cbor
+"$CLI" journal verify --genesis ./target/readme-restoration-demo-v1/genesis-entry.cbor
 status=$?
 printf 'exit=%s\n' "$status"
 ```
@@ -358,13 +374,13 @@ Actual CLI stdout, formatted from the fresh captured output (process exit `0`, e
 
 The head hash was checked against SHA-256 of the generated `genesis-entry.cbor`. This replay establishes neither resolved Record prerequisites nor selected Store authority, so both authority and Admission remain `UNAVAILABLE`. The sample is not a Binder execution, positive Store authority example, or proof that a published binary produced this result.
 
-### Windows PowerShell — recipe pending parent integration
+### Windows PowerShell note
 
 The final native recipe must set Windows-form build/temp paths, run the locked build and fresh demo, invoke the `.exe`, and capture `$LASTEXITCODE` immediately after each native command. It must preserve raw stdout/stderr and stop on failure. The Git Bash run above does **not** verify PowerShell syntax or execution. No unexecuted PowerShell demo is presented as runnable evidence here.
 
-### Linux / macOS — preserved build recipe; recipe-specific execution status
+### POSIX shell note
 
-The following POSIX environment/build recipe is retained from the Core README, **not newly executed on Linux/macOS in this draft**. Do not apply its `$PWD` environment setup to Windows native tools. Obtain permission for build/temp writes, run commands separately, and stop on failure:
+For Linux and macOS POSIX shells, use the following environment/build setup. Do not apply its `$PWD` environment setup to Windows native tools. Obtain permission for build/temp writes, run commands separately, and stop on failure:
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.97.1 RUSTUP_AUTO_INSTALL=0
@@ -374,7 +390,7 @@ mkdir -p "$TMPDIR"
 cargo build --release --locked
 ```
 
-The POSIX binary is `target/release/evidence-registry` when using that target directory. This particular build → fresh demo → ordered replay recipe has not been executed on Linux or macOS from this documentation revision; do not infer recipe execution from the Windows observation or from the broader Linux smoke. The macOS exact-candidate workspace suite currently has a recorded failing test.
+The POSIX binary is `target/release/evidence-registry` when using that target directory. This particular build → fresh demo → ordered replay recipe has not been executed on Linux or macOS from this documentation revision; do not infer recipe execution from the Windows observation or from broader native qualification.
 
 ### Developer verification
 
@@ -399,7 +415,7 @@ Release closeout must bind the annotated v0.3.0 tag, its resolved commit/tree, a
 |---|---|---|
 | Released Core authority path | Historical release qualification exists for the Core-only v0.2.0 release. | Historical qualification does not qualify the v0.3.0 source candidate. |
 | Current Binder implementation tree | Native qualification completed on Windows x86_64, Linux x86_64, and macOS arm64. | The qualification records bind the implementation tree, not semantic correctness or a publication identity. |
-| Current Journal quick start | A Windows x86_64 / Git Bash working-tree build, synthetic demo, and replay were observed. | This specific recipe has not been rerun from the current documentation revision; PowerShell, Linux, and macOS recipe execution is not inferred. |
+| Current Journal quick start | A shared Bash recipe is provided for Windows Git Bash, Linux Bash, and macOS Bash; a Windows x86_64 / Git Bash working-tree build, synthetic demo, and replay were observed. | This specific recipe has not been rerun from the current documentation revision; PowerShell, Linux, and macOS recipe execution is not inferred. |
 | Core positive / Binder fake examples | Retained development executions and the native qualification fixture routes exist. | Fixtures remain fixtures; documented shell recipes need their own execution records if represented as tested recipes. |
 | Binder common code / subprocess fixtures | `1bbaeea` / `adde784a` passed full native qualification on Windows x86_64, Linux x86_64, and macOS arm64. | This is clearly historical implementation-tree evidence, not qualification of the current documentation revision. |
 | Real Hermes review | One Windows/Git-Bash Request-first Hermes run on `1bbaeea` / `adde784a` retained a Result and accepted selected-lane Admission; its exact boundary is in [the dogfood record](docs/HERMES-BINDER-DOGFOOD-1bbaeea.md). | It is historical; native qualification used deterministic fixture routes. Neither establishes semantic correctness, reviewer identity, independence, or other adapters. |
